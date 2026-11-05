@@ -1,0 +1,25 @@
+[package]
+name = "hotel-client"
+version = "0.1.0"
+edition = "2021"
+description = "酒店AI管理客户端 —— License 激活 / 心跳同步 / 授权概览"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }
+license-core = { path = "license-core" }
+
+[workspace]
+
+[profile.release]
+# 商业化加固：符号剥离 + panic=abort + thin LTO + 关闭调试信息
+# （debuginfo=0 规避本机沙箱 mspdbsrv 挂死 link.exe 的问题）
+strip = true
+panic = "abort"
+lto = "thin"
+debug = 0

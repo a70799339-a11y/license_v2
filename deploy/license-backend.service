@@ -1,0 +1,15 @@
+[Unit]
+Description=License Admin Backend (FastAPI)
+After=network.target postgresql.service
+
+[Service]
+User=__USER__
+WorkingDirectory=/opt/license/backend
+Environment=DATABASE_URL=postgresql+psycopg2://postgres:license123@127.0.0.1:5432/license
+Environment=JWT_SECRET=change-me-in-production
+ExecStart=/opt/license/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

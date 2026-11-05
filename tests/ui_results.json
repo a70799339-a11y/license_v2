@@ -1,0 +1,276 @@
+{
+  "target": "http://localhost",
+  "time": "2026/11/3 13:38:10",
+  "total": 38,
+  "passed": 38,
+  "failed": 0,
+  "pass_rate": "100.0%",
+  "results": [
+    {
+      "id": "U1.1",
+      "module": "登录页",
+      "name": "登录页渲染",
+      "pass": true,
+      "actual": "2 个输入框"
+    },
+    {
+      "id": "U1.2",
+      "module": "登录页",
+      "name": "错误密码显示提示",
+      "pass": true,
+      "actual": ""
+    },
+    {
+      "id": "U1.3",
+      "module": "登录页",
+      "name": "登录成功跳转总览",
+      "pass": true,
+      "actual": "/dashboard"
+    },
+    {
+      "id": "U2.1",
+      "module": "经营总览",
+      "name": "KPI 卡片渲染",
+      "pass": true,
+      "actual": "4 张"
+    },
+    {
+      "id": "U2.2",
+      "module": "经营总览",
+      "name": "折线图渲染",
+      "pass": true,
+      "actual": ""
+    },
+    {
+      "id": "U2.3",
+      "module": "经营总览",
+      "name": "到期风险提醒列表",
+      "pass": true,
+      "actual": "16 行"
+    },
+    {
+      "id": "U3.1",
+      "module": "客户管理",
+      "name": "客户表格渲染",
+      "pass": true,
+      "actual": "5 行"
+    },
+    {
+      "id": "U3.2",
+      "module": "客户管理",
+      "name": "搜索无结果时表格为空",
+      "pass": true,
+      "actual": "0 行"
+    },
+    {
+      "id": "U3.3",
+      "module": "客户管理",
+      "name": "新增客户弹窗打开",
+      "pass": true,
+      "actual": ""
+    },
+    {
+      "id": "U3.4",
+      "module": "客户管理",
+      "name": "新增客户提交反馈",
+      "pass": true,
+      "actual": ""
+    },
+    {
+      "id": "U3.5",
+      "module": "客户管理",
+      "name": "勾选行出现批量操作栏",
+      "pass": true,
+      "actual": ""
+    },
+    {
+      "id": "U3.6",
+      "module": "客户管理",
+      "name": "详情跳转客户详情页",
+      "pass": true,
+      "actual": "/customers/h001"
+    },
+    {
+      "id": "U4.1",
+      "module": "客户详情",
+      "name": "Tab 导航渲染",
+      "pass": true,
+      "actual": "5 个 Tab"
+    },
+    {
+      "id": "U4.2",
+      "module": "客户详情",
+      "name": "概要指标卡",
+      "pass": true,
+      "actual": ""
+    },
+    {
+      "id": "U4.3",
+      "module": "客户详情",
+      "name": "设备清单 Tab 切换",
+      "pass": true,
+      "actual": ""
+    },
+    {
+      "id": "U4.4",
+      "module": "客户详情",
+      "name": "一键续期反馈",
+      "pass": true,
+      "actual": ""
+    },
+    {
+      "id": "U5.1",
+      "module": "授权管理",
+      "name": "授权表格渲染",
+      "pass": true,
+      "actual": ""
+    },
+    {
+      "id": "U5.2",
+      "module": "授权管理",
+      "name": "发放授权弹窗打开",
+      "pass": true,
+      "actual": ""
+    },
+    {
+      "id": "U5.3",
+      "module": "授权管理",
+      "name": "签发提交反馈",
+      "pass": true,
+      "actual": ""
+    },
+    {
+      "id": "U6.1",
+      "module": "套餐管理",
+      "name": "3 档套餐卡片",
+      "pass": true,
+      "actual": "3 张"
+    },
+    {
+      "id": "U6.2",
+      "module": "套餐管理",
+      "name": "套餐功能清单",
+      "pass": true,
+      "actual": ""
+    },
+    {
+      "id": "U7.1",
+      "module": "AI 智能风控",
+      "name": "风控 KPI 卡",
+      "pass": true,
+      "actual": ""
+    },
+    {
+      "id": "U7.2",
+      "module": "AI 智能风控",
+      "name": "告警表格渲染",
+      "pass": true,
+      "actual": ""
+    },
+    {
+      "id": "U7.3",
+      "module": "AI 智能风控",
+      "name": "等级筛选生效",
+      "pass": true,
+      "actual": "紧急 2 行"
+    },
+    {
+      "id": "U7.4",
+      "module": "AI 智能风控",
+      "name": "告警处置反馈",
+      "pass": true,
+      "actual": ""
+    },
+    {
+      "id": "U8.1",
+      "module": "到期续期",
+      "name": "到期分布 4 卡",
+      "pass": true,
+      "actual": ""
+    },
+    {
+      "id": "U8.2",
+      "module": "到期续期",
+      "name": "自动续期开关",
+      "pass": true,
+      "actual": ""
+    },
+    {
+      "id": "U8.3",
+      "module": "到期续期",
+      "name": "自动续期切换反馈",
+      "pass": true,
+      "actual": ""
+    },
+    {
+      "id": "U8.4",
+      "module": "到期续期",
+      "name": "批量续期反馈",
+      "pass": true,
+      "actual": ""
+    },
+    {
+      "id": "U9.1",
+      "module": "安全设计",
+      "name": "签发流程 6 步",
+      "pass": true,
+      "actual": "6 步"
+    },
+    {
+      "id": "U9.2",
+      "module": "安全设计",
+      "name": "风控规则表",
+      "pass": true,
+      "actual": ""
+    },
+    {
+      "id": "U9.3",
+      "module": "安全设计",
+      "name": "吊销弹窗（含原因）打开",
+      "pass": true,
+      "actual": ""
+    },
+    {
+      "id": "U9.4",
+      "module": "安全设计",
+      "name": "吊销提交反馈",
+      "pass": true,
+      "actual": ""
+    },
+    {
+      "id": "U10.1",
+      "module": "全局",
+      "name": "SPA 深链接直达子路由",
+      "pass": true,
+      "actual": ""
+    },
+    {
+      "id": "U10.2",
+      "module": "全局",
+      "name": "刷新子路由不丢页",
+      "pass": true,
+      "actual": ""
+    },
+    {
+      "id": "U10.3",
+      "module": "全局",
+      "name": "退出登录回到登录页",
+      "pass": true,
+      "actual": ""
+    },
+    {
+      "id": "U10.4",
+      "module": "全局",
+      "name": "未登录访问受保护页被拦截",
+      "pass": true,
+      "actual": "/login"
+    },
+    {
+      "id": "U10.5",
+      "module": "全局",
+      "name": "页面无 JS 报错",
+      "pass": true,
+      "actual": "0 个"
+    }
+  ]
+}

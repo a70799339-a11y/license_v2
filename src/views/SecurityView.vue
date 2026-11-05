@@ -34,11 +34,22 @@ const wecom = ref({ opsWebhook: '', pushEnabled: false, dryRun: true })
 const wecomTestResult = ref('')
 const simText = ref('状态 HT-0001')
 const simReply = ref('')
+const wsStatus = ref<{ running: boolean; authenticated: boolean; last_error: string; started_at: string; msg_count: number } | null>(null)
 
 async function loadWecom() {
   try {
-    wecom.value = await api.wecomConfig()
+    const cfg = await api.wecomConfig() as Record<string, unknown>
+    wecom.value = {
+      opsWebhook: String(cfg.opsWebhook || ''),
+      pushEnabled: Boolean(cfg.pushEnabled),
+      dryRun: Boolean(cfg.dryRun),
+    }
   } catch { /* 无权限时忽略 */ }
+  try {
+    wsStatus.value = await fetch('/api/wecom/ws-status', {
+      headers: { Authorization: `Bearer ${localStorage.getItem('license_token')}` },
+    }).then(r => r.json())
+  } catch { /* 忽略 */ }
 }
 
 async function saveWecom() {
@@ -146,6 +157,14 @@ async function revokeWithReason(row: License) {
         dry-run 开启时只记录不外发，用于调试；推送内容自动脱敏。
       </p>
       <div style="display: flex; flex-direction: column; gap: 12px">
+        <div class="ws-row">
+          <span class="muted small">智能机器人长连接（指令通道，凭据配置于服务端 backend/.env）</span>
+          <el-tag v-if="wsStatus?.authenticated" type="success" size="small">已连接</el-tag>
+          <el-tag v-else-if="wsStatus?.running" type="warning" size="small">连接中</el-tag>
+          <el-tag v-else type="info" size="small">未启用</el-tag>
+          <span v-if="wsStatus?.msg_count" class="muted small">已处理 {{ wsStatus.msg_count }} 条消息</span>
+          <span v-if="wsStatus?.last_error" class="muted small" style="color: #b91c1c">{{ wsStatus.last_error }}</span>
+        </div>
         <div style="display: flex; gap: 12px; align-items: center">
           <el-input v-model="wecom.opsWebhook" placeholder="运营群机器人 webhook 地址" style="flex: 1" show-password />
           <el-switch v-model="wecom.pushEnabled" active-text="启用推送" />
@@ -241,6 +260,7 @@ async function revokeWithReason(row: License) {
 .card-title { font-size: 15px; font-weight: 600; margin-bottom: 16px; }
 .flow-card { padding: 20px; }
 .sim-reply { background: #f4f4f5; border-radius: 6px; padding: 10px 14px; font-size: 12px; white-space: pre-wrap; margin: 0; }
+.ws-row { display: flex; gap: 10px; align-items: center; background: #fafafa; border: 1px solid var(--border, #e5e5e5); border-radius: 6px; padding: 8px 12px; }
 .flow-row { display: flex; align-items: center; gap: 4px; }
 .step { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 6px; }
 .badge {

@@ -29,10 +29,17 @@ async def lifespan(app: FastAPI):
         seed(db)
     finally:
         db.close()
+    # 企微智能机器人长连接（配置齐备时自动启动，读 backend/.env 或环境变量）
+    try:
+        from .wecom_ws import start_ws
+
+        start_ws()
+    except Exception:
+        pass
     yield
 
 
-app = FastAPI(title="酒店AI管理 License 授权管理系统", version="0.0.1", lifespan=lifespan)
+app = FastAPI(title="酒店AI管理 License 授权管理系统", version="0.2.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -485,13 +492,19 @@ def _mask_url(url: str) -> str:
 
 @app.get("/api/wecom/config")
 def wecom_config(db: Session = Depends(get_db), _: User = Depends(require_roles("admin", "operator"))):
-    from .wecom import group_hooks, is_dry_run, ops_webhook, push_enabled
+    from .wecom import group_hooks, is_dry_run, ops_webhook, push_enabled, get_setting
+    from .wecom_ws import ws_status
 
+    secret = get_setting(db, "wecom_bot_secret")
     return {
         "opsWebhook": _mask_url(ops_webhook(db)),
         "pushEnabled": push_enabled(db),
         "dryRun": is_dry_run(db),
         "groupHooks": {gid: _mask_url(u) for gid, u in group_hooks(db).items()},
+        "botId": get_setting(db, "wecom_bot_id"),
+        "botSecretMasked": (secret[:4] + "***") if secret else "",
+        "wsEnabled": get_setting(db, "wecom_bot_enabled") == "on",
+        "wsStatus": ws_status(),
     }
 
 
@@ -538,6 +551,13 @@ def wecom_test(db: Session = Depends(get_db), user: User = Depends(require_roles
     write_log(db, user, "企微测试", "wecom", f"测试推送 {r.get('sent')}")
     db.commit()
     return {"ok": True, "sent": r.get("sent"), "dryRun": r.get("dry_run")}
+
+
+@app.get("/api/wecom/ws-status")
+def wecom_ws_status(_: User = Depends(require_roles("admin", "operator"))):
+    from .wecom_ws import ws_status
+
+    return ws_status()
 
 
 @app.post("/api/wecom/flush-daily")

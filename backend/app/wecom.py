@@ -206,7 +206,10 @@ def process_command(db: Session, text: str, sender: str = "unknown") -> str:
         )
 
     if binding is None:
-        return "你的企微账号尚未绑定，请联系管理员在后台「用户管理」绑定后使用。"
+        return (
+            f"你的企微账号尚未绑定（userid：{sender}）。\n"
+            f"请联系管理员绑定后使用；回复『帮助』可先看指令列表。"
+        )
 
     parts = text.split()
     cmd, code = parts[0], (parts[1] if len(parts) > 1 else "")

@@ -5,6 +5,9 @@ client/src-tauri/target/
 client/node_modules/
 backend/static/
 backend/keys/          # 签名私钥，绝不入库
+backend/.env           # 企微机器人等本地凭据，绝不入库
+# 企微机器人本地配置，绝不入库
+backend/wecom-bot.conf
 __pycache__/
 *.pyc
 .venv/

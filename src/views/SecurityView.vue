@@ -38,16 +38,18 @@ const steps = [
   { n: 6, title: '公钥验签', desc: '心跳 + 吊销校验', server: false },
 ]
 
-// 风控告警规则（与 AI 风控页联动的静态规则定义）
+// 风控告警规则（与实时告警管道一一对应：检测点命中自动写入风控告警）
 const rules = [
-  { rule: '多设备并发激活', level: '高', action: '自动暂停授权', on: true },
-  { rule: '时间回滚', level: '高', action: '冻结并告警', on: true },
-  { rule: '设备指纹变更', level: '中', action: '要求重新激活', on: true },
-  { rule: '心跳中断（72h）', level: '中', action: '短信提醒转人工', on: true },
-  { rule: '异地 IP 聚集', level: '中', action: '二次验证并告警', on: true },
-  { rule: '破解特征检测', level: '紧急', action: '立即吊销', on: true },
-  { rule: 'License 共享检测', level: '高', action: '限流并告警', on: true },
-  { rule: '客户端完整性校验', level: '紧急', action: '拒绝启动', on: true },
+  { rule: '多设备并发激活', level: '高', action: '实时告警 + 人工核查', on: true },
+  { rule: '时间回滚', level: '高', action: '实时告警（客户端上报时钟异常）', on: true },
+  { rule: '设备指纹变更', level: '高', action: '拒绝心跳 + 实时告警', on: true },
+  { rule: '心跳中断', level: '中', action: '离线宽限超时锁定 + 告警', on: true },
+  { rule: 'License 共享检测', level: '高', action: '拒绝激活 + 实时告警', on: true },
+  { rule: '吊销后使用', level: '紧急', action: '拒绝请求 + 实时告警', on: true },
+  { rule: '无效激活尝试', level: '中', action: '实时告警', on: true },
+  { rule: '设备数超限', level: '中', action: '拒绝激活 + 实时告警', on: true },
+  { rule: '异地 IP 聚集', level: '中', action: '规则预留（下版本）', on: false },
+  { rule: '客户端完整性校验', level: '紧急', action: '反调试门禁拒绝启动（已实现）', on: true },
 ]
 
 // 吊销记录 = 已吊销的授权

@@ -359,6 +359,92 @@ def main():
     check("T13.3", "离线宽限", "激活响应含宽限时长", st == 200
           and (p or {}).get("offline_grace_hours") == 72, f"grace={(p or {}).get('offline_grace_hours')}")
 
+    # ---------------- 14. 实时告警管道（检测→自动记账） ----------------
+    print("【14. 实时告警管道】")
+
+    def alerts_of(rule, hotel=None):
+        st, p = req("GET", "/api/alerts", token=token)
+        out = [a for a in (p or []) if a.get("rule") == rule]
+        if hotel is not None:
+            out = [a for a in out if a.get("hotelName") == hotel]
+        return out
+
+    def t14fp(tag):
+        """每轮唯一的设备指纹（固定指纹重复跑会触发跨店绑定 409）"""
+        return (f"{ts:08x}" + tag * 60)[:64]
+
+    # 无效激活尝试（同一无效码两次 → 只记一条，验证去重）
+    for _ in range(2):
+        req("POST", "/api/client/activate", {"licenseCode": f"NOPE-{ts}"},
+            headers={"X-Device-Fingerprint": t14fp("a")})
+    invalid = alerts_of("无效激活尝试", hotel=f"NOPE-{ts}")
+    check("T14.1", "告警管道", "无效激活自动告警（含 24h 去重）", len(invalid) == 1,
+          f"{len(invalid)} 条")
+
+    # 指纹变更（凭证挪机）
+    req("POST", "/api/client/heartbeat", {"clientVersion": "0.1.0"},
+        token=ctoken, headers={"X-Device-Fingerprint": "ff" * 32})
+    fp_alerts = alerts_of("设备指纹变更")
+    check("T14.2", "告警管道", "指纹不一致心跳触发「设备指纹变更」", len(fp_alerts) >= 1,
+          f"{len(fp_alerts)} 条")
+
+    # 时间回滚（客户端上报时钟异常）
+    req("POST", "/api/client/heartbeat", {"clientVersion": "0.1.0", "clockAnomaly": True},
+        token=ctoken, headers={"X-Device-Fingerprint": FP})
+    clock_alerts = alerts_of("时间回滚")
+    check("T14.3", "告警管道", "时钟回滚上报触发「时间回滚」", len(clock_alerts) >= 1,
+          f"{len(clock_alerts)} 条")
+
+    # 吊销后使用：专用酒店 激活→吊销→心跳
+    st, p = req("POST", "/api/hotels",
+                {"name": f"告警管道测试店{ts}", "code": f"HT-R{ts}", "plan": "基础版"}, token=token)
+    rid = (p or {}).get("id")
+    st, p = req("POST", "/api/licenses", {"hotelId": rid, "plan": "基础版", "type": "新签", "months": 12}, token=token)
+    rlic = (p or {}).get("code")
+    rfp = t14fp("b")
+    st, p = req("POST", "/api/client/activate",
+                {"licenseCode": rlic, "deviceName": "吊销测试", "clientVersion": "0.1.0"},
+                headers={"X-Device-Fingerprint": rfp})
+    rtok = (p or {}).get("token")
+    st, p = req("GET", "/api/licenses", token=token)
+    rlic_id = next((l["id"] for l in (p or []) if l.get("code") == rlic), None)
+    req("POST", f"/api/licenses/{rlic_id}/revoke", {"reason": "告警管道测试吊销"}, token=token)
+    st, p = req("POST", "/api/client/heartbeat", {"clientVersion": "0.1.0"},
+                token=rtok, headers={"X-Device-Fingerprint": rfp})
+    revoked_alerts = alerts_of("吊销后使用")
+    check("T14.4", "告警管道", "吊销授权仍心跳触发「吊销后使用」",
+          len(revoked_alerts) >= 1 and (p or {}).get("status") == "revoked",
+          f"{len(revoked_alerts)} 条 status={(p or {}).get('status')}")
+
+    # 多设备并发激活：同一店 3 台新设备
+    st, p = req("POST", "/api/hotels",
+                {"name": f"并发激活测试店{ts}", "code": f"HT-M{ts}", "plan": "基础版"}, token=token)
+    mid = (p or {}).get("id")
+    st, p = req("POST", "/api/licenses", {"hotelId": mid, "plan": "基础版", "type": "新签", "months": 12}, token=token)
+    mlic = (p or {}).get("code")
+    for i in range(3):
+        req("POST", "/api/client/activate",
+            {"licenseCode": mlic, "deviceName": f"并发机{i+1}", "clientVersion": "0.1.0"},
+            headers={"X-Device-Fingerprint": t14fp(f"m{i}")})
+    multi_alerts = alerts_of("多设备并发激活")
+    check("T14.5", "告警管道", "24h 内多设备激活触发「多设备并发激活」", len(multi_alerts) >= 1,
+          f"{len(multi_alerts)} 条")
+
+    # 心跳中断：读取告警触发惰性扫描，重复读取不重复记账
+    st, p = req("GET", "/api/alerts", token=token)
+    n1 = len([a for a in (p or []) if a.get("rule") == "心跳中断"])
+    st, p = req("GET", "/api/alerts", token=token)
+    n2 = len([a for a in (p or []) if a.get("rule") == "心跳中断"])
+    check("T14.6", "告警管道", "长期无心跳触发「心跳中断」且不重复记账", n1 >= 1 and n1 == n2,
+          f"首轮 {n1} 条，复读 {n2} 条")
+
+    # 聚合视图兼容真实告警
+    st, p = req("GET", "/api/alerts/groups", token=token)
+    rules_seen = {g.get("rule") for g in (p or [])}
+    check("T14.7", "告警管道", "聚合视图覆盖真实告警规则",
+          st == 200 and {"设备指纹变更", "时间回滚"} <= rules_seen,
+          f"{len(rules_seen)} 类规则")
+
     # ---------------- 汇总 ----------------
     passed = sum(1 for r in results if r["pass"])
     total = len(results)

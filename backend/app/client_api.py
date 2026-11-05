@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from .auth import ALGORITHM, JWT_SECRET
+from .alerting import raise_alert
 from .database import get_db
 from .license_crypto import sign_license
 from .models import Alert, AuditLog, Device, Group, Hotel, License, Setting
@@ -36,6 +37,7 @@ class ActivateRequest(BaseModel):
 
 class HeartbeatRequest(BaseModel):
     clientVersion: str = CLIENT_VERSION
+    clockAnomaly: bool = False  # 客户端自检发现本机时钟回滚时上报 → 触发「时间回滚」告警
 
 
 class ClientContext(BaseModel):
@@ -101,9 +103,18 @@ def license_payload_for(hotel: Hotel, lic: License) -> dict:
 
 
 def find_active_license(db: Session, hotel: Hotel) -> Optional[License]:
-    return (
+    """优先取未吊销授权；若全部吊销则返回最近一条（供 revoked 状态判定）"""
+    lic = (
         db.query(License)
         .filter(License.hotel_name == hotel.name, License.status != "已吊销")
+        .order_by(License.expire_at.desc())
+        .first()
+    )
+    if lic is not None:
+        return lic
+    return (
+        db.query(License)
+        .filter(License.hotel_name == hotel.name)
         .order_by(License.expire_at.desc())
         .first()
     )
@@ -207,10 +218,20 @@ def activate(
         if hotel is not None:
             lic = find_active_license(db, hotel)
     if hotel is None:
+        raise_alert(
+            db, level="中", rule="无效激活尝试", hotel_name=req.licenseCode or "未知",
+            detail=f"无效授权码/客户编号激活尝试（指纹 {fingerprint[:12]}…）",
+        )
+        db.commit()
         raise HTTPException(status_code=404, detail="授权码/客户编号无效")
     if hotel.status == "已停用":
         raise HTTPException(status_code=403, detail="该客户已停用，无法激活")
     if lic is None or lic.status == "已吊销":
+        raise_alert(
+            db, level="高", rule="吊销后使用", hotel_name=hotel.name,
+            detail=f"已吊销/无效授权仍尝试激活（授权码 {req.licenseCode}）",
+        )
+        db.commit()
         raise HTTPException(status_code=403, detail="授权已吊销或不存在，无法激活")
 
     # 指纹唯一性：同一设备只能绑定一家酒店
@@ -220,6 +241,11 @@ def activate(
         .first()
     )
     if other is not None:
+        raise_alert(
+            db, level="高", rule="License 共享检测", hotel_name=hotel.name,
+            detail=f"设备已绑定「{other.name}」又尝试激活本店，疑似授权共享（指纹 {fingerprint[:12]}…）",
+        )
+        db.commit()
         raise HTTPException(status_code=409, detail=f"该设备已绑定酒店「{other.name}」，如需变更请联系服务商")
 
     device = (
@@ -229,6 +255,11 @@ def activate(
     )
     if device is None:
         if hotel.devices >= hotel.max_devices:
+            raise_alert(
+                db, level="中", rule="设备数超限", hotel_name=hotel.name,
+                detail=f"设备数已达上限 {hotel.max_devices} 仍尝试激活新设备",
+            )
+            db.commit()
             raise HTTPException(status_code=403, detail="设备数已达套餐上限，请先解绑或升级套餐")
         device = Device(
             id=f"cd{datetime.utcnow().strftime('%H%M%S')}{fingerprint[:6]}",
@@ -241,6 +272,18 @@ def activate(
         )
         db.add(device)
         hotel.devices = (hotel.devices or 0) + 1
+        # 多设备并发激活：24h 内已有 ≥2 台活跃设备，又新增一台
+        day_ago = (datetime.utcnow() - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+        active_recent = (
+            db.query(Device)
+            .filter(Device.hotel_id == hotel.id, Device.last_active >= day_ago)
+            .count()
+        )
+        if active_recent >= 2:
+            raise_alert(
+                db, level="高", rule="多设备并发激活", hotel_name=hotel.name,
+                detail=f"24 小时内第 {active_recent + 1} 台设备激活，疑似授权共享",
+            )
     else:
         device.last_active = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         device.status = "在线"
@@ -279,7 +322,33 @@ def heartbeat(
 ):
     # 指纹一致性校验（防凭证拷贝到其他机器）
     if fingerprint and fingerprint != ctx.fingerprint:
+        # 实时告警：凭证挪机/指纹变更
+        owner = (
+            db.query(Hotel).filter(Hotel.id == ctx.hotel_id).first()
+            if ctx.scope == "hotel"
+            else db.query(Group).filter(Group.id == ctx.hotel_id).first()
+        )
+        raise_alert(
+            db, level="高", rule="设备指纹变更",
+            hotel_name=owner.name if owner else ctx.hotel_id,
+            detail=f"心跳指纹 {fingerprint[:12]}… 与激活指纹 {ctx.fingerprint[:12]}… 不一致，疑似凭证拷贝",
+        )
+        db.commit()
         raise HTTPException(status_code=401, detail="设备指纹不一致，请重新激活")
+
+    # 客户端上报本机时钟回滚 → 实时告警
+    if req.clockAnomaly:
+        owner = (
+            db.query(Hotel).filter(Hotel.id == ctx.hotel_id).first()
+            if ctx.scope == "hotel"
+            else db.query(Group).filter(Group.id == ctx.hotel_id).first()
+        )
+        raise_alert(
+            db, level="高", rule="时间回滚",
+            hotel_name=owner.name if owner else ctx.hotel_id,
+            detail="客户端上报本机时钟回滚（检测到系统时间早于上次同步）",
+        )
+        db.commit()
 
     version = latest_version_info(db)
     update_available = req.clientVersion != version["latest"]
@@ -333,6 +402,24 @@ def heartbeat(
 
     lic = find_active_license(db, hotel)
     status = license_status(hotel, lic)
+
+    # 实时告警：心跳中断后恢复 / 吊销与过期授权仍在使用
+    gap = (datetime.utcnow() - datetime.strptime(hotel.last_active, "%Y-%m-%d %H:%M:%S")).total_seconds() / 3600 if hotel.last_active else 0
+    if hotel.last_active and gap > offline_grace_hours(db):
+        raise_alert(
+            db, level="中", rule="心跳中断", hotel_name=hotel.name,
+            detail=f"中断 {gap:.0f} 小时后恢复心跳（宽限 {offline_grace_hours(db)}h）",
+        )
+    if status == "revoked":
+        raise_alert(
+            db, level="紧急", rule="吊销后使用", hotel_name=hotel.name,
+            detail="已吊销授权的客户端仍在发起心跳",
+        )
+    elif status == "expired":
+        raise_alert(
+            db, level="高", rule="吊销后使用", hotel_name=hotel.name,
+            detail="已过期授权的客户端仍在发起心跳",
+        )
 
     db.commit()
     return {

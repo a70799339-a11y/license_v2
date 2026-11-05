@@ -238,6 +238,9 @@ def revoke_license(license_id: str, req: RevokeRequest | None = None, db: Sessio
 # ---------- 告警 ----------
 @app.get("/api/alerts")
 def list_alerts(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
+    from .alerting import scan_stale_heartbeats
+
+    scan_stale_heartbeats(db)  # 读取时惰性扫描长期无心跳的在册酒店
     return [AlertOut.from_orm_model(a) for a in db.query(Alert).order_by(Alert.time.desc()).all()]
 
 
@@ -455,6 +458,9 @@ def list_logs(db: Session = Depends(get_db), _: User = Depends(get_current_user)
 # ---------- 统计（经营总览） ----------
 @app.get("/api/stats")
 def stats(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
+    from .alerting import scan_stale_heartbeats
+
+    scan_stale_heartbeats(db)
     hotels = db.query(Hotel).all()
     today = datetime.utcnow()
     expire_soon = {"d7": 0, "d30": 0, "d60": 0, "d90": 0}

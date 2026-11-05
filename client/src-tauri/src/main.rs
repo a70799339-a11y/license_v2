@@ -225,7 +225,12 @@ fn heartbeat_core(fp: &str, st: &mut ClientState) -> Result<Value, String> {
     if st.token.is_empty() {
         return Err("尚未激活".into());
     }
-    let body = json!({ "clientVersion": CLIENT_VERSION });
+    // 客户端本机时钟回滚自检：本地时间早于上次服务端时间 → 上报异常（触发服务端「时间回滚」告警）
+    let clock_anomaly = match license_core::parse_utc(&st.last_server_time) {
+        Some(last_server) => now_unix() + 300 < last_server, // 允许 5 分钟时钟容差
+        None => false,
+    };
+    let body = json!({ "clientVersion": CLIENT_VERSION, "clockAnomaly": clock_anomaly });
     let resp = http_post(
         &api_url(&st.server_url, "/api/client/heartbeat"),
         fp,

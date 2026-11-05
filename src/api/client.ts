@@ -100,6 +100,25 @@ export interface AuditLog {
   createdAt: string
 }
 
+export interface LlmCallLog {
+  id: number
+  sourceType: string
+  sourceId: string
+  sourceName: string
+  userId: string
+  scene: string
+  userInput: string
+  modelInput: string
+  modelOutput: string
+  modelName: string
+  tokensIn: number
+  tokensOut: number
+  latencyMs: number
+  status: string
+  error: string
+  createdAt: string
+}
+
 export interface HotelDetail {
   hotel: Hotel
   devices: Device[]
@@ -219,4 +238,18 @@ export const api = {
   updateSetting: (key: string, value: string) =>
     request<{ ok: boolean }>('/settings', { method: 'POST', body: JSON.stringify({ key, value }) }),
   listLogs: () => request<AuditLog[]>('/logs'),
+
+  // 大模型调用审计（每次 LLM 调用全量留痕，脱敏落库）
+  listLlmLogs: (params?: { sourceType?: string; scene?: string; limit?: number }) => {
+    const q = new URLSearchParams()
+    if (params?.sourceType) q.set('sourceType', params.sourceType)
+    if (params?.scene) q.set('scene', params.scene)
+    q.set('limit', String(params?.limit ?? 50))
+    return request<LlmCallLog[]>(`/llm-logs?${q.toString()}`)
+  },
+  simulateLlmCall: (data: { sourceType: string; scene: string; userInput: string }) =>
+    request<{ ok: boolean; result: { status: string; latencyMs: number } }>('/llm-logs/simulate', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
 }

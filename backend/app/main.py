@@ -626,6 +626,79 @@ def list_logs(db: Session = Depends(get_db), _: User = Depends(get_current_user)
     return [AuditLogOut.from_orm_model(a) for a in logs]
 
 
+# ---------- 大模型调用审计（集团/门店/后台 经服务端网关的每次 LLM 调用） ----------
+@app.get("/api/llm-logs")
+def list_llm_logs(
+    sourceType: str = "",
+    scene: str = "",
+    limit: int = 50,
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    from .models import LLMCallLog
+
+    q = db.query(LLMCallLog).order_by(LLMCallLog.created_at.desc())
+    if sourceType:
+        q = q.filter(LLMCallLog.source_type == sourceType)
+    if scene:
+        q = q.filter(LLMCallLog.scene == scene)
+    return [
+        {
+            "id": r.id,
+            "sourceType": r.source_type,
+            "sourceId": r.source_id,
+            "sourceName": r.source_name,
+            "userId": r.user_id,
+            "scene": r.scene,
+            "userInput": r.user_input,
+            "modelInput": r.model_input,
+            "modelOutput": r.model_output,
+            "modelName": r.model_name,
+            "tokensIn": r.tokens_in,
+            "tokensOut": r.tokens_out,
+            "latencyMs": r.latency_ms,
+            "status": r.status,
+            "error": r.error,
+            "createdAt": r.created_at.strftime("%Y-%m-%d %H:%M:%S") if r.created_at else "",
+        }
+        for r in q.limit(max(1, min(limit, 200))).all()
+    ]
+
+
+class LLMSimulateReq(BaseModel):
+    sourceType: str = "admin"       # group / hotel / admin
+    sourceId: str = "demo"
+    sourceName: str = "演示来源"
+    userId: str = "admin"
+    scene: str = "对话查询"
+    userInput: str = "最近哪家酒店风险最高？联系人手机 13812345678"
+
+
+@app.post("/api/llm-logs/simulate")
+def simulate_llm_call(
+    req: LLMSimulateReq,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("admin", "operator")),
+):
+    """演示/自测：走真实审计网关产生一条 LLM 调用记录（验证留痕与脱敏）"""
+    from .llm_audit import llm_call
+
+    prompt = f"请基于授权管理数据回答运营问题：{req.userInput}"
+    r = llm_call(
+        db,
+        source_type=req.sourceType if req.sourceType in ("group", "hotel", "admin") else "admin",
+        source_id=req.sourceId,
+        source_name=req.sourceName,
+        user_id=req.userId,
+        scene=req.scene,
+        user_input=req.userInput,
+        prompt=prompt,
+    )
+    write_log(db, user, "大模型调用(模拟)", req.sourceName, f"场景：{req.scene}")
+    db.commit()
+    return {"ok": True, "result": r}
+
+
 # ---------- 统计（经营总览） ----------
 @app.get("/api/stats")
 def stats(db: Session = Depends(get_db), _: User = Depends(get_current_user)):

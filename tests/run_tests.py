@@ -628,6 +628,38 @@ def main():
     check("T17.6", "客户端企微配置", "配置变更审计留痕且 webhook key 脱敏", log_ok,
           f"{len(cfg_logs)} 条配置日志")
 
+    # ---------------- 18. 大模型调用审计（全量留痕 + 脱敏） ----------------
+    print("【18. 大模型调用审计】")
+
+    secret_input = f"联系人手机 13812345678，酒店设备指纹 {'cd' * 32}，最近哪家风险高？-{ts}"
+    st, p = req("POST", "/api/llm-logs/simulate",
+                {"sourceType": "group", "sourceId": "GP-0001", "sourceName": "审计测试集团",
+                 "userId": "u-test", "scene": "对话查询", "userInput": secret_input},
+                token=token)
+    check("T18.1", "大模型审计", "经网关调用自动留痕（输入/输出/模型/耗时）",
+          st == 200 and (p or {}).get("result", {}).get("status") == "success",
+          f"status={(p or {}).get('result', {}).get('status')}")
+
+    st, logs = req("GET", "/api/llm-logs?sourceType=group&limit=10", token=token)
+    rec = next((l for l in (logs or []) if "审计测试集团" in (l.get("sourceName") or "")), {})
+    masked_ok = (
+        "138****5678" in (rec.get("userInput") or "")
+        and "13812345678" not in (rec.get("userInput") or "")
+        and "13812345678" not in (rec.get("modelInput") or "")
+        and bool(rec.get("modelOutput"))
+        and rec.get("sourceType") == "group"
+    )
+    check("T18.2", "大模型审计", "用户输入/模型输入输出落库且自动脱敏", masked_ok,
+          f"rec={'有' if rec else '无'}")
+
+    st, logs2 = req("GET", "/api/llm-logs?sourceType=hotel&limit=10", token=token)
+    only_hotel = all(l.get("sourceType") == "hotel" for l in (logs2 or []))
+    check("T18.3", "大模型审计", "按调用来源（集团/门店/后台）过滤", st == 200 and only_hotel,
+          f"hotel 来源 {len(logs2 or [])} 条")
+
+    st, p = req("POST", "/api/llm-logs/simulate", {"sourceType": "admin", "userInput": "x"}, token=vtok)
+    check("T18.4", "大模型审计", "只读角色无权触发调用（403）", st == 403, f"HTTP {st}")
+
     # ---------------- 汇总 ----------------
     passed = sum(1 for r in results if r["pass"])
     total = len(results)

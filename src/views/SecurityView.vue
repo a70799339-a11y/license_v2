@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { api, type License } from '../api/client'
+import { api, type License, type LlmCallLog } from '../api/client'
 
 const licenses = ref<License[]>([])
 const loading = ref(true)
@@ -13,6 +13,7 @@ onMounted(async () => {
     licenses.value = l
     if (s.heartbeat_timeout_hours) graceHours.value = s.heartbeat_timeout_hours
     await loadWecom()
+    await loadLlmLogs()
   } finally {
     loading.value = false
   }
@@ -78,6 +79,35 @@ async function pushDaily() {
 async function runSim() {
   const r = await api.wecomSimulate(simText.value)
   simReply.value = r.reply
+}
+
+// ---------- 大模型调用审计 ----------
+const llmLogs = ref<LlmCallLog[]>([])
+const llmFilter = ref('')
+const llmDetail = ref<LlmCallLog | null>(null)
+const llmDetailShow = ref(false)
+const llmSimInput = ref('最近哪家酒店风险最高？联系人手机 13812345678')
+
+async function loadLlmLogs() {
+  llmLogs.value = await api.listLlmLogs({ sourceType: llmFilter.value || undefined, limit: 30 })
+}
+
+async function simulateLlm() {
+  try {
+    await api.simulateLlmCall({
+      sourceType: llmFilter.value || 'admin',
+      scene: '对话查询',
+      userInput: llmSimInput.value,
+    })
+    await loadLlmLogs()
+    ElMessage.success('已产生一条模拟调用记录（可展开核对脱敏与留痕）')
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '模拟失败')
+  }
+}
+
+function sourceTypeLabel(t: string) {
+  return t === 'group' ? '集团总端' : t === 'hotel' ? '门店客户端' : '管理后台'
 }
 
 // 签发流程 6 步
@@ -179,6 +209,70 @@ async function revokeWithReason(row: License) {
         </div>
         <pre v-if="simReply" class="sim-reply">{{ simReply }}</pre>
       </div>
+    </div>
+
+    <div class="card flow-card mb-20">
+      <div class="card-title">大模型调用审计（集团 / 门店 / 后台 全量留痕）</div>
+      <p class="muted" style="font-size: 12px; margin-bottom: 12px">
+        所有大模型调用统一经服务端网关（客户端不直连 LLM），每次调用记录：调用来源、发起人、用户输入、模型输入/输出、token 用量、耗时——文本统一脱敏后落库。
+      </p>
+      <div style="display: flex; gap: 12px; align-items: center; margin-bottom: 12px">
+        <el-select v-model="llmFilter" placeholder="全部来源" style="width: 140px" clearable @change="loadLlmLogs">
+          <el-option label="集团总端" value="group" />
+          <el-option label="门店客户端" value="hotel" />
+          <el-option label="管理后台" value="admin" />
+        </el-select>
+        <el-input v-model="llmSimInput" placeholder="模拟用户输入（验证留痕与脱敏）" style="flex: 1" />
+        <el-button @click="simulateLlm">模拟一次调用</el-button>
+        <el-button @click="loadLlmLogs">刷新</el-button>
+      </div>
+      <el-table :data="llmLogs" size="small" max-height="360">
+        <el-table-column label="时间" width="140">
+          <template #default="{ row }"><span class="mono">{{ row.createdAt }}</span></template>
+        </el-table-column>
+        <el-table-column label="来源" width="110">
+          <template #default="{ row }">
+            <el-tag size="small" :type="row.sourceType === 'group' ? 'warning' : row.sourceType === 'hotel' ? 'success' : 'info'">
+              {{ sourceTypeLabel(row.sourceType) }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="sourceName" label="实体" width="130" show-overflow-tooltip />
+        <el-table-column prop="scene" label="场景" width="100" />
+        <el-table-column prop="userInput" label="用户输入（脱敏）" min-width="180" show-overflow-tooltip />
+        <el-table-column label="tokens" width="110">
+          <template #default="{ row }"><span class="mono">{{ row.tokensIn }}+{{ row.tokensOut }}</span></template>
+        </el-table-column>
+        <el-table-column prop="latencyMs" label="耗时" width="80">
+          <template #default="{ row }"><span class="mono">{{ row.latencyMs }}ms</span></template>
+        </el-table-column>
+        <el-table-column label="状态" width="80">
+          <template #default="{ row }">
+            <el-tag size="small" :type="row.status === 'success' ? 'success' : 'danger'">{{ row.status }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="详情" width="80" fixed="right">
+          <template #default="{ row }">
+            <el-button link type="primary" size="small" @click="llmDetail = row; llmDetailShow = true">查看</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+      <el-dialog v-model="llmDetailShow" title="大模型调用详情" width="640px">
+        <template v-if="llmDetail">
+          <el-descriptions :column="2" border size="small">
+            <el-descriptions-item label="来源">{{ sourceTypeLabel(llmDetail.sourceType) }} · {{ llmDetail.sourceName }}</el-descriptions-item>
+            <el-descriptions-item label="发起人"><span class="mono">{{ llmDetail.userId }}</span></el-descriptions-item>
+            <el-descriptions-item label="场景">{{ llmDetail.scene }}</el-descriptions-item>
+            <el-descriptions-item label="模型">{{ llmDetail.modelName }}</el-descriptions-item>
+            <el-descriptions-item label="token">{{ llmDetail.tokensIn }} 入 / {{ llmDetail.tokensOut }} 出</el-descriptions-item>
+            <el-descriptions-item label="耗时">{{ llmDetail.latencyMs }}ms</el-descriptions-item>
+          </el-descriptions>
+          <div class="llm-field"><b>用户输入（脱敏）</b><pre>{{ llmDetail.userInput }}</pre></div>
+          <div class="llm-field"><b>模型输入（脱敏）</b><pre>{{ llmDetail.modelInput }}</pre></div>
+          <div class="llm-field"><b>模型输出（脱敏）</b><pre>{{ llmDetail.modelOutput }}</pre></div>
+          <div v-if="llmDetail.error" class="llm-field"><b>错误</b><pre style="color: #b91c1c">{{ llmDetail.error }}</pre></div>
+        </template>
+      </el-dialog>
     </div>
 
     <div class="card flow-card mb-20">
@@ -288,4 +382,10 @@ async function revokeWithReason(row: License) {
 .status-off { color: #ef4444; font-size: 12px; font-weight: 500; }
 .empty { padding: 40px; text-align: center; }
 .divider { height: 8px; background: #fafafa; }
+.llm-field { margin-top: 12px; font-size: 12px; }
+.llm-field b { display: block; margin-bottom: 4px; color: #52525b; }
+.llm-field pre {
+  margin: 0; background: #f4f4f5; border-radius: 6px; padding: 10px 12px;
+  white-space: pre-wrap; word-break: break-all; font-size: 12px; max-height: 160px; overflow: auto;
+}
 </style>

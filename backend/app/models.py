@@ -131,3 +131,25 @@ class AuditLog(Base):
     target = Column(String(128), default="")
     detail = Column(String(256), default="")
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class LLMCallLog(Base):
+    """大模型调用审计 —— 集团/子酒店/管理端经服务端网关的每次 LLM 调用全量留痕"""
+
+    __tablename__ = "llm_call_logs"
+    id = Column(Integer, primary_key=True, index=True)
+    source_type = Column(String(16), default="")   # group=集团总端 / hotel=门店客户端 / admin=管理后台
+    source_id = Column(String(32), default="")     # 集团码或酒店ID
+    source_name = Column(String(128), default="")
+    user_id = Column(String(64), default="")       # 指令发起人（企微 userid / 后台账号）
+    scene = Column(String(64), default="")         # 场景：告警解读/对话查询/处置建议等
+    user_input = Column(Text, default="")          # 用户原始输入（脱敏后）
+    model_input = Column(Text, default="")         # 送入模型的提示词（脱敏后）
+    model_output = Column(Text, default="")        # 模型输出（脱敏后）
+    model_name = Column(String(64), default="")
+    tokens_in = Column(Integer, default=0)
+    tokens_out = Column(Integer, default=0)
+    latency_ms = Column(Integer, default=0)
+    status = Column(String(16), default="success")  # success / error
+    error = Column(String(256), default="")
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)

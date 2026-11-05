@@ -12,6 +12,7 @@ onMounted(async () => {
     const [l, s] = await Promise.all([api.listLicenses(), api.getSettings()])
     licenses.value = l
     if (s.heartbeat_timeout_hours) graceHours.value = s.heartbeat_timeout_hours
+    await loadWecom()
   } finally {
     loading.value = false
   }
@@ -26,6 +27,46 @@ async function saveGrace() {
   }
   await api.updateSetting('heartbeat_timeout_hours', String(n))
   ElMessage.success(`已保存：客户端离线宽限 ${n} 小时（超时禁用，联网恢复）`)
+}
+
+// ---------- 企业微信通知 ----------
+const wecom = ref({ opsWebhook: '', pushEnabled: false, dryRun: true })
+const wecomTestResult = ref('')
+const simText = ref('状态 HT-0001')
+const simReply = ref('')
+
+async function loadWecom() {
+  try {
+    wecom.value = await api.wecomConfig()
+  } catch { /* 无权限时忽略 */ }
+}
+
+async function saveWecom() {
+  try {
+    await api.wecomConfigUpdate(wecom.value)
+    ElMessage.success('企微配置已保存')
+    await loadWecom()
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '保存失败')
+  }
+}
+
+async function testWecom() {
+  const r = await api.wecomTest()
+  wecomTestResult.value = r.dryRun
+    ? `dry-run 模式：内容已生成未外发（${r.sent.join(',')}）`
+    : `已发送：${r.sent.join(',')}`
+  ElMessage.success(wecomTestResult.value)
+}
+
+async function pushDaily() {
+  await api.wecomFlushDaily()
+  ElMessage.success('日报已生成推送（dry-run 时仅记录）')
+}
+
+async function runSim() {
+  const r = await api.wecomSimulate(simText.value)
+  simReply.value = r.reply
 }
 
 // 签发流程 6 步
@@ -95,6 +136,29 @@ async function revokeWithReason(row: License) {
         </el-input>
         <el-button type="primary" @click="saveGrace">保存</el-button>
         <span class="muted" style="font-size: 12px">当前：{{ graceHours }} 小时（默认 72）</span>
+      </div>
+    </div>
+
+    <div class="card flow-card mb-20">
+      <div class="card-title">企业微信通知（运营群推送 + 指令管道）</div>
+      <p class="muted" style="font-size: 12px; margin-bottom: 12px">
+        紧急/高危告警即时推送、日报每日汇总；集团群 webhook 在「集团管理 → 集团详情」配置（只推本集团事件）。
+        dry-run 开启时只记录不外发，用于调试；推送内容自动脱敏。
+      </p>
+      <div style="display: flex; flex-direction: column; gap: 12px">
+        <div style="display: flex; gap: 12px; align-items: center">
+          <el-input v-model="wecom.opsWebhook" placeholder="运营群机器人 webhook 地址" style="flex: 1" show-password />
+          <el-switch v-model="wecom.pushEnabled" active-text="启用推送" />
+          <el-switch v-model="wecom.dryRun" active-text="dry-run" />
+          <el-button type="primary" @click="saveWecom">保存</el-button>
+          <el-button @click="testWecom">测试推送</el-button>
+          <el-button @click="pushDaily">推日报</el-button>
+        </div>
+        <div style="display: flex; gap: 12px; align-items: center">
+          <el-input v-model="simText" placeholder="指令模拟，如：状态 HT-0001" style="flex: 1" />
+          <el-button @click="runSim">执行指令</el-button>
+        </div>
+        <pre v-if="simReply" class="sim-reply">{{ simReply }}</pre>
       </div>
     </div>
 
@@ -176,6 +240,7 @@ async function revokeWithReason(row: License) {
 <style scoped>
 .card-title { font-size: 15px; font-weight: 600; margin-bottom: 16px; }
 .flow-card { padding: 20px; }
+.sim-reply { background: #f4f4f5; border-radius: 6px; padding: 10px 14px; font-size: 12px; white-space: pre-wrap; margin: 0; }
 .flow-row { display: flex; align-items: center; gap: 4px; }
 .step { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 6px; }
 .badge {

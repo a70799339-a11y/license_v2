@@ -24,7 +24,7 @@ router = APIRouter(prefix="/api/client", tags=["client"])
 client_security = HTTPBearer(auto_error=False)
 
 CLIENT_TOKEN_DAYS = 90
-CLIENT_VERSION = "0.1.0"  # 当前打包客户端版本；settings.client_version 为服务端要求的最新版
+CLIENT_VERSION = "0.2.0"  # 当前打包客户端版本；settings.client_version 为服务端要求的最新版
 
 
 # ---------- schemas ----------

@@ -46,6 +46,13 @@ def raise_alert(
     )
     db.add(alert)
     db.flush()
+    # 实时告警企微推送（紧急/高危即时；失败不影响落库）
+    try:
+        from .wecom import notify_alert
+
+        notify_alert(db, alert)
+    except Exception:
+        pass
     return True
 
 

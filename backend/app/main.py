@@ -251,6 +251,13 @@ def list_alerts(db: Session = Depends(get_db), _: User = Depends(get_current_use
     from .alerting import scan_stale_heartbeats
 
     scan_stale_heartbeats(db)  # 读取时惰性扫描长期无心跳的在册酒店
+    try:  # 企微日报惰性触发（仅真实推送开启时）
+        from .wecom import flush_daily, push_enabled
+
+        if push_enabled(db):
+            flush_daily(db)
+    except Exception:
+        pass
     return [AlertOut.from_orm_model(a) for a in db.query(Alert).order_by(Alert.time.desc()).all()]
 
 
@@ -444,6 +451,140 @@ def group_renew(group_id: str, db: Session = Depends(get_db), user: User = Depen
     write_log(db, user, "集团续期", g.name, f"{len(members)} 家门店续期至 2027-12-31")
     db.commit()
     return {"ok": True, "renewed": len(members)}
+
+
+# ---------- 企业微信机器人 ----------
+class WecomConfigUpdate(BaseModel):
+    opsWebhook: str = ""
+    pushEnabled: bool = False
+    dryRun: bool = True
+
+
+class WecomGroupHookReq(BaseModel):
+    groupId: str
+    webhookUrl: str
+
+
+class WecomSimulateReq(BaseModel):
+    text: str
+    userid: str = "admin-sim"
+
+
+class WecomBindingReq(BaseModel):
+    userid: str
+    name: str = ""
+    role: str = "viewer"
+    groupId: str = ""
+
+
+def _mask_url(url: str) -> str:
+    from .masking import mask_text
+
+    return mask_text(url) if url else ""
+
+
+@app.get("/api/wecom/config")
+def wecom_config(db: Session = Depends(get_db), _: User = Depends(require_roles("admin", "operator"))):
+    from .wecom import group_hooks, is_dry_run, ops_webhook, push_enabled
+
+    return {
+        "opsWebhook": _mask_url(ops_webhook(db)),
+        "pushEnabled": push_enabled(db),
+        "dryRun": is_dry_run(db),
+        "groupHooks": {gid: _mask_url(u) for gid, u in group_hooks(db).items()},
+    }
+
+
+@app.post("/api/wecom/config")
+def wecom_config_update(
+    req: WecomConfigUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("admin")),
+):
+    from .wecom import set_setting
+
+    if req.opsWebhook.strip():
+        set_setting(db, "wecom_ops_webhook", req.opsWebhook.strip())
+    set_setting(db, "wecom_push_enabled", "on" if req.pushEnabled else "off")
+    set_setting(db, "wecom_dry_run", "off" if not req.dryRun else "on")
+    write_log(db, user, "企微配置", "wecom", f"推送={'开' if req.pushEnabled else '关'} dry-run={'开' if req.dryRun else '关'}")
+    db.commit()
+    return {"ok": True}
+
+
+@app.post("/api/wecom/group-hook")
+def wecom_group_hook(
+    req: WecomGroupHookReq,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("admin", "operator")),
+):
+    from .models import WecomGroupHook
+
+    row = db.query(WecomGroupHook).filter(WecomGroupHook.group_id == req.groupId).first()
+    if row is None:
+        db.add(WecomGroupHook(group_id=req.groupId, webhook_url=req.webhookUrl.strip()))
+    else:
+        row.webhook_url = req.webhookUrl.strip()
+    write_log(db, user, "企微配置", req.groupId, "配置集团群 webhook")
+    db.commit()
+    return {"ok": True}
+
+
+@app.post("/api/wecom/test")
+def wecom_test(db: Session = Depends(get_db), user: User = Depends(require_roles("admin", "operator"))):
+    from .wecom import push_message
+
+    r = push_message(db, "**✅ 企微推送测试**\nLicense 授权管理系统通知链路正常。")
+    write_log(db, user, "企微测试", "wecom", f"测试推送 {r.get('sent')}")
+    db.commit()
+    return {"ok": True, "sent": r.get("sent"), "dryRun": r.get("dry_run")}
+
+
+@app.post("/api/wecom/flush-daily")
+def wecom_flush_daily(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
+    from .wecom import flush_daily
+
+    return flush_daily(db)
+
+
+@app.post("/api/wecom/simulate")
+def wecom_simulate(
+    req: WecomSimulateReq,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("admin")),
+):
+    """调试入口：模拟企微消息进入指令管道（生产接自建应用回调后走 /api/wecom/callback）"""
+    from .wecom import process_command
+
+    return {"reply": process_command(db, req.text, req.userid)}
+
+
+@app.get("/api/wecom/bindings")
+def wecom_bindings(db: Session = Depends(get_db), _: User = Depends(require_roles("admin"))):
+    from .models import WecomBinding
+
+    return [
+        {"userid": b.userid, "name": b.name, "role": b.role, "groupId": b.group_id}
+        for b in db.query(WecomBinding).all()
+    ]
+
+
+@app.post("/api/wecom/bindings")
+def wecom_binding_create(
+    req: WecomBindingReq,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("admin")),
+):
+    from .models import WecomBinding
+
+    row = db.query(WecomBinding).filter(WecomBinding.userid == req.userid).first()
+    if row is None:
+        db.add(WecomBinding(userid=req.userid, name=req.name, role=req.role, group_id=req.groupId))
+    else:
+        row.name, row.role, row.group_id = req.name, req.role, req.groupId
+    write_log(db, user, "企微绑定", req.userid, f"角色：{req.role} 集团：{req.groupId or '-'}")
+    db.commit()
+    return {"ok": True}
 
 
 @app.post("/api/settings")

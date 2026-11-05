@@ -1,6 +1,6 @@
 [package]
 name = "hotel-client"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "酒店AI管理客户端 —— License 激活 / 心跳同步 / 授权概览"
 

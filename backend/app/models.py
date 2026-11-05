@@ -1,6 +1,6 @@
 """ORM 数据模型 —— groups / hotels / licenses / alerts / plans / users"""
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime
+from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, Text
 from .database import Base
 
 
@@ -27,6 +27,26 @@ class Group(Base):
     expire_at = Column(String(10), default="")
     auto_renew = Column(Boolean, default=False)
     created_at = Column(String(10), default="")
+
+
+class WecomGroupHook(Base):
+    """集团企微群机器人 webhook（场景 B：集团告警/日报推本集团群）"""
+
+    __tablename__ = "wecom_group_hooks"
+    id = Column(Integer, primary_key=True, index=True)
+    group_id = Column(String(16), unique=True, index=True, nullable=False)
+    webhook_url = Column(String(512), default="")
+
+
+class WecomBinding(Base):
+    """企微用户 ↔ 系统角色绑定（指令管道权限依据）"""
+
+    __tablename__ = "wecom_bindings"
+    id = Column(Integer, primary_key=True, index=True)
+    userid = Column(String(64), unique=True, index=True, nullable=False)
+    name = Column(String(64), default="")
+    role = Column(String(16), default="viewer")  # admin / operator / viewer / group
+    group_id = Column(String(16), default="")  # role=group 时生效
 
 
 class Hotel(Base):
@@ -100,7 +120,7 @@ class Device(Base):
 class Setting(Base):
     __tablename__ = "settings"
     key = Column(String(64), primary_key=True)
-    value = Column(String(256), default="")
+    value = Column(Text, default="")  # 可存企微推送记录等长内容
 
 
 class AuditLog(Base):

@@ -497,6 +497,78 @@ def main():
     check("T15.4", "日志脱敏", "设置修改日志掩码手机号",
           "139****4321" in log_text2 and "13987654321" not in log_text2)
 
+    # ---------------- 16. 企业微信机器人 ----------------
+    print("【16. 企业微信机器人】")
+
+    # 配置读写（webhook 返回掩码）
+    st, p = req("POST", "/api/wecom/config",
+                {"opsWebhook": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=abcdef123456",
+                 "pushEnabled": True, "dryRun": True}, token=token)
+    st, p = req("GET", "/api/wecom/config", token=token)
+    check("T16.1", "企微机器人", "配置读写 + webhook 接口掩码返回", st == 200
+          and (p or {}).get("pushEnabled") is True and "abcdef123456" not in str((p or {}).get("opsWebhook")),
+          str((p or {}).get("opsWebhook"))[:40])
+
+    # 测试推送（dry-run 记录）
+    st, p = req("POST", "/api/wecom/test", token=token)
+    st, s2 = req("GET", "/api/settings", token=token)
+    last_push = (s2 or {}).get("wecom_last_push", "")
+    check("T16.2", "企微机器人", "测试推送进入 dry-run 记录", (p or {}).get("dryRun") is True
+          and "企微推送测试" in last_push)
+
+    # 高危告警实时路由（时间回滚=高 → 立即推）：用新店避免 24h 告警去重
+    st, p = req("POST", "/api/hotels",
+                {"name": f"企微推送测试店{ts}", "code": f"HT-W{ts}", "plan": "基础版"}, token=token)
+    wid = (p or {}).get("id")
+    st, p = req("POST", "/api/licenses", {"hotelId": wid, "plan": "基础版", "type": "新签", "months": 12}, token=token)
+    wlic = (p or {}).get("code")
+    wtok = req("POST", "/api/client/activate",
+               {"licenseCode": wlic, "deviceName": "企微推送测试", "clientVersion": "0.1.0"},
+               headers={"X-Device-Fingerprint": t14fp("w")})[1].get("token")
+    req("POST", "/api/client/heartbeat", {"clientVersion": "0.1.0", "clockAnomaly": True},
+        token=wtok, headers={"X-Device-Fingerprint": t14fp("w")})
+    st, s2 = req("GET", "/api/settings", token=token)
+    last_push = (s2 or {}).get("wecom_last_push", "")
+    check("T16.3", "企微机器人", "高危告警即时推送（内容含规则且已脱敏）",
+          "时间回滚" in last_push and f"企微推送测试店{ts}" in last_push,
+          last_push[:60])
+
+    # 指令管道：未绑定 → 绑定 → 查询
+    st, p = req("POST", "/api/wecom/simulate", {"text": "状态 HT-0001", "userid": f"u{ts}"}, token=token)
+    unbound_ok = "尚未绑定" in (p or {}).get("reply", "")
+    req("POST", "/api/wecom/bindings", {"userid": f"u{ts}", "name": "测试员", "role": "operator"}, token=token)
+    st, p = req("POST", "/api/wecom/simulate", {"text": "状态 HT-0001", "userid": f"u{ts}"}, token=token)
+    query_ok = "授权状态" in (p or {}).get("reply", "")
+    check("T16.4", "企微机器人", "指令管道（未绑定拦截 + 绑定后查状态）", unbound_ok and query_ok)
+
+    # 续期二次确认
+    st, p = req("POST", "/api/wecom/simulate", {"text": "续期 HT-0001", "userid": f"u{ts}"}, token=token)
+    step1 = "确认续期" in (p or {}).get("reply", "")
+    st, p = req("POST", "/api/wecom/simulate", {"text": "确认续期 HT-0001", "userid": f"u{ts}"}, token=token)
+    step2 = "已续期" in (p or {}).get("reply", "")
+    check("T16.5", "企微机器人", "续期指令二次确认后执行", step1 and step2)
+
+    # 集团数据隔离：group 绑定用户不能查别家集团门店
+    g0 = (req("GET", "/api/groups", token=token)[1] or [{}])[0].get("id", "g001")
+    req("POST", "/api/wecom/bindings", {"userid": f"ug{ts}", "name": "集团管理员", "role": "group", "groupId": g0}, token=token)
+    st, p = req("POST", "/api/wecom/simulate", {"text": "状态 HT-0001", "userid": f"ug{ts}"}, token=token)
+    reply = (p or {}).get("reply", "")
+    # HT-0001 属于万豪集团(g001)：若 g0==g001 则允许，否则应拒绝——两种情况都验证权限判定生效
+    g0_members = (req("GET", f"/api/groups/{g0}", token=token)[1] or {}).get("members", [])
+    ht_in_g0 = any(m.get("code") == "HT-0001" for m in g0_members)
+    check("T16.6", "企微机器人", "集团绑定指令数据隔离",
+          (ht_in_g0 and "授权状态" in reply) or ((not ht_in_g0) and "授权状态" not in reply),
+          f"HT-0001∈{g0}={ht_in_g0}")
+
+    # 日报生成（dry-run 记录）：先清当日幂等标记
+    req("POST", "/api/settings", {"key": "wecom_daily_last", "value": ""}, token=token)
+    req("POST", "/api/wecom/flush-daily", token=token)
+    st, s2 = req("GET", "/api/settings", token=token)
+    last_push = (s2 or {}).get("wecom_last_push", "")
+    check("T16.7", "企微机器人", "运营日报生成（含当日告警汇总）",
+          "运营日报" in last_push and "新增告警" in last_push,
+          last_push[:60])
+
     # ---------------- 汇总 ----------------
     passed = sum(1 for r in results if r["pass"])
     total = len(results)

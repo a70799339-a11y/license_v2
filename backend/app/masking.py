@@ -22,6 +22,7 @@ _RE_PHONE = re.compile(r"(?<!\d)(1[3-9]\d)(\d{4})(\d{4})(?!\d)")
 _RE_EMAIL = re.compile(r"([\w.+-])[\w.+-]*@([\w.-]+\.[A-Za-z]{2,})")
 _RE_BANK = re.compile(r"(?<!\d)(\d{4})\d{7,13}(\d{4})(?!\d)")
 _RE_FINGERPRINT = re.compile(r"(?<![a-fA-F0-9])([a-fA-F0-9]{6})[a-fA-F0-9]{22,58}([a-fA-F0-9]{4})(?![a-fA-F0-9])")
+_RE_WEBHOOK_KEY = re.compile(r"(key=)[A-Za-z0-9_-]{6,}")
 
 
 def mask_text(text: str) -> str:
@@ -36,6 +37,7 @@ def mask_text(text: str) -> str:
     s = _RE_EMAIL.sub(r"\1***@\2", s)
     s = _RE_BANK.sub(r"************\2", s)
     s = _RE_FINGERPRINT.sub(r"\1…\2", s)
+    s = _RE_WEBHOOK_KEY.sub(r"\1***", s)
 
     def _biz(m: re.Match) -> str:
         prefix, body = m.group(1), m.group(2)

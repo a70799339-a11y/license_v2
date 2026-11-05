@@ -13,7 +13,7 @@ use license_core::{
 use serde_json::{json, Value};
 use tauri::State;
 
-const CLIENT_VERSION: &str = "0.1.0";
+const CLIENT_VERSION: &str = "0.2.0";
 
 fn now_unix() -> i64 {
     std::time::SystemTime::now()

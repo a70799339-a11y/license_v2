@@ -19,6 +19,7 @@ const showDetail = ref(false)
 const allHotels = ref<Hotel[]>([])
 const selectedHotels = ref<string[]>([])
 const showAssign = ref(false)
+const hookUrl = ref('')
 
 async function load() {
   loading.value = true
@@ -50,6 +51,22 @@ async function openDetail(g: Group) {
   const res = await api.groupDetail(g.id)
   members.value = res.members
   showDetail.value = true
+  try {
+    const cfg = await api.wecomConfig()
+    hookUrl.value = cfg.groupHooks[g.id] || ''
+  } catch {
+    hookUrl.value = ''
+  }
+}
+
+async function saveHook() {
+  if (!detail.value) return
+  try {
+    await api.wecomGroupHook(detail.value.id, hookUrl.value)
+    ElMessage.success('集团企微 webhook 已保存（本集团告警/日报将推送到该群）')
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '保存失败')
+  }
 }
 
 async function openAssign() {
@@ -161,6 +178,11 @@ onMounted(load)
           <div><span class="muted">门店 / 设备</span><b>{{ detail.memberCount }} / {{ detail.deviceCount }}</b></div>
         </div>
         <p class="muted small">集团总端激活方式：客户端输入集团码 <b class="mono">{{ detail.code }}</b> 即可进入总端模式。</p>
+        <div class="hook-row">
+          <span class="muted small">集团企微群 webhook</span>
+          <el-input v-model="hookUrl" placeholder="集团群机器人 webhook（本集团告警/日报推送）" size="small" style="flex: 1" show-password />
+          <el-button size="small" type="primary" @click="saveHook">保存</el-button>
+        </div>
         <div class="btn-row">
           <el-button v-if="auth.canWrite" type="primary" size="small" @click="renewAll">全部门店续期一年</el-button>
           <el-button v-if="auth.canWrite" size="small" @click="openAssign">划入门店</el-button>
@@ -206,6 +228,7 @@ onMounted(load)
 .kv-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
 .kv-row > div { display: flex; flex-direction: column; gap: 2px; }
 .btn-row { display: flex; gap: 8px; }
+.hook-row { display: flex; gap: 8px; align-items: center; }
 .muted { color: #a1a1aa; font-size: 12px; }
 .small { font-size: 12px; }
 </style>

@@ -48,6 +48,29 @@ def group_hooks(db: Session) -> dict:
     return {h.group_id: h.webhook_url for h in db.query(WecomGroupHook).all()}
 
 
+# ---------- 实体级 webhook（客户端自助配置） ----------
+def validate_webhook_url(url: str) -> bool:
+    """仅允许企微官方机器人 webhook 域（防 SSRF）"""
+    u = (url or "").strip()
+    return u.startswith("https://qyapi.weixin.qq.com/cgi-bin/webhook/send")
+
+
+def hotel_hook(db: Session, hotel_id: str) -> str:
+    return get_setting(db, f"wecom_hotel_hook_{hotel_id}")
+
+
+def set_hotel_hook(db: Session, hotel_id: str, url: str) -> None:
+    set_setting(db, f"wecom_hotel_hook_{hotel_id}", url.strip())
+
+
+def set_group_hook(db: Session, group_id: str, url: str) -> None:
+    row = db.query(WecomGroupHook).filter(WecomGroupHook.group_id == group_id).first()
+    if row is None:
+        db.add(WecomGroupHook(group_id=group_id, webhook_url=url.strip()))
+    else:
+        row.webhook_url = url.strip()
+
+
 # ---------- 发送 ----------
 def send_webhook(webhook_url: str, content: str) -> tuple:
     """群机器人 webhook 推送 markdown 消息，返回 (ok, err)"""
@@ -65,12 +88,13 @@ def send_webhook(webhook_url: str, content: str) -> tuple:
         return False, str(e)[:100]
 
 
-def push_message(db: Session, content: str, *, group_id: str = "") -> dict:
-    """路由推送：运营群（全量）+ 指定集团群（本集团）。返回路由结果。"""
+def push_message(db: Session, content: str, *, group_id: str = "", hotel_id: str = "") -> dict:
+    """路由推送：运营群（全量）+ 集团群 + 门店群（各自实体配置）。返回路由结果。"""
     masked = mask_text(content)
     record = {
         "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
         "group_id": group_id,
+        "hotel_id": hotel_id,
         "content": masked,
         "sent": [],
         "dry_run": is_dry_run(db),
@@ -85,9 +109,14 @@ def push_message(db: Session, content: str, *, group_id: str = "") -> dict:
     if push_enabled(db):
         if ops_webhook(db):
             targets.append(("ops", ops_webhook(db)))
-        hook = group_hooks(db).get(group_id, "") if group_id else ""
-        if hook:
-            targets.append((f"group:{group_id}", hook))
+        if group_id:
+            hook = group_hooks(db).get(group_id, "")
+            if hook:
+                targets.append((f"group:{group_id}", hook))
+        if hotel_id:
+            hook = hotel_hook(db, hotel_id)
+            if hook:
+                targets.append((f"hotel:{hotel_id}", hook))
     for name, url in targets:
         ok, err = send_webhook(url, masked)
         record["sent"].append(f"{name}:{'ok' if ok else 'fail ' + err}")
@@ -102,12 +131,18 @@ def hotel_group_id(db: Session, hotel_name: str) -> str:
     return (h.group_id or "") if h else ""
 
 
+def hotel_id_by_name(db: Session, hotel_name: str) -> str:
+    h = db.query(Hotel).filter(Hotel.name == hotel_name).first()
+    return (h.id or "") if h else ""
+
+
 def notify_alert(db: Session, alert: Alert) -> None:
     """紧急/高危告警即时推；中危进日报汇总（不单独推）。失败不影响告警落库。"""
     try:
         if alert.level not in ("紧急", "高"):
             return
         gid = hotel_group_id(db, alert.hotel_name)
+        hid = hotel_id_by_name(db, alert.hotel_name)
         content = (
             f"**🚨 风控告警（{alert.level}）**\n"
             f"> 规则：{alert.rule}\n"
@@ -115,7 +150,7 @@ def notify_alert(db: Session, alert: Alert) -> None:
             f"> 详情：{alert.detail}\n"
             f"> 时间：{alert.time}"
         )
-        push_message(db, content, group_id=gid)
+        push_message(db, content, group_id=gid, hotel_id=hid)
     except Exception:
         pass  # 推送失败不影响告警记账
 
@@ -171,7 +206,9 @@ def flush_daily(db: Session) -> dict:
     if get_setting(db, "wecom_daily_last") == today:
         return {"skipped": True, "reason": "今日已推送"}
     results = {"ops": push_message(db, build_ops_daily(db)).get("sent")}
-    for gid in group_hooks(db).keys():
+    for gid, url in group_hooks(db).items():
+        if not url:
+            continue  # 未配置的集团通道跳过
         results[f"group:{gid}"] = push_message(db, build_group_daily(db, gid), group_id=gid).get("sent")
     set_setting(db, "wecom_daily_last", today)
     db.commit()

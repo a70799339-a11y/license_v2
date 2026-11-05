@@ -560,14 +560,73 @@ def main():
           (ht_in_g0 and "授权状态" in reply) or ((not ht_in_g0) and "授权状态" not in reply),
           f"HT-0001∈{g0}={ht_in_g0}")
 
-    # 日报生成（dry-run 记录）：先清当日幂等标记
+    # 日报生成（dry-run 记录）：清当日幂等标记 + 清遗留集团通道（避免集团日报覆盖记录槽）
     req("POST", "/api/settings", {"key": "wecom_daily_last", "value": ""}, token=token)
+    st, wc = req("GET", "/api/wecom/config", token=token)
+    for gid in ((wc or {}).get("groupHooks") or {}).keys():
+        req("POST", "/api/wecom/group-hook", {"groupId": gid, "webhookUrl": ""}, token=token)
     req("POST", "/api/wecom/flush-daily", token=token)
     st, s2 = req("GET", "/api/settings", token=token)
     last_push = (s2 or {}).get("wecom_last_push", "")
     check("T16.7", "企微机器人", "运营日报生成（含当日告警汇总）",
           "运营日报" in last_push and "新增告警" in last_push,
           last_push[:60])
+
+    # ---------------- 17. 客户端企微自助配置（门店/集团） ----------------
+    print("【17. 客户端企微自助配置】")
+    HOOK = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=testhook123"
+
+    # 门店客户端保存并读取
+    st, p = req("POST", "/api/client/notify/config", {"webhookUrl": HOOK},
+                token=ctoken, headers={"X-Device-Fingerprint": FP})
+    st, p = req("GET", "/api/client/notify/config",
+                token=ctoken, headers={"X-Device-Fingerprint": FP})
+    check("T17.1", "客户端企微配置", "门店保存并回显 webhook", st == 200
+          and (p or {}).get("webhookUrl") == HOOK and (p or {}).get("scope") == "hotel")
+
+    # 域名白名单（防 SSRF）
+    st, _ = req("POST", "/api/client/notify/config", {"webhookUrl": "https://evil.example.com/hook"},
+                token=ctoken, headers={"X-Device-Fingerprint": FP})
+    check("T17.2", "客户端企微配置", "非法域名被拒（400 防 SSRF）", st == 400, f"HTTP {st}")
+
+    # 集团总端配置（走 wecom_group_hooks）
+    gfp = t14fp("gc")
+    st, p = req("POST", "/api/client/activate",
+                {"licenseCode": "GP-0001", "deviceName": "配置测试总端"}, headers={"X-Device-Fingerprint": gfp})
+    gtok2 = (p or {}).get("token")
+    ghook = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=grouphook456"
+    req("POST", "/api/client/notify/config", {"webhookUrl": ghook},
+        token=gtok2, headers={"X-Device-Fingerprint": gfp})
+    st, p = req("GET", "/api/client/notify/config",
+                token=gtok2, headers={"X-Device-Fingerprint": gfp})
+    check("T17.3", "客户端企微配置", "集团总端保存并回显（scope=group）", st == 200
+          and (p or {}).get("webhookUrl") == ghook and (p or {}).get("scope") == "group")
+
+    # scope 隔离：门店 token 只能读到自己的配置（hotel scope，非 group 的值）
+    st, p = req("GET", "/api/client/notify/config",
+                token=ctoken, headers={"X-Device-Fingerprint": FP})
+    check("T17.4", "客户端企微配置", "scope 隔离（门店只见门店配置）",
+          (p or {}).get("scope") == "hotel" and (p or {}).get("webhookUrl") == HOOK)
+
+    # 测试推送进入 dry-run 记录且路由到本实体
+    st, p = req("POST", "/api/client/notify/test", {},
+                token=ctoken, headers={"X-Device-Fingerprint": FP})
+    st, s2 = req("GET", "/api/settings", token=token)
+    last_push = (s2 or {}).get("wecom_last_push", "")
+    try:
+        rec = json.loads(last_push)
+    except Exception:
+        rec = {}
+    check("T17.5", "客户端企微配置", "测试推送路由到门店通道", (p or {}).get("dryRun") is True
+          and "消息通知测试" in last_push and bool(rec.get("hotel_id")),
+          f"hotel_id={rec.get('hotel_id')}")
+
+    # 审计留痕（脱敏：key= 掩码）
+    st, p = req("GET", "/api/logs", token=token)
+    cfg_logs = [l for l in (p or []) if l.get("action") == "配置企微通知"]
+    log_ok = any("key=***" in (l.get("detail") or "") for l in cfg_logs)
+    check("T17.6", "客户端企微配置", "配置变更审计留痕且 webhook key 脱敏", log_ok,
+          f"{len(cfg_logs)} 条配置日志")
 
     # ---------------- 汇总 ----------------
     passed = sum(1 for r in results if r["pass"])

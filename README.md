@@ -2,7 +2,7 @@
 
 面向 AI 酒店管理软件的 **License 授权与客户运营平台**：服务商在后台管理酒店客户/授权/风控，酒店通过桌面客户端激活授权并与服务端保持同步，集团总部可通过「集团总端」统一查看和管理旗下门店。
 
-> 版本：ver0.2.0 ｜ 技术栈：FastAPI + PostgreSQL + Vue3 + Element Plus + Tauri (Rust)
+> 版本：ver0.2.1 ｜ 技术栈：FastAPI + PostgreSQL + Vue3 + Element Plus + Tauri (Rust)
 
 ---
 

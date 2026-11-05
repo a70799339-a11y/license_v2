@@ -13,7 +13,7 @@ use license_core::{
 use serde_json::{json, Value};
 use tauri::State;
 
-const CLIENT_VERSION: &str = "0.2.0";
+const CLIENT_VERSION: &str = "0.2.1";
 
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
@@ -383,6 +383,52 @@ fn fetch_group_profile(state: State<AppState>) -> Result<Value, String> {
     http_get(&api_url(&server, "/api/client/group/profile"), &fp, &token)
 }
 
+/// 消息通知自助配置（门店/集团配自己的企微群 webhook）
+#[tauri::command]
+fn fetch_notify_config(state: State<AppState>) -> Result<Value, String> {
+    let fp = state.fingerprint.clone();
+    let (token, server) = {
+        let s = state.inner.lock().unwrap();
+        (s.token.clone(), s.server_url.clone())
+    };
+    if token.is_empty() {
+        return Err("尚未激活".into());
+    }
+    http_get(&api_url(&server, "/api/client/notify/config"), &fp, &token)
+}
+
+#[tauri::command]
+fn save_notify_config(state: State<AppState>, webhook_url: String) -> Result<Value, String> {
+    let fp = state.fingerprint.clone();
+    let (token, server) = {
+        let s = state.inner.lock().unwrap();
+        (s.token.clone(), s.server_url.clone())
+    };
+    if token.is_empty() {
+        return Err("尚未激活".into());
+    }
+    let body = json!({ "webhookUrl": webhook_url });
+    http_post(&api_url(&server, "/api/client/notify/config"), &fp, &token, &body)
+}
+
+#[tauri::command]
+fn test_notify(state: State<AppState>) -> Result<Value, String> {
+    let fp = state.fingerprint.clone();
+    let (token, server) = {
+        let s = state.inner.lock().unwrap();
+        (s.token.clone(), s.server_url.clone())
+    };
+    if token.is_empty() {
+        return Err("尚未激活".into());
+    }
+    http_post(
+        &api_url(&server, "/api/client/notify/test"),
+        &fp,
+        &token,
+        &json!({}),
+    )
+}
+
 #[tauri::command]
 fn group_renew(state: State<AppState>, hotel_ids: Vec<String>) -> Result<Value, String> {
     let fp = state.fingerprint.clone();
@@ -643,6 +689,9 @@ fn main() {
             fetch_profile,
             fetch_group_profile,
             group_renew,
+            fetch_notify_config,
+            save_notify_config,
+            test_notify,
             set_server,
             logout
         ])

@@ -24,7 +24,7 @@ router = APIRouter(prefix="/api/client", tags=["client"])
 client_security = HTTPBearer(auto_error=False)
 
 CLIENT_TOKEN_DAYS = 90
-CLIENT_VERSION = "0.2.0"  # 当前打包客户端版本；settings.client_version 为服务端要求的最新版
+CLIENT_VERSION = "0.2.1"  # 当前打包客户端版本；settings.client_version 为服务端要求的最新版
 
 
 # ---------- schemas ----------
@@ -632,3 +632,84 @@ def group_renew(
     )
     db.commit()
     return {"ok": True, "renewed": len(members)}
+
+
+# ---------- 消息通知自助配置（门店/集团在客户端内配置自己的企微群 webhook） ----------
+class NotifyConfigReq(BaseModel):
+    webhookUrl: str = ""
+
+
+@router.get("/notify/config")
+def notify_config_get(
+    ctx: ClientContext = Depends(get_client_context),
+    fingerprint: str = Depends(get_fingerprint_header),
+    db: Session = Depends(get_db),
+):
+    """读取本实体的通知配置（scope 隔离：只见自己）"""
+    if fingerprint and fingerprint != ctx.fingerprint:
+        raise HTTPException(status_code=401, detail="设备指纹不一致")
+    from .wecom import group_hooks, hotel_hook
+
+    if ctx.scope == "group":
+        url = group_hooks(db).get(ctx.hotel_id, "")
+    else:
+        url = hotel_hook(db, ctx.hotel_id)
+    return {"scope": ctx.scope, "webhookUrl": url, "entityId": ctx.hotel_id}
+
+
+@router.post("/notify/config")
+def notify_config_set(
+    req: NotifyConfigReq,
+    ctx: ClientContext = Depends(get_client_context),
+    fingerprint: str = Depends(get_fingerprint_header),
+    db: Session = Depends(get_db),
+):
+    """保存本实体的通知 webhook（只写自己的配置；域名白名单防 SSRF）"""
+    if fingerprint and fingerprint != ctx.fingerprint:
+        raise HTTPException(status_code=401, detail="设备指纹不一致")
+    from .wecom import set_group_hook, set_hotel_hook, validate_webhook_url
+    from .masking import mask_text
+
+    url = (req.webhookUrl or "").strip()
+    if url and not validate_webhook_url(url):
+        raise HTTPException(status_code=400, detail="仅支持企业微信官方机器人 webhook（https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...）")
+    if ctx.scope == "group":
+        set_group_hook(db, ctx.hotel_id, url)
+        target = f"集团:{ctx.hotel_id}"
+    else:
+        set_hotel_hook(db, ctx.hotel_id, url)
+        target = f"门店:{ctx.hotel_id}"
+    db.add(
+        AuditLog(
+            operator=f"客户端({target})",
+            action="配置企微通知",
+            target=target,
+            detail=mask_text(f"webhook {url or '（已清空）'}"),
+        )
+    )
+    db.commit()
+    return {"ok": True, "saved": bool(url)}
+
+
+@router.post("/notify/test")
+def notify_test(
+    ctx: ClientContext = Depends(get_client_context),
+    fingerprint: str = Depends(get_fingerprint_header),
+    db: Session = Depends(get_db),
+):
+    """向本实体配置的 webhook 发测试消息（dry-run 时仅记录）"""
+    if fingerprint and fingerprint != ctx.fingerprint:
+        raise HTTPException(status_code=401, detail="设备指纹不一致")
+    from .wecom import hotel_hook, group_hooks, push_message
+
+    if ctx.scope == "group":
+        gid, hid = ctx.hotel_id, ""
+    else:
+        gid, hid = "", ctx.hotel_id
+    r = push_message(
+        db,
+        "**✅ 消息通知测试**\n来自客户端的测试消息，本实体告警/提醒将推送到这里。",
+        group_id=gid,
+        hotel_id=hid,
+    )
+    return {"ok": True, "sent": r.get("sent"), "dryRun": r.get("dry_run")}

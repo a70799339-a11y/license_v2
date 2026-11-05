@@ -44,7 +44,17 @@ app.add_middleware(
 
 
 def write_log(db: Session, user: User, action: str, target: str, detail: str) -> None:
-    db.add(AuditLog(operator=user.name, action=action, target=target, detail=detail))
+    """审计写入口 —— 落库前统一脱敏（手机/身份证/邮箱/卡号/令牌/指纹/授权码）"""
+    from .masking import mask_text
+
+    db.add(
+        AuditLog(
+            operator=user.name,
+            action=action,
+            target=mask_text(target),
+            detail=mask_text(detail),
+        )
+    )
 
 
 def next_code(db: Session, model, prefix: str) -> str:

@@ -40,7 +40,20 @@ fn state_dir() -> PathBuf {
 }
 
 /// 诊断日志：panic / 关键启动节点写入 crash.log（release 版无控制台，排查静默退出）
+/// 落盘前对令牌类内容做脱敏（JWT 三段式 → ***TOKEN***）
 fn diag_log(msg: &str) {
+    let masked: String = {
+        let mut out = String::with_capacity(msg.len());
+        for seg in msg.split(' ') {
+            if seg.starts_with("eyJ") && seg.matches('.').count() >= 2 {
+                out.push_str("***TOKEN***");
+            } else {
+                out.push_str(seg);
+            }
+            out.push(' ');
+        }
+        out
+    };
     let dir = state_dir();
     let _ = std::fs::create_dir_all(&dir);
     if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -53,7 +66,7 @@ fn diag_log(msg: &str) {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let _ = writeln!(f, "[{ts}] {msg}");
+        let _ = writeln!(f, "[{ts}] {}", masked.trim_end());
     }
 }
 

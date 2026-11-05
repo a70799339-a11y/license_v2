@@ -7,6 +7,7 @@ import uuid
 
 from sqlalchemy.orm import Session
 
+from .masking import mask_text
 from .models import Alert
 
 
@@ -39,7 +40,7 @@ def raise_alert(
         level=level,
         rule=rule,
         hotel_name=hotel_name,
-        detail=detail[:250],
+        detail=mask_text(detail)[:250],
         time=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
         status="待处理",
     )

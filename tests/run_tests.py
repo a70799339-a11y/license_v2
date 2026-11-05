@@ -445,6 +445,58 @@ def main():
           st == 200 and {"设备指纹变更", "时间回滚"} <= rules_seen,
           f"{len(rules_seen)} 类规则")
 
+    # ---------------- 15. 日志/审计脱敏 ----------------
+    print("【15. 日志脱敏】")
+    secret_reason = (
+        "违规转租 手机13812345678 身份证330106199001011234 "
+        "邮箱song.xk@example.com 卡号6222021234567890 授权LIC-2026-0123"
+    )
+    # 用吊销原因把敏感串带进审计日志
+    st, p = req("POST", "/api/hotels",
+                {"name": f"脱敏测试店{ts}", "code": f"HT-S{ts}", "plan": "基础版"}, token=token)
+    sid = (p or {}).get("id")
+    st, p = req("POST", "/api/licenses", {"hotelId": sid, "plan": "基础版", "type": "新签", "months": 12}, token=token)
+    slic = (p or {}).get("code")
+    st, p = req("GET", "/api/licenses", token=token)
+    slic_id = next((l["id"] for l in (p or []) if l.get("code") == slic), None)
+    req("POST", f"/api/licenses/{slic_id}/revoke", {"reason": secret_reason}, token=token)
+
+    st, p = req("GET", "/api/logs", token=token)
+    log_text = " ".join((l.get("detail") or "") + (l.get("target") or "") for l in (p or []))
+    # 只看本次脱敏测试店新写入的吊销记录（历史日志为掩码上线前的存量明文，不参与断言）
+    my_logs = " ".join(
+        (l.get("detail") or "")
+        for l in (p or [])
+        if l.get("target") == f"脱敏测试店{ts}" and l.get("action") == "吊销授权"
+    )
+    masked_ok = (
+        "138****5678" in log_text
+        and "330106199001011234" not in log_text
+        and "song.xk@example.com" not in log_text
+        and "6222021234567890" not in log_text
+    )
+    check("T15.1", "日志脱敏", "审计详情掩码（手机/身份证/邮箱/卡号）", masked_ok,
+          "含138****5678" if "138****5678" in log_text else "掩码缺失")
+
+    check("T15.2", "日志脱敏", "授权码部分掩码保留可追溯（LIC-****23）",
+          "LIC-****" in my_logs and "LIC-2026-0123" not in my_logs,
+          my_logs[:60])
+
+    st, p = req("GET", "/api/alerts", token=token)
+    full_fp_leaked = any(
+        len(seg) >= 40 and all(c in "0123456789abcdefABCDEF" for c in seg)
+        for a in (p or [])
+        for seg in (a.get("detail") or "").replace("…", " ").split()
+    )
+    check("T15.3", "日志脱敏", "告警详情不含完整设备指纹", not full_fp_leaked)
+
+    # 设置值脱敏（用户输入进入日志的另一条链路）
+    req("POST", "/api/settings", {"key": "mask_test_contact", "value": "13987654321"}, token=token)
+    st, p = req("GET", "/api/logs", token=token)
+    log_text2 = " ".join((l.get("detail") or "") for l in (p or []))
+    check("T15.4", "日志脱敏", "设置修改日志掩码手机号",
+          "139****4321" in log_text2 and "13987654321" not in log_text2)
+
     # ---------------- 汇总 ----------------
     passed = sum(1 for r in results if r["pass"])
     total = len(results)

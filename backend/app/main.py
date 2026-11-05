@@ -699,6 +699,79 @@ def simulate_llm_call(
     return {"ok": True, "result": r}
 
 
+# ---------- 本地大模型接入（Ollama / llama.cpp，经审计网关调用） ----------
+class LLMConfigUpdate(BaseModel):
+    provider: str = ""          # ollama / llama.cpp / 空=未接入
+    endpoint: str = ""
+    model: str = ""
+
+
+@app.get("/api/ai/llm-status")
+def llm_status(db: Session = Depends(get_db), _: User = Depends(require_roles("admin", "operator"))):
+    from .llm_backend import llm_config, ping
+
+    return {**llm_config(db), "ping": ping(db)}
+
+
+@app.post("/api/ai/config")
+def llm_config_update(
+    req: LLMConfigUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("admin")),
+):
+    from .wecom import set_setting
+
+    if req.provider not in ("", "ollama", "llama.cpp"):
+        raise HTTPException(status_code=400, detail="provider 须为 ollama / llama.cpp / 空")
+    set_setting(db, "llm_provider", req.provider)
+    set_setting(db, "llm_endpoint", (req.endpoint or "").strip())
+    set_setting(db, "llm_model", (req.model or "").strip())
+    write_log(db, user, "配置本地大模型", req.provider or "未接入", f"endpoint={req.endpoint} model={req.model}")
+    db.commit()
+    return {"ok": True}
+
+
+class AlertExplainReq(BaseModel):
+    alertId: str = ""
+    rule: str = ""
+    hotelName: str = ""
+    detail: str = ""
+
+
+@app.post("/api/ai/alert-explain")
+def ai_explain_alert(
+    req: AlertExplainReq,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("admin", "operator")),
+):
+    """告警 AI 解读（真实场景示例）：经审计网关调用本地大模型，全量留痕"""
+    from .llm_audit import llm_call
+    from .models import Alert
+
+    a = db.query(Alert).filter(Alert.id == req.alertId).first() if req.alertId else None
+    rule = a.rule if a else req.rule
+    hotel = a.hotel_name if a else req.hotelName
+    detail = a.detail if a else req.detail
+    if not rule and not detail:
+        raise HTTPException(status_code=400, detail="缺少告警内容")
+    prompt = (
+        "你是酒店授权管理系统的风控助手。请用中文简洁解读下面这条告警：可能原因、风险等级判断、"
+        "建议的处置步骤（不超过 5 条要点）。\n"
+        f"规则：{rule}\n酒店：{hotel}\n详情：{detail}"
+    )
+    r = llm_call(
+        db,
+        source_type="admin",
+        source_id=user.username,
+        source_name="管理后台",
+        user_id=user.username,
+        scene="告警解读",
+        user_input=f"{rule}：{detail}",
+        prompt=prompt,
+    )
+    return {"ok": True, "explain": r.get("output", ""), "audit": {"status": r["status"], "model": r["model"]}}
+
+
 # ---------- 统计（经营总览） ----------
 @app.get("/api/stats")
 def stats(db: Session = Depends(get_db), _: User = Depends(get_current_user)):

@@ -252,4 +252,15 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(data),
     }),
+
+  // 本地大模型（Ollama / llama.cpp）接入
+  llmStatus: () =>
+    request<{ provider: string; endpoint: string; model: string; ping: { ok: boolean; detail: string; models?: string[] } }>('/ai/llm-status'),
+  llmConfigSave: (data: { provider: string; endpoint: string; model: string }) =>
+    request<{ ok: boolean }>('/ai/config', { method: 'POST', body: JSON.stringify(data) }),
+  aiExplainAlert: (data: { alertId?: string; rule?: string; hotelName?: string; detail?: string }) =>
+    request<{ ok: boolean; explain: string; audit: { status: string; model: string } }>('/ai/alert-explain', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
 }

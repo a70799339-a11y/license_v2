@@ -14,6 +14,7 @@ onMounted(async () => {
     if (s.heartbeat_timeout_hours) graceHours.value = s.heartbeat_timeout_hours
     await loadWecom()
     await loadLlmLogs()
+    await loadLlmCfg()
   } finally {
     loading.value = false
   }
@@ -108,6 +109,35 @@ async function simulateLlm() {
 
 function sourceTypeLabel(t: string) {
   return t === 'group' ? '集团总端' : t === 'hotel' ? '门店客户端' : '管理后台'
+}
+
+// ---------- 本地大模型接入（Ollama / llama.cpp） ----------
+const llmCfg = ref({ provider: '', endpoint: '', model: '' })
+const llmPing = ref<{ ok: boolean; detail: string; models?: string[] } | null>(null)
+
+async function loadLlmCfg() {
+  try {
+    const s = await api.llmStatus()
+    llmCfg.value = { provider: s.provider, endpoint: s.endpoint, model: s.model }
+    llmPing.value = s.ping
+  } catch { /* 无权限忽略 */ }
+}
+
+async function saveLlmCfg() {
+  try {
+    await api.llmConfigSave(llmCfg.value)
+    await loadLlmCfg()
+    ElMessage.success('本地大模型配置已保存（调用统一经审计网关留痕）')
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '保存失败')
+  }
+}
+
+async function testLlm() {
+  await saveLlmCfg()
+  await loadLlmCfg()
+  if (llmPing.value?.ok) ElMessage.success(`连通正常：${llmPing.value.detail}`)
+  else ElMessage.warning(`连通异常：${llmPing.value?.detail || '未知'}`)
 }
 
 // 签发流程 6 步
@@ -216,7 +246,22 @@ async function revokeWithReason(row: License) {
       <p class="muted" style="font-size: 12px; margin-bottom: 12px">
         所有大模型调用统一经服务端网关（客户端不直连 LLM），每次调用记录：调用来源、发起人、用户输入、模型输入/输出、token 用量、耗时——文本统一脱敏后落库。
       </p>
-      <div style="display: flex; gap: 12px; align-items: center; margin-bottom: 12px">
+      <div class="llm-cfg-row">
+        <span class="muted small">本地模型（Ollama / llama.cpp）</span>
+        <el-select v-model="llmCfg.provider" placeholder="未接入" style="width: 130px" clearable>
+          <el-option label="Ollama" value="ollama" />
+          <el-option label="llama.cpp" value="llama.cpp" />
+        </el-select>
+        <el-input v-model="llmCfg.endpoint" placeholder="http://localhost:11434" style="width: 230px" />
+        <el-input v-model="llmCfg.model" placeholder="模型名，如 qwen2.5:7b" style="width: 190px" />
+        <el-button type="primary" @click="saveLlmCfg">保存</el-button>
+        <el-button @click="testLlm">测试连通</el-button>
+        <el-tag v-if="llmPing" size="small" :type="llmPing.ok ? 'success' : 'danger'">
+          {{ llmPing.ok ? '正常' : '异常' }}
+        </el-tag>
+        <span v-if="llmPing" class="muted small">{{ llmPing.detail }}</span>
+      </div>
+      <div style="display: flex; gap: 12px; align-items: center; margin: 12px 0">
         <el-select v-model="llmFilter" placeholder="全部来源" style="width: 140px" clearable @change="loadLlmLogs">
           <el-option label="集团总端" value="group" />
           <el-option label="门店客户端" value="hotel" />
@@ -387,5 +432,10 @@ async function revokeWithReason(row: License) {
 .llm-field pre {
   margin: 0; background: #f4f4f5; border-radius: 6px; padding: 10px 12px;
   white-space: pre-wrap; word-break: break-all; font-size: 12px; max-height: 160px; overflow: auto;
+}
+.llm-cfg-row {
+  display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+  background: #fafafa; border: 1px solid #f0f0f2; border-radius: 8px;
+  padding: 10px 12px; margin-bottom: 4px;
 }
 </style>

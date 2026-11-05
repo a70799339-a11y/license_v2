@@ -54,6 +54,30 @@ async function handle(a: Alert) {
   }
 }
 
+// AI 解读（本地大模型，经审计网关留痕）
+const aiDialog = ref(false)
+const aiLoading = ref(false)
+const aiResult = ref('')
+const aiMeta = ref('')
+const aiAlert = ref<Alert | null>(null)
+
+async function aiExplain(a: Alert) {
+  aiAlert.value = a
+  aiResult.value = ''
+  aiMeta.value = ''
+  aiDialog.value = true
+  aiLoading.value = true
+  try {
+    const r = await api.aiExplainAlert({ alertId: a.id, rule: a.rule, hotelName: a.hotelName, detail: a.detail })
+    aiResult.value = r.explain || '（无输出）'
+    aiMeta.value = `模型：${r.audit.model} · 状态：${r.audit.status}（本次调用已记入大模型审计日志）`
+  } catch (e) {
+    aiResult.value = e instanceof Error ? e.message : '调用失败'
+  } finally {
+    aiLoading.value = false
+  }
+}
+
 function groupLevel(l: string) {
   return l === '紧急' ? 'danger' : l === '高' ? 'warning' : 'info'
 }
@@ -153,22 +177,44 @@ function groupLevel(l: string) {
             <el-tag :type="statusType(row.status)" size="small">{{ row.status }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="120" fixed="right">
+        <el-table-column label="操作" width="180" fixed="right">
           <template #default="{ row }">
+            <el-button
+              v-if="auth.canWrite"
+              link type="warning" size="small"
+              @click="aiExplain(row)"
+            >AI 解读</el-button>
             <el-button
               v-if="row.status !== '已处置' && auth.canWrite"
               link type="primary" size="small"
               @click="handle(row)"
             >标记处置</el-button>
-            <el-button v-else link size="small" disabled>{{ row.status === '已处置' ? '已处置' : '无权限' }}</el-button>
+            <el-button v-else-if="row.status === '已处置'" link size="small" disabled>已处置</el-button>
+            <el-button v-else link size="small" disabled>无权限</el-button>
           </template>
         </el-table-column>
       </el-table>
     </div>
+
+    <el-dialog v-model="aiDialog" title="告警 AI 解读（本地大模型）" width="620px">
+      <template v-if="aiAlert">
+        <p class="muted" style="font-size: 12px">
+          {{ aiAlert.rule }} · {{ aiAlert.hotelName }} · {{ aiAlert.detail }}
+        </p>
+      </template>
+      <div v-if="aiLoading" style="padding: 24px; text-align: center" class="muted">本地模型推理中，请稍候…</div>
+      <pre v-else class="ai-result">{{ aiResult }}</pre>
+      <p v-if="aiMeta" class="muted" style="font-size: 12px; margin-top: 10px">{{ aiMeta }}</p>
+    </el-dialog>
   </div>
 </template>
 
 <style scoped>
 .filter-bar { display: flex; gap: 12px; padding: 16px 20px; align-items: center; }
 .mode-bar { display: flex; gap: 12px; align-items: center; margin-bottom: 4px; }
+.ai-result {
+  margin: 0; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px;
+  padding: 14px 16px; white-space: pre-wrap; word-break: break-word;
+  font-size: 13px; line-height: 1.8; max-height: 360px; overflow: auto;
+}
 </style>

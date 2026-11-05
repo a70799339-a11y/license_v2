@@ -660,6 +660,44 @@ def main():
     st, p = req("POST", "/api/llm-logs/simulate", {"sourceType": "admin", "userInput": "x"}, token=vtok)
     check("T18.4", "大模型审计", "只读角色无权触发调用（403）", st == 403, f"HTTP {st}")
 
+    # ---------------- 19. 本地大模型接入（Ollama / llama.cpp） ----------------
+    print("【19. 本地大模型接入】")
+
+    st, p = req("POST", "/api/ai/config",
+                {"provider": "ollama", "endpoint": "http://localhost:11434", "model": "qwen2.5:7b"},
+                token=token)
+    st2, s = req("GET", "/api/ai/llm-status", token=token)
+    check("T19.1", "本地大模型", "模型后端配置保存并回显（provider/endpoint/model）",
+          st == 200 and (s or {}).get("provider") == "ollama"
+          and "11434" in (s or {}).get("endpoint", ""),
+          f"provider={(s or {}).get('provider')}")
+
+    st, p = req("POST", "/api/ai/config", {"provider": "llama.cpp"}, token=vtok)
+    check("T19.2", "本地大模型", "只读角色无权改模型配置（403）", st == 403, f"HTTP {st}")
+
+    # 未接入/占位路径：清空 provider 后解读 → 网关照常留痕
+    req("POST", "/api/ai/config", {"provider": "", "endpoint": "", "model": ""}, token=token)
+    st, p = req("POST", "/api/ai/alert-explain",
+                {"rule": "时间回滚", "hotelName": "接入测试店", "detail": "客户端时钟回滚 48 小时"},
+                token=token)
+    st2, logs = req("GET", "/api/llm-logs?limit=10", token=token)
+    rec = next((l for l in (logs or []) if l.get("scene") == "告警解读"), {})
+    check("T19.3", "本地大模型", "告警 AI 解读经审计网关（调用即留痕）",
+          st == 200 and (p or {}).get("audit", {}).get("status") == "success" and bool(rec),
+          f"model={(p or {}).get('audit', {}).get('model')} rec={'有' if rec else '无'}")
+
+    # 失败也留痕：指向不可达端点 → error 记录入审计
+    req("POST", "/api/ai/config",
+        {"provider": "ollama", "endpoint": "http://127.0.0.1:59999", "model": "x"}, token=token)
+    st, p = req("POST", "/api/ai/alert-explain",
+                {"rule": "设备指纹变更", "hotelName": "接入测试店", "detail": "指纹不一致"},
+                token=token)
+    st2, logs = req("GET", "/api/llm-logs?limit=5", token=token)
+    err_rec = next((l for l in (logs or []) if l.get("status") == "error"), {})
+    check("T19.4", "本地大模型", "模型调用失败同样留痕（error 记录）", bool(err_rec),
+          f"error rec={'有' if err_rec else '无'}")
+    req("POST", "/api/ai/config", {"provider": "", "endpoint": "", "model": ""}, token=token)
+
     # ---------------- 汇总 ----------------
     passed = sum(1 for r in results if r["pass"])
     total = len(results)

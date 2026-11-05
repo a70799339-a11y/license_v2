@@ -81,10 +81,15 @@ def llm_call(
 ) -> dict:
     """
     大模型调用唯一入口：执行 + 自动审计。
-    backend: fn(prompt) -> (output, model_name, tokens_in, tokens_out)；未接入时返回占位结果。
+    backend: fn(prompt) -> (output, model_name, tokens_in, tokens_out)。
+    未传 backend 时自动使用本地模型后端（Ollama / llama.cpp，settings 配置），
+    本地后端未配置时返回占位结果（审计管道照常运转）。
     """
     t0 = time.time()
     try:
+        if backend is None:
+            from .llm_backend import get_backend
+            backend = get_backend(db)
         if backend is not None:
             output, model_name, tin, tout = backend(prompt)
             status, error = "success", ""

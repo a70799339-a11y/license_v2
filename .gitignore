@@ -25,3 +25,4 @@ tools/
 .DS_Store
 Thumbs.db
 .workbuddy/
+backend/wecom-ws.lock

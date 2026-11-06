@@ -26,6 +26,28 @@ _STATUS = {
 }
 _thread: threading.Thread | None = None
 _stop_event = threading.Event()
+_lock_fd = None  # 进程级互斥锁（保证全局只有一条企微长连接，防互踢）
+
+
+def _acquire_singleton() -> bool:
+    """跨进程互斥：拿不到锁说明已有实例连着，本进程不再建连（企微只允许一条有效连接）"""
+    global _lock_fd
+    if _lock_fd is not None:
+        return True
+    try:
+        import fcntl
+
+        path = Path(__file__).resolve().parent.parent / "wecom-ws.lock"
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return False
+        _lock_fd = fd
+        return True
+    except Exception:
+        return True  # 锁机制异常时不阻断启动（宁可重试互踢也别不连）
 
 
 def ws_status() -> dict:
@@ -173,6 +195,10 @@ def start_ws(force: bool = False) -> dict:
     if not enabled or not bot_id or not secret:
         _STATUS["running"] = False
         _STATUS["last_error"] = "未启用或缺少 BotID/Secret"
+        return ws_status()
+    if not _acquire_singleton():
+        _STATUS["running"] = False
+        _STATUS["last_error"] = "已有另一实例持有长连接（互斥锁），本进程跳过"
         return ws_status()
     if _thread and _thread.is_alive() and not force:
         return ws_status()

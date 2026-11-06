@@ -777,6 +777,8 @@ def main():
     check("T21.2", "企微数据接地", "集团问答只含本集团数据（隔离）",
           f"接地测试店{ts}" not in reply and ("本集团" in reply or "直出" in reply),
           f"越界店出现={f'接地测试店{ts}' in reply}")
+    # 清理测试酒店（停用，防残留污染数据查询）
+    req("PATCH", f"/api/hotels/{gid}", {"status": "已停用"}, token=token)
 
     # 还原模型配置（测试改动不污染环境；apiKey 空串=不修改已有 Key）
     req("POST", "/api/ai/config", llm_snapshot, token=token)

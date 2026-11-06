@@ -262,6 +262,8 @@ def _query_data(db: Session, text: str, binding) -> str | None:
             win = 90
         upcoming, overdue = [], []
         for h in hotels:
+            if h.status == "已停用":
+                continue
             d = days_left(h)
             if d is None:
                 continue
@@ -297,7 +299,7 @@ def _query_data(db: Session, text: str, binding) -> str | None:
     if "设备" in text:
         hit = True
         lines.append("【设备使用】：")
-        for h in sorted(hotels, key=lambda x: -(x.devices or 0))[:15]:
+        for h in sorted((x for x in hotels if x.status != "已停用"), key=lambda x: -(x.devices or 0))[:15]:
             lines.append(f"- {h.name}：{h.devices}/{h.max_devices}")
 
     return "\n".join(lines) if hit else None
@@ -353,6 +355,15 @@ def _llm_answer(db: Session, text: str, sender: str, binding) -> str:
             "AI 问答暂不可用（模型服务异常，已记录），请稍后再试或回复『帮助』看指令列表。"
         )
     out = (r["output"] or "").strip()[:1600]
+
+    # 完整性校验：数据含酒店清单时，模型输出条目数不得少于数据条目数（防小模型截断漏项）
+    if data and out:
+        import re as _re
+        exp = len(_re.findall(r"（[A-Z]{2}-[^）]+）", data))
+        act = len(_re.findall(r"（[A-Z]{2}-[^）]+）", out))
+        if exp > 0 and act < exp:
+            return direct() + f"\n（模型输出不完整 {act}/{exp} 条，已切换为系统数据直出）"
+
     return out or (direct() if data else "（模型无输出）")
 
 

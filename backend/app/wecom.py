@@ -261,6 +261,14 @@ def _scoped_hotels(db: Session, binding) -> tuple:
     return [], "无"
 
 
+def _match_group(db: Session, text: str):
+    """问题里出现集团全名/集团编码 → 返回该集团（最长名优先），用于数据范围收敛"""
+    matches = [g for g in db.query(Group).all() if g.name and g.name in text]
+    if matches:
+        return max(matches, key=lambda g: len(g.name or ""))
+    return next((g for g in db.query(Group).all() if g.code and g.code in text), None)
+
+
 def _is_list_query(text: str) -> bool:
     """是否为「清单类」问法（完整性兜底只对这类生效，避免误伤咨询类回答）"""
     return any(k in text for k in ("查询", "查一下", "查出", "查找", "查查", "列出", "清单", "哪些", "有哪些", "多少", "列表"))
@@ -274,6 +282,11 @@ def _query_data(db: Session, text: str, binding) -> tuple:
     from datetime import date
 
     hotels, scope = _scoped_hotels(db, binding)
+    # 单集团提问（问题里带集团名/编码）→ 数据范围收敛到该集团（在角色隔离之上再收窄）
+    gt = _match_group(db, text)
+    if gt is not None:
+        hotels = [h for h in hotels if h.group_id == gt.id]
+        scope = gt.name
     today = _today_bj()
     lines = [f"今天日期：{today.isoformat()}"]
 
@@ -385,6 +398,48 @@ def _query_data(db: Session, text: str, binding) -> tuple:
         for h in sorted((x for x in hotels if x.status != "已停用"), key=lambda x: -(x.devices or 0))[:15]:
             lines.append(f"- {h.name}：{h.devices}/{h.max_devices}")
 
+    # 集团/子酒店（未命中更具体意图时）：单集团→列成员；全局→各集团子酒店数
+    if not hit and scope != "无" and ("集团" in text or "子酒店" in text) and any(
+        k in text for k in ("几家", "多少", "数量", "子酒店", "成员", "门店", "分别",
+                            "哪些", "列出", "清单", "统计", "情况", "总览", "有几个", "排行")
+    ):
+        hit = True
+        if gt is not None:
+            members = sorted((h for h in hotels if h.status != "已停用"), key=lambda x: x.code or "")
+            guard_n = min(len(members), 30)
+            strict = guard_n > 0  # 单集团成员清单：漏项即切数据直出
+            head = f"【{gt.name}（{gt.code}）子酒店】共 {len(members)} 家"
+            if len(members) > 30:
+                head += "（仅列前 30 家，完整清单请到后台查看）"
+            lines.append(head + "：")
+            if members:
+                for h in members[:30]:
+                    lines.append(f"- {h.name}（{h.code}）到期 {h.expire_at} 套餐 {h.plan} 状态 {h.status}")
+            else:
+                lines.append("（暂无在营子酒店）")
+        else:
+            member_counts: dict = {}
+            for h in db.query(Hotel).filter(Hotel.status != "已停用", Hotel.group_id != "").all():
+                member_counts[h.group_id] = member_counts.get(h.group_id, 0) + 1
+            if binding and binding.role == "group":
+                g_rows = [g for g in db.query(Group).all() if g.id == (binding.group_id or "")]
+                n_empty = 0
+            else:
+                g_rows = [g for g in db.query(Group).all() if member_counts.get(g.id, 0) > 0]
+                n_empty = sum(1 for g in db.query(Group).all() if member_counts.get(g.id, 0) == 0)
+            g_rows.sort(key=lambda g: (-member_counts.get(g.id, 0), g.code or ""))
+            guard_n = min(len(g_rows), 25)  # 清单类问法要求把集团清单列全
+            head = f"【集团与子酒店】共 {len(g_rows)} 个集团有在营子酒店"
+            if n_empty:
+                head += f"（另有 {n_empty} 个集团暂无在营子酒店）"
+            if len(g_rows) > 25:
+                head += "；仅列前 25 家"
+            lines.append(head + "：")
+            for g in g_rows[:25]:
+                lines.append(f"- {g.name}（{g.code}）：{member_counts.get(g.id, 0)} 家")
+            if not g_rows:
+                lines.append("（暂无集团）")
+
     # 酒店总清单（兜底问法：仅当未命中更具体意图时生效，避免与到期/告警/设备叠加）
     if not hit and any(k in text for k in ("酒店", "客户")) and any(
         k in text for k in ("列出", "全部", "清单", "列表", "有哪些", "哪些", "所有")
@@ -408,14 +463,18 @@ def _query_data(db: Session, text: str, binding) -> tuple:
 ACK_TEXT = "🔍 正在检索，请稍候…（数据查询/AI 生成中）"
 
 
-def _analysis_stats(db: Session, binding) -> str:
+def _analysis_stats(db: Session, binding, gt=None) -> str:
     """系统预计算聚合指标（分析类问题的事实基座）——
-    小模型不擅长自己统计，由系统算好全量指标喂给它解读，消除『分析时数据缺失』。"""
+    小模型不擅长自己统计，由系统算好全量指标喂给它解读，消除『分析时数据缺失』。
+    gt：单集团提问时收敛到该集团（与实时数据同口径）。"""
     from datetime import date
 
     hotels, scope = _scoped_hotels(db, binding)
+    if gt is not None:
+        hotels = [h for h in hotels if h.group_id == gt.id]
+        scope = gt.name
     hotels = [h for h in hotels if h.status != "已停用"]
-    today = date.today()
+    today = _today_bj()
 
     def days_left(h: Hotel):
         try:
@@ -509,7 +568,7 @@ def _llm_answer(db: Session, text: str, sender: str, binding, on_slow=None) -> s
         "让用户分得清这是全量还是节选；"
         "分析/建议类问题请结合【统计基座】的精确数字回答（直接引用，不要自己重新统计）；"
         "非清单问题用中文简洁回答（不超过 250 字）。\n"
-        f"{_analysis_stats(db, binding)}\n"
+        f"{_analysis_stats(db, binding, _match_group(db, text))}\n"
         f"【实时数据】\n{data or '（本次提问未命中结构化明细，按统计基座回答）'}\n"
         f"用户问题：{text}"
     )

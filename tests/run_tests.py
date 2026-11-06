@@ -747,6 +747,43 @@ def main():
     req("PATCH", f"/api/hotels/{hvid}", {"status": "已停用"}, token=token)
     req("PATCH", f"/api/hotels/{hv2id}", {"status": "已停用"}, token=token)
 
+    # ---------------- 25. 集团/子酒店数据接地 ----------------
+    print("【25. 集团/子酒店数据接地】")
+
+    st, p = req("POST", "/api/groups", {"name": f"清点集团{ts}", "plan": "基础版"}, token=token)
+    tgid = (p or {}).get("id") or ""
+    st, gp = req("GET", f"/api/groups/{tgid}", token=token)
+    tgc = ((gp or {}).get("group") or {}).get("code", "")
+    tcodes = [f"HT-XC{ts}", f"HT-XD{ts}"]
+    tids = []
+    for i, c in enumerate(tcodes):
+        st, p = req("POST", "/api/hotels", {"name": f"清点店{ts}-{i}", "code": c, "plan": "基础版"}, token=token)
+        hid = (p or {}).get("id")
+        if not hid:
+            st_h, hs = req("GET", "/api/hotels", token=token)
+            hid = next((h.get("id") for h in (hs or []) if h.get("code") == c), None)
+        tids.append(hid)
+    req("POST", "/api/groups/assign", {"hotelIds": tids, "groupId": tgid}, token=token)
+
+    # 全局问：各集团子酒店数量 → 新集团编码与家数必须在回答里（接地+兜底）
+    st, p = req("POST", "/api/wecom/simulate",
+                {"text": "当前入住集团有几家分别有多少个子酒店", "userid": f"u{ts}"}, token=token)
+    reply = (p or {}).get("reply", "")
+    check("T25.1", "企微回答准确性", "集团/子酒店数量有数据接地（编码+家数）",
+          tgc in reply and ("2 家" in reply or "2家" in reply),
+          f"{tgc}={tgc in reply} 含2家={'2 家' in reply or '2家' in reply}")
+
+    # 单集团问：列成员清单（漏项即兜底直出）
+    st, p = req("POST", "/api/wecom/simulate",
+                {"text": f"清点集团{ts}有几家子酒店", "userid": f"u{ts}"}, token=token)
+    reply = (p or {}).get("reply", "")
+    check("T25.2", "企微回答准确性", "单集团提问列出子酒店清单（完整）",
+          all(c in reply for c in tcodes),
+          f"{tcodes[0]}={tcodes[0] in reply} {tcodes[1]}={tcodes[1] in reply}")
+
+    for hid in tids:
+        req("PATCH", f"/api/hotels/{hid}", {"status": "已停用"}, token=token)
+
     # ---------------- 19. 大模型接入（本地 Ollama/llama.cpp + 云端 API） ----------------
     print("【19. 大模型接入（本地+云端）】")
 

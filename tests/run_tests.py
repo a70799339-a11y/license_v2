@@ -785,7 +785,7 @@ def main():
 
     # ---------------- 22. 设备ID防撞（同秒+同指纹前缀双激活） ----------------
     print("【22. 设备 ID 防撞】")
-    fp_a, fp_b = ("beef01" + "a" * 58)[:64], ("beef01" + "b" * 58)[:64]  # 前6位相同
+    fp_a, fp_b = (f"{ts:08x}" + "z" * 56)[:64], (f"{ts:08x}" + "y" * 56)[:64]  # 每轮唯一、前8位相同（避开 t14fp 的 a/b/m/w/gc 尾缀）
     codes = []
     for i, fp in enumerate((fp_a, fp_b)):
         st, p = req("POST", "/api/hotels",

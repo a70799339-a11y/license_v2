@@ -9,12 +9,29 @@
 import json
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy.orm import Session
 
 from .masking import mask_text
 from .models import Alert, AuditLog, Group, Hotel, Setting, WecomBinding, WecomGroupHook
+
+
+# ---------- 时间展示（库存 UTC，对客户一律换算北京时间） ----------
+def _fmt_bj(ts, fmt="%Y-%m-%d %H:%M") -> str:
+    """UTC 时间串 → 北京时间（UTC+8）展示；解析失败原样返回"""
+    s = (ts or "").strip()
+    for f in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return (datetime.strptime(s, f) + timedelta(hours=8)).strftime(fmt)
+        except ValueError:
+            continue
+    return s
+
+
+def _today_bj():
+    """北京时间「今天」——企微回复里的日期与到期天数按此计算"""
+    return (datetime.utcnow() + timedelta(hours=8)).date()
 
 
 # ---------- 配置读写 ----------
@@ -148,7 +165,7 @@ def notify_alert(db: Session, alert: Alert) -> None:
             f"> 规则：{alert.rule}\n"
             f"> 酒店：{alert.hotel_name}\n"
             f"> 详情：{alert.detail}\n"
-            f"> 时间：{alert.time}"
+            f"> 时间：{_fmt_bj(alert.time)}"
         )
         push_message(db, content, group_id=gid, hotel_id=hid)
     except Exception:
@@ -157,12 +174,19 @@ def notify_alert(db: Session, alert: Alert) -> None:
 
 # ---------- 日报（惰性：当日首次读取告警/统计时生成） ----------
 def _daily_key() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%d")
+    """日报日期（北京时间）"""
+    return (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d")
+
+
+def _daily_cutoff() -> str:
+    """北京时间今日 00:00 对应的 UTC 时间串（按天过滤告警用）"""
+    bj_mid = (datetime.utcnow() + timedelta(hours=8)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return (bj_mid - timedelta(hours=8)).strftime("%Y-%m-%d %H:%M")
 
 
 def build_ops_daily(db: Session) -> str:
     today = _daily_key()
-    alerts = db.query(Alert).filter(Alert.time >= today).all()
+    alerts = db.query(Alert).filter(Alert.time >= _daily_cutoff()).all()
     from .models import License
 
     soon = []
@@ -184,7 +208,7 @@ def build_group_daily(db: Session, group_id: str) -> str:
     names = [m.name for m in members]
     alerts = (
         db.query(Alert)
-        .filter(Alert.time >= today, Alert.hotel_name.in_(names))
+        .filter(Alert.time >= _daily_cutoff(), Alert.hotel_name.in_(names))
         .all()
         if names
         else []
@@ -239,17 +263,18 @@ def _scoped_hotels(db: Session, binding) -> tuple:
 
 def _is_list_query(text: str) -> bool:
     """是否为「清单类」问法（完整性兜底只对这类生效，避免误伤咨询类回答）"""
-    return any(k in text for k in ("查询", "查一下", "列出", "清单", "哪些", "有哪些", "多少", "列表"))
+    return any(k in text for k in ("查询", "查一下", "查出", "查找", "查查", "列出", "清单", "哪些", "有哪些", "多少", "列表"))
 
 
 def _query_data(db: Session, text: str, binding) -> tuple:
     """按问题意图从数据库取真实数据（接地）。
-    返回 (数据文本, 完整性基线)；未命中数据意图返回 (None, 0)。
-    完整性基线 = 主清单（临期/告警/设备）条目数，不含「已过期」附录。"""
+    返回 (数据文本, 完整性基线, 强校验)；未命中数据意图返回 (None, 0, False)。
+    完整性基线 = 主清单（临期/告警/设备）条目数，不含「已过期」附录；
+    强校验=True（单店告警全量）时不再要求清单类问法，兜底必生效。"""
     from datetime import date
 
     hotels, scope = _scoped_hotels(db, binding)
-    today = date.today()
+    today = _today_bj()
     lines = [f"今天日期：{today.isoformat()}"]
 
     def days_left(h: Hotel):
@@ -292,18 +317,67 @@ def _query_data(db: Session, text: str, binding) -> tuple:
             for d, h in overdue[:15]:
                 lines.append(f"- {h.name}（{h.code}）到期 {h.expire_at}（已过期 {-d} 天）套餐 {h.plan} 状态 {h.status}")
 
+    strict = False
     if any(k in text for k in ("告警", "风险", "异常")):
         hit = True
-        names = {h.name for h in hotels}
-        alerts = [
-            a for a in db.query(Alert).order_by(Alert.time.desc()).limit(30).all()
-            if a.hotel_name in names
-        ][:10]
-        lines.append(f"【近期告警】共 {len(alerts)} 条：")
-        for a in alerts:
-            lines.append(f"- [{a.level}] {a.rule}｜{a.hotel_name}｜{a.status}｜{a.time}")
-        if not alerts:
-            lines.append("（无告警）")
+        code_of = {h.name: (h.code or "") for h in hotels}
+        # 单店提问（问题里出现该店编码/全名）→ 取该店全量告警，避免老告警被全局窗口挤掉
+        target = next((h for h in hotels if h.code and h.code in text), None) or next(
+            (h for h in hotels if h.name and h.name in text), None
+        )
+        if target is not None:
+            rows = (
+                db.query(Alert).filter(Alert.hotel_name == target.name)
+                .order_by(Alert.time.desc()).limit(30).all()
+            )
+            guard_n = min(len(rows), 30)
+            strict = guard_n > 0  # 单店全量：无论问法都必须完整，漏项即切数据直出
+            by_lv: dict = {}
+            for a in rows:
+                by_lv[a.level] = by_lv.get(a.level, 0) + 1
+            lv_txt = "、".join(f"{k} {v} 条" for k, v in by_lv.items()) or "无"
+            lines.append(f"【{target.name}（{target.code}）告警】共 {len(rows)} 条（{lv_txt}，含已处置历史）：")
+            if rows:
+                for a in rows[:30]:
+                    lines.append(f"- [{a.level}] {a.rule}｜{a.status}｜{_fmt_bj(a.time, '%m-%d %H:%M')}（{target.code}）")
+            else:
+                lines.append("（该店暂无告警记录）")
+        else:
+            # 全局提问：总量 + 按酒店聚合（用户要找的是“哪些店异常”）+ 最近明细
+            # 口径与统计基座一致：只算在营（非已停用）酒店的未处置告警
+            names = {h.name for h in hotels if h.status != "已停用"}
+            rows = [
+                a for a in db.query(Alert).order_by(Alert.time.desc()).limit(400).all()
+                if a.hotel_name in names and a.status != "已处置"
+            ]
+            by_hotel: dict = {}
+            for a in rows:
+                d = by_hotel.setdefault(a.hotel_name, {"n": 0, "rules": set()})
+                d["n"] += 1
+                d["rules"].add(a.rule)
+            top = sorted(by_hotel.items(), key=lambda kv: -kv[1]["n"])[:25]
+            guard_n = min(len(top), 25)  # 清单类问法要求把聚合清单列全
+            lv_all: dict = {}
+            for a in rows:
+                lv_all[a.level] = lv_all.get(a.level, 0) + 1
+            lv_txt = "、".join(f"{k} {v} 条" for k, v in lv_all.items()) or "无"
+            lines.append(
+                f"【未处置告警】共 {len(rows)} 条，涉及 {len(by_hotel)} 家酒店（{lv_txt}）；"
+                f"按告警数列前 {len(top)} 家（完整清单可到后台查看）："
+            )
+            if top:
+                for name, d in top:
+                    lines.append(f"- {name}（{code_of.get(name, '')}）{d['n']} 条：{'、'.join(sorted(d['rules']))}")
+            else:
+                lines.append("（无未处置告警）")
+            recent = rows[:8]
+            if recent:
+                lines.append("【最近告警明细】：")
+                for a in recent:
+                    lines.append(
+                        f"- [{a.level}] {a.rule}｜{a.hotel_name}（{code_of.get(a.hotel_name, '')}）"
+                        f"｜{a.status}｜{_fmt_bj(a.time, '%m-%d %H:%M')}"
+                    )
 
     if "设备" in text:
         hit = True
@@ -328,7 +402,7 @@ def _query_data(db: Session, text: str, binding) -> tuple:
         else:
             lines.append("（暂无酒店）")
 
-    return ("\n".join(lines), guard_n) if hit else (None, 0)
+    return ("\n".join(lines), guard_n, strict) if hit else (None, 0, False)
 
 
 ACK_TEXT = "🔍 正在检索，请稍候…（数据查询/AI 生成中）"
@@ -410,7 +484,7 @@ def _llm_answer(db: Session, text: str, sender: str, binding, on_slow=None) -> s
     else:
         source_type, source_id, source_name = "hotel", (binding.group_id or ""), "企微用户"
 
-    data, guard_n = _query_data(db, text, binding)
+    data, guard_n, strict = _query_data(db, text, binding)
 
     def direct() -> str:
         return f"📋 查询结果：\n{data}"
@@ -430,7 +504,9 @@ def _llm_answer(db: Session, text: str, sender: str, binding, on_slow=None) -> s
     prompt = (
         "你是酒店 AI 授权管理系统的企微助手。严格依据下面【实时数据】回答，"
         "禁止编造数据中不存在的酒店名、日期或数字；数据不足就如实说明。"
-        "若数据含清单请**完整列出全部条目**（每行一条，不要省略或概括掉条目）；"
+        "若数据含清单请**完整列出全部条目**（每行一条、保留（编码），不要省略或概括掉条目）；"
+        "数据里的范围说明（如『共 N 条/涉及 N 家/前 N 家/完整清单到后台查看』）回答须原样保留，"
+        "让用户分得清这是全量还是节选；"
         "分析/建议类问题请结合【统计基座】的精确数字回答（直接引用，不要自己重新统计）；"
         "非清单问题用中文简洁回答（不超过 250 字）。\n"
         f"{_analysis_stats(db, binding)}\n"
@@ -445,11 +521,11 @@ def _llm_answer(db: Session, text: str, sender: str, binding, on_slow=None) -> s
         return direct() if data else (
             "AI 问答暂不可用，请稍后再试或回复『帮助』看指令列表。"
         )
-    out = (r["output"] or "").strip()[:1600]
+    out = (r["output"] or "").strip()[:2400]
 
-    # 完整性校验：仅对「清单类」问法生效，且只对标主清单条目数（防小模型截断漏项；
-    # 不误伤咨询类回答——咨询回答本就无需罗列全部编码）
-    if data and out and guard_n > 0 and _is_list_query(text):
+    # 完整性校验：清单类问法或单店告警全量（strict）时生效，对标主清单条目数
+    # （防小模型截断漏项；不误伤咨询类回答——咨询回答本就无需罗列全部编码）
+    if data and out and guard_n > 0 and (strict or _is_list_query(text)):
         import re as _re
         exp = len(_re.findall(r"（[A-Z]{2}-[^）]+）", data))
         act = len(_re.findall(r"（[A-Z]{2}-[^）]+）", out))
@@ -516,7 +592,7 @@ def process_command(db: Session, text: str, sender: str = "unknown", on_slow=Non
         db.commit()
         if not alerts:
             return f"{hotel.name} 暂无告警记录。"
-        return "\n".join(f"· [{a.level}] {a.rule}（{a.status}）{a.time}" for a in alerts)
+        return "\n".join(f"· [{a.level}] {a.rule}（{a.status}）{_fmt_bj(a.time)}" for a in alerts)
 
     if cmd in ("续期", "确认续期") and hotel is not None and allowed(hotel):
         if cmd == "续期":

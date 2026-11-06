@@ -10,6 +10,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta
 
 BASE = os.environ.get("BASE_URL", "http://127.0.0.1:8000")
 results: list[dict] = []
@@ -662,6 +663,89 @@ def main():
 
     st, p = req("POST", "/api/llm-logs/simulate", {"sourceType": "admin", "userInput": "x"}, token=vtok)
     check("T18.4", "大模型审计", "只读角色无权触发调用（403）", st == 403, f"HTTP {st}")
+
+    # ---------------- 24. 企微回答准确性（单店告警全量 / 清单完整性 / 北京时间） ----------------
+    print("【24. 企微回答准确性】")
+
+    # 造测试店并激活设备，制造两条不同规则告警（设备指纹变更 + 时间回滚）
+    # 编码用 HT-XA/HT-XB 前缀：避开历史用例的 HT-W(企微推送)/HT-G/HT-C/HT-M/HT-R 占用
+    hv_name, hv_code = f"核对店{ts}", f"HT-XA{ts}"
+    st, p = req("POST", "/api/hotels", {"name": hv_name, "code": hv_code, "plan": "基础版"}, token=token)
+    hvid = (p or {}).get("id")
+    if not hvid:
+        st_h, hs = req("GET", "/api/hotels", token=token)
+        hvid = next((h.get("id") for h in (hs or []) if h.get("code") == hv_code), None)
+    st, p = req("POST", "/api/licenses", {"hotelId": hvid, "plan": "基础版", "type": "新签", "months": 12}, token=token)
+    hvfp = f"{ts:08x}" + "v" * 56
+    st, p = req("POST", "/api/client/activate",
+                {"licenseCode": (p or {}).get("code"), "deviceName": "核对机", "clientVersion": "0.1.0"},
+                headers={"X-Device-Fingerprint": hvfp})
+    hvtok = (p or {}).get("token")
+    req("POST", "/api/client/heartbeat", {"clientVersion": "0.1.0"},
+        token=hvtok, headers={"X-Device-Fingerprint": "f" * 64})  # → 设备指纹变更
+    req("POST", "/api/client/heartbeat", {"clientVersion": "0.1.0", "clockAnomaly": True},
+        token=hvtok, headers={"X-Device-Fingerprint": hvfp})  # → 时间回滚
+
+    # 单店提问：该店全部告警都要出来（老告警不得被全局窗口挤掉；漏项即兜底直出）
+    st, p = req("POST", "/api/wecom/simulate",
+                {"text": f"查看{hv_name}酒店异常统计", "userid": f"u{ts}"}, token=token)
+    reply = (p or {}).get("reply", "")
+    check("T24.1", "企微回答准确性", "单店异常统计返回该店全部告警（2 条不同规则）",
+          "设备指纹变更" in reply and "时间回滚" in reply and hv_code in reply,
+          f"指纹变更={'设备指纹变更' in reply} 回滚={'时间回滚' in reply} 编码={hv_code in reply}")
+
+    # 集团隔离范围下「查找异常的酒店」：聚合清单必须把有告警的店列全（完整性兜底保证）
+    st, p = req("POST", "/api/groups", {"name": f"核对集团{ts}", "plan": "基础版"}, token=token)
+    vgid = (p or {}).get("id") or ""
+    if not vgid:
+        st, gs = req("GET", "/api/groups", token=token)
+        vgid = next((g.get("id") for g in (gs or []) if g.get("name") == f"核对集团{ts}"), "")
+    hv2_name, hv2_code = f"核对二店{ts}", f"HT-XB{ts}"
+    st2, p2 = req("POST", "/api/hotels", {"name": hv2_name, "code": hv2_code, "plan": "基础版"}, token=token)
+    hv2id = (p2 or {}).get("id")
+    if not hv2id:
+        st_h, hs = req("GET", "/api/hotels", token=token)
+        hv2id = next((h.get("id") for h in (hs or []) if h.get("code") == hv2_code), None)
+    st, p = req("POST", "/api/licenses", {"hotelId": hv2id, "plan": "基础版", "type": "新签", "months": 12}, token=token)
+    hv2fp = f"{ts:08x}" + "w" * 56
+    st, p = req("POST", "/api/client/activate",
+                {"licenseCode": (p or {}).get("code"), "deviceName": "核对机2", "clientVersion": "0.1.0"},
+                headers={"X-Device-Fingerprint": hv2fp})
+    hv2tok = (p or {}).get("token")
+    req("POST", "/api/client/heartbeat", {"clientVersion": "0.1.0", "clockAnomaly": True},
+        token=hv2tok, headers={"X-Device-Fingerprint": hv2fp})
+    st_a, p_a = req("POST", "/api/groups/assign", {"hotelIds": [hvid, hv2id], "groupId": vgid}, token=token)
+    st_g, gd = req("GET", f"/api/groups/{vgid}", token=token)
+    members = [m.get("code") for m in ((gd or {}).get("members") or [])]
+    req("POST", "/api/wecom/bindings",
+        {"userid": f"ugv{ts}", "name": "核对集团管理员", "role": "group", "groupId": vgid}, token=token)
+    st, p = req("POST", "/api/wecom/simulate", {"text": "查找异常的酒店", "userid": f"ugv{ts}"}, token=token)
+    reply = (p or {}).get("reply", "")
+    check("T24.2", "企微回答准确性", "查找异常的酒店→聚合清单完整（两店都在，兜底保证）",
+          hv_code in reply and hv2_code in reply,
+          f"{hv_code}={hv_code in reply} {hv2_code}={hv2_code in reply} "
+          f"vgid={vgid} ids=[{hvid},{hv2id}] assign={st_a} members={members} reply={reply[:60]!r}")
+
+    # 时间展示：告警时间换算北京时间（UTC+8），不再直接甩 UTC
+    st, alerts = req("GET", "/api/alerts", token=token)
+    ta = next((a for a in (alerts or []) if a.get("hotelName") == hv_name), None)
+    bj_expect = ""
+    if ta:
+        raw = (ta.get("time") or "")[:19]
+        try:
+            bj_expect = (datetime.strptime(raw, "%Y-%m-%d %H:%M:%S") + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            bj_expect = ""
+        st, p = req("POST", "/api/wecom/simulate", {"text": f"告警 {hv_code}", "userid": f"u{ts}"}, token=token)
+        reply = (p or {}).get("reply", "")
+    else:
+        reply = ""
+    check("T24.3", "企微回答准确性", "告警时间按北京时间展示（UTC+8 换算）",
+          bool(bj_expect) and bj_expect in reply, f"期望 {bj_expect or '（未找到告警）'}")
+
+    # 清理测试店（停用，防残留污染数据查询）
+    req("PATCH", f"/api/hotels/{hvid}", {"status": "已停用"}, token=token)
+    req("PATCH", f"/api/hotels/{hv2id}", {"status": "已停用"}, token=token)
 
     # ---------------- 19. 大模型接入（本地 Ollama/llama.cpp + 云端 API） ----------------
     print("【19. 大模型接入（本地+云端）】")

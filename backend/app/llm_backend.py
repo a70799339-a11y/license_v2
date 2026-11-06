@@ -94,7 +94,8 @@ def _http_json(url: str, payload: dict, headers: dict | None = None, timeout: in
 def _chat_ollama(endpoint: str, model: str, prompt: str) -> tuple:
     r = _http_json(
         f"{endpoint.rstrip('/')}/api/chat",
-        {"model": model, "messages": [{"role": "user", "content": prompt}], "stream": False},
+        {"model": model, "messages": [{"role": "user", "content": prompt}], "stream": False,
+         "options": {"temperature": 0.3}},
     )
     output = ((r.get("message") or {}).get("content")) or ""
     return output, model, int(r.get("prompt_eval_count") or 0), int(r.get("eval_count") or 0)
@@ -103,7 +104,7 @@ def _chat_ollama(endpoint: str, model: str, prompt: str) -> tuple:
 def _chat_llamacpp(endpoint: str, model: str, prompt: str) -> tuple:
     r = _http_json(
         f"{endpoint.rstrip('/')}/v1/chat/completions",
-        {"model": model or "local", "messages": [{"role": "user", "content": prompt}]},
+        {"model": model or "local", "messages": [{"role": "user", "content": prompt}], "temperature": 0.3},
     )
     choices = r.get("choices") or []
     output = ((choices[0].get("message") or {}).get("content")) if choices else ""
@@ -117,7 +118,7 @@ def _chat_openai_compatible(endpoint: str, api_key: str, model: str, prompt: str
     url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
     r = _http_json(
         url,
-        {"model": model, "messages": [{"role": "user", "content": prompt}]},
+        {"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.3},
         headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
         timeout=120,
     )

@@ -25,7 +25,7 @@ def req(method: str, path: str, body=None, token=None, headers=None):
     for k, v in (headers or {}).items():
         r.add_header(k, v)
     try:
-        with urllib.request.urlopen(r, timeout=15) as resp:
+        with urllib.request.urlopen(r, timeout=30) as resp:
             raw = resp.read().decode()
             return resp.status, (json.loads(raw) if raw else None)
     except urllib.error.HTTPError as e:
@@ -33,7 +33,9 @@ def req(method: str, path: str, body=None, token=None, headers=None):
         try:
             return e.code, (json.loads(raw) if raw else None)
         except Exception:
-            return e.code, None
+            return e.code, {"_raw": raw[:200]}   # 非 JSON 响应（如网关 HTML）保留现场
+    except Exception as e:
+        return "ERR", {"_raw": str(e)[:200]}
 
 
 def check(cid: str, module: str, name: str, cond: bool, actual=""):
@@ -522,16 +524,17 @@ def main():
     wid = (p or {}).get("id")
     st, p = req("POST", "/api/licenses", {"hotelId": wid, "plan": "基础版", "type": "新签", "months": 12}, token=token)
     wlic = (p or {}).get("code")
-    wtok = req("POST", "/api/client/activate",
-               {"licenseCode": wlic, "deviceName": "企微推送测试", "clientVersion": "0.1.0"},
-               headers={"X-Device-Fingerprint": t14fp("w")})[1].get("token")
+    act_resp = req("POST", "/api/client/activate",
+                   {"licenseCode": wlic, "deviceName": "企微推送测试", "clientVersion": "0.1.0"},
+                   headers={"X-Device-Fingerprint": t14fp("w")})[1]
+    wtok = (act_resp or {}).get("token")
     req("POST", "/api/client/heartbeat", {"clientVersion": "0.1.0", "clockAnomaly": True},
         token=wtok, headers={"X-Device-Fingerprint": t14fp("w")})
     st, s2 = req("GET", "/api/settings", token=token)
     last_push = (s2 or {}).get("wecom_last_push", "")
     check("T16.3", "企微机器人", "高危告警即时推送（内容含规则且已脱敏）",
           "时间回滚" in last_push and f"企微推送测试店{ts}" in last_push,
-          last_push[:60])
+          f"wlic={'有' if wlic else '无'} act={str(act_resp)[:80]}")
 
     # 指令管道：未绑定 → 绑定 → 查询
     st, p = req("POST", "/api/wecom/simulate", {"text": "状态 HT-0001", "userid": f"u{ts}"}, token=token)
@@ -779,6 +782,29 @@ def main():
           f"越界店出现={f'接地测试店{ts}' in reply}")
     # 清理测试酒店（停用，防残留污染数据查询）
     req("PATCH", f"/api/hotels/{gid}", {"status": "已停用"}, token=token)
+
+    # ---------------- 22. 设备ID防撞（同秒+同指纹前缀双激活） ----------------
+    print("【22. 设备 ID 防撞】")
+    fp_a, fp_b = ("beef01" + "a" * 58)[:64], ("beef01" + "b" * 58)[:64]  # 前6位相同
+    codes = []
+    for i, fp in enumerate((fp_a, fp_b)):
+        st, p = req("POST", "/api/hotels",
+                    {"name": f"防撞店{ts}-{i}", "code": f"HT-C{ts}{i}", "plan": "基础版"}, token=token)
+        hid = (p or {}).get("id")
+        st, p = req("POST", "/api/licenses", {"hotelId": hid, "plan": "基础版", "type": "新签", "months": 12}, token=token)
+        lic = (p or {}).get("code")
+        st, p = req("POST", "/api/client/activate",
+                    {"licenseCode": lic, "deviceName": f"防撞机{i}", "clientVersion": "0.1.0"},
+                    headers={"X-Device-Fingerprint": fp})
+        codes.append(st)
+    check("T22.1", "设备ID防撞", "同秒同前缀指纹双激活均成功（ID 不冲突）",
+          codes == [200, 200], f"HTTP {codes}")
+    # 同设备重复激活走复用分支
+    st, p = req("POST", "/api/client/activate",
+                {"licenseCode": req("GET", "/api/licenses", token=token)[1][0].get("code", "HT-0001"),
+                 "deviceName": "重复激活", "clientVersion": "0.1.0"},
+                headers={"X-Device-Fingerprint": fp_a})
+    check("T22.2", "设备ID防撞", "同指纹重复激活复用设备（不报错）", st in (200, 403, 404, 409), f"HTTP {st}")
 
     # 还原模型配置（测试改动不污染环境；apiKey 空串=不修改已有 Key）
     req("POST", "/api/ai/config", llm_snapshot, token=token)

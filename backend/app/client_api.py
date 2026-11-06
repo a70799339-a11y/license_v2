@@ -5,6 +5,7 @@
 吊销、停用、到期、自动续期、新版本发布都会通过心跳即时下发。
 """
 import platform
+import uuid
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -262,7 +263,7 @@ def activate(
             db.commit()
             raise HTTPException(status_code=403, detail="设备数已达套餐上限，请先解绑或升级套餐")
         device = Device(
-            id=f"cd{datetime.utcnow().strftime('%H%M%S')}{fingerprint[:6]}",
+            id=f"cd{uuid.uuid4().hex[:12]}",
             hotel_id=hotel.id,
             name=req.deviceName or f"客户端-{fingerprint[:6]}",
             os=req.os_name or platform.platform(),

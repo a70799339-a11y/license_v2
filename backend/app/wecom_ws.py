@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .database import SessionLocal
-from .wecom import get_setting, process_command
+from .wecom import ACK_TEXT, get_setting, process_command
 
 _STATUS = {
     "running": False,
@@ -118,12 +118,31 @@ def _run(bot_id: str, secret: str) -> None:
                 userid = ((body.get("from") or {}).get("userid")) or "unknown"
                 if not text:
                     return
+                sid = generate_req_id("stream")
+                loop = asyncio.get_running_loop()
+                ack_fut = None
+
+                def on_slow():
+                    """慢路径（AI 检索/生成）入口：秒发『检索中』提示（同一气泡流式）"""
+                    nonlocal ack_fut
+                    if ack_fut is None:
+                        ack_fut = asyncio.run_coroutine_threadsafe(
+                            client.reply_stream(frame, sid, f"{ACK_TEXT}\n", False), loop
+                        )
+
                 db = SessionLocal()
                 try:
-                    reply = process_command(db, text, userid)
+                    reply = await asyncio.to_thread(process_command, db, text, userid, on_slow)
                 finally:
                     db.close()
-                await client.reply_stream(frame, generate_req_id("stream"), reply, True)
+                if ack_fut is not None:
+                    try:
+                        await asyncio.wrap_future(ack_fut)  # 等提示先落地，保证时序
+                    except Exception:
+                        pass
+                    await client.reply_stream(frame, sid, reply, True)  # 续写同一气泡
+                else:
+                    await client.reply_stream(frame, sid, reply, True)
             except Exception as e:  # 单条消息失败不影响连接
                 _STATUS["last_error"] = f"消息处理失败：{str(e)[:100]}"
 

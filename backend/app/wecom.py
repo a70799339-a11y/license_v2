@@ -314,11 +314,21 @@ def _query_data(db: Session, text: str, binding) -> tuple:
     return ("\n".join(lines), guard_n) if hit else (None, 0)
 
 
-def _llm_answer(db: Session, text: str, sender: str, binding) -> str:
+ACK_TEXT = "🔍 正在检索，请稍候…（数据查询/AI 生成中）"
+
+
+def _llm_answer(db: Session, text: str, sender: str, binding, on_slow=None) -> str:
     """企微自由问答：先从数据库取真实数据（接地），再经审计网关调用大模型组织回答。
-    未配置模型时数据直出（保证查询类问题依然准确）；模型失败时降级为数据直出。"""
+    未配置模型时数据直出（保证查询类问题依然准确）；模型失败时降级为数据直出。
+    on_slow：进入慢路径（AI 检索/生成）前的回调——用于向用户先发『检索中』提示。"""
     from .llm_audit import llm_call
     from .llm_backend import get_backend
+
+    if on_slow:
+        try:
+            on_slow()
+        except Exception:
+            pass
 
     role = binding.role if binding else "viewer"
     if role == "group":
@@ -377,8 +387,9 @@ def _llm_answer(db: Session, text: str, sender: str, binding) -> str:
     return out or (direct() if data else "（模型无输出）")
 
 
-def process_command(db: Session, text: str, sender: str = "unknown") -> str:
-    """解析并执行企微指令。权限：续期需 operator+/集团绑定；查询需绑定。"""
+def process_command(db: Session, text: str, sender: str = "unknown", on_slow=None) -> str:
+    """解析并执行企微指令。权限：续期需 operator+/集团绑定；查询需绑定。
+    on_slow：慢路径（AI 问答）进入前回调（如向用户发『检索中』提示）。"""
     text = (text or "").strip()
     operator = f"企微({sender})"
     binding = db.query(WecomBinding).filter(WecomBinding.userid == sender).first()
@@ -446,4 +457,4 @@ def process_command(db: Session, text: str, sender: str = "unknown") -> str:
         return f"✅ {hotel.name} 已续期至 2027-12-31"
 
     # 未命中指令 → 大模型问答（本地/云端均可，经审计网关全量留痕）
-    return _llm_answer(db, text, sender, binding)
+    return _llm_answer(db, text, sender, binding, on_slow)

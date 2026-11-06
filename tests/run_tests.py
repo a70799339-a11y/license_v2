@@ -806,6 +806,28 @@ def main():
                 headers={"X-Device-Fingerprint": fp_a})
     check("T22.2", "设备ID防撞", "同指纹重复激活复用设备（不报错）", st in (200, 403, 404, 409), f"HTTP {st}")
 
+    # ---------------- 23. 检索中提示（慢路径先提示后结果） ----------------
+    print("【23. 检索中提示】")
+
+    st, p = req("POST", "/api/wecom/simulate",
+                {"text": "授权到期前我应该做什么准备？", "userid": f"u{ts}"}, token=token)
+    check("T23.1", "检索中提示", "AI 慢路径先返回『检索中』提示",
+          (p or {}).get("ackSent") is True and "正在检索" in (p or {}).get("ack", "")
+          and bool((p or {}).get("reply")),
+          f"ackSent={(p or {}).get('ackSent')}")
+
+    st, p = req("POST", "/api/wecom/simulate",
+                {"text": "状态 HT-0001", "userid": f"u{ts}"}, token=token)
+    check("T23.2", "检索中提示", "快速指令不加检索提示（秒回无噪音）",
+          (p or {}).get("ackSent") is False and "授权状态" in (p or {}).get("reply", ""),
+          f"ackSent={(p or {}).get('ackSent')}")
+
+    st, p = req("POST", "/api/wecom/simulate",
+                {"text": "帮我看看数据", "userid": f"nobody{ts}"}, token=token)
+    check("T23.3", "检索中提示", "未绑定用户快速提示（不进慢路径）",
+          (p or {}).get("ackSent") is False and "尚未绑定" in (p or {}).get("reply", ""),
+          f"ackSent={(p or {}).get('ackSent')}")
+
     # 还原模型配置（测试改动不污染环境；apiKey 空串=不修改已有 Key）
     req("POST", "/api/ai/config", llm_snapshot, token=token)
 

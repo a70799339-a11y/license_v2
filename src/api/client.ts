@@ -227,7 +227,7 @@ export const api = {
   wecomTest: () => request<{ ok: boolean; sent: string[]; dryRun: boolean }>('/wecom/test', { method: 'POST' }),
   wecomFlushDaily: () => request<Record<string, unknown>>('/wecom/flush-daily', { method: 'POST' }),
   wecomSimulate: (text: string, userid = 'admin-sim') =>
-    request<{ reply: string }>('/wecom/simulate', { method: 'POST', body: JSON.stringify({ text, userid }) }),
+    request<{ reply: string; ackSent: boolean; ack: string }>('/wecom/simulate', { method: 'POST', body: JSON.stringify({ text, userid }) }),
 
   // plans & stats
   listPlans: () => request<Plan[]>('/plans'),

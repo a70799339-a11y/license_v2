@@ -36,6 +36,8 @@ const wecom = ref({ opsWebhook: '', pushEnabled: false, dryRun: true })
 const wecomTestResult = ref('')
 const simText = ref('状态 HT-0001')
 const simReply = ref('')
+const simLoading = ref(false)
+const simAck = ref('')
 const wsStatus = ref<{ running: boolean; authenticated: boolean; last_error: string; started_at: string; msg_count: number } | null>(null)
 
 async function loadWecom() {
@@ -78,8 +80,19 @@ async function pushDaily() {
 }
 
 async function runSim() {
-  const r = await api.wecomSimulate(simText.value)
-  simReply.value = r.reply
+  simLoading.value = true
+  simReply.value = ''
+  simAck.value = '🔍 正在检索，请稍候…'
+  try {
+    const r = await api.wecomSimulate(simText.value)
+    simAck.value = r.ackSent ? r.ack : ''
+    simReply.value = r.reply
+  } catch (e) {
+    simReply.value = e instanceof Error ? e.message : '执行失败'
+    simAck.value = ''
+  } finally {
+    simLoading.value = false
+  }
 }
 
 // ---------- 大模型调用审计 ----------
@@ -250,10 +263,11 @@ async function revokeWithReason(row: License) {
           <el-button @click="pushDaily">推日报</el-button>
         </div>
         <div style="display: flex; gap: 12px; align-items: center">
-          <el-input v-model="simText" placeholder="指令模拟，如：状态 HT-0001" style="flex: 1" />
-          <el-button @click="runSim">执行指令</el-button>
+          <el-input v-model="simText" placeholder="指令模拟，如：状态 HT-0001" style="flex: 1" :disabled="simLoading" />
+          <el-button type="primary" :loading="simLoading" @click="runSim">执行指令</el-button>
         </div>
-        <pre v-if="simReply" class="sim-reply">{{ simReply }}</pre>
+        <p v-if="simLoading" class="muted sim-ack">{{ simAck || '🔍 正在检索，请稍候…' }}</p>
+        <pre v-else-if="simReply" class="sim-reply">{{ simReply }}</pre>
       </div>
     </div>
 
@@ -435,6 +449,7 @@ async function revokeWithReason(row: License) {
 .card-title { font-size: 15px; font-weight: 600; margin-bottom: 16px; }
 .flow-card { padding: 20px; }
 .sim-reply { background: #f4f4f5; border-radius: 6px; padding: 10px 14px; font-size: 12px; white-space: pre-wrap; margin: 0; }
+.sim-ack { margin: 8px 0 0; font-size: 12px; color: #2563eb; }
 .ws-row { display: flex; gap: 10px; align-items: center; background: #fafafa; border: 1px solid var(--border, #e5e5e5); border-radius: 6px; padding: 8px 12px; }
 .flow-row { display: flex; align-items: center; gap: 4px; }
 .step { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 6px; }

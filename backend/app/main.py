@@ -574,9 +574,19 @@ def wecom_simulate(
     _: User = Depends(require_roles("admin")),
 ):
     """调试入口：模拟企微消息进入指令管道（生产接自建应用回调后走 /api/wecom/callback）"""
-    from .wecom import process_command
+    from .wecom import ACK_TEXT, process_command
 
-    return {"reply": process_command(db, req.text, req.userid)}
+    slow = {"hit": False}
+
+    def on_slow():
+        slow["hit"] = True
+
+    reply = process_command(db, req.text, req.userid, on_slow)
+    return {
+        "reply": reply,
+        "ackSent": slow["hit"],
+        "ack": ACK_TEXT if slow["hit"] else "",
+    }
 
 
 @app.get("/api/wecom/bindings")

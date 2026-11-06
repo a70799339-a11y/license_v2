@@ -823,6 +823,54 @@ def main():
           "运营日报" in daily and ("超时未处置" in daily or "新增告警" in daily),
           f"升级段={'超时未处置' in daily}")
 
+    # ---------------- 27. 变更操作防谎称 + 风险等级过滤 + 停用指令 ----------------
+    print("【27. 变更操作防谎称/等级过滤/停用指令】")
+
+    # 造一家有高风险告警（时间回滚）的店
+    hb_name, hb_code = f"拉黑店{ts}", f"HT-XE{ts}"
+    st, p = req("POST", "/api/hotels", {"name": hb_name, "code": hb_code, "plan": "基础版"}, token=token)
+    hbid = (p or {}).get("id")
+    if not hbid:
+        st_h, hs = req("GET", "/api/hotels", token=token)
+        hbid = next((h.get("id") for h in (hs or []) if h.get("code") == hb_code), None)
+    st, p = req("POST", "/api/licenses", {"hotelId": hbid, "plan": "基础版", "type": "新签", "months": 12}, token=token)
+    hbfp = f"{ts:08x}" + "h" * 56
+    st, p = req("POST", "/api/client/activate",
+                {"licenseCode": (p or {}).get("code"), "deviceName": "拉黑机", "clientVersion": "0.1.0"},
+                headers={"X-Device-Fingerprint": hbfp})
+    hbtok = (p or {}).get("token")
+    req("POST", "/api/client/heartbeat", {"clientVersion": "0.1.0", "clockAnomaly": True},
+        token=hbtok, headers={"X-Device-Fingerprint": hbfp})
+
+    # 变更操作请求：不得谎称执行，必须附「未执行」说明与操作指引
+    st, p = req("POST", "/api/wecom/simulate",
+                {"text": "把高风险告警酒店拉黑并告诉我处置结果", "userid": f"u{ts}"}, token=token)
+    reply = (p or {}).get("reply", "")
+    claims = [c for c in ("已拉黑", "将拉黑", "拉黑成功", "已封禁", "我们将", "处置完成") if c in reply]
+    check("T27.1", "变更操作防谎称", "拉黑请求不谎称执行 + 明示未执行与操作指引",
+          "未执行" in reply and not claims and ("停用" in reply or "后台" in reply),
+          f"未执行={'未执行' in reply} 谎称={claims or '无'}")
+
+    # 风险等级过滤：高风险清单不得混入中危（心跳中断）条目
+    st, p = req("POST", "/api/wecom/simulate",
+                {"text": "高风险告警酒店有哪些", "userid": f"u{ts}"}, token=token)
+    reply = (p or {}).get("reply", "")
+    check("T27.2", "变更操作防谎称", "高风险清单按等级过滤（不含中危心跳中断）",
+          hb_code in reply and "心跳中断" not in reply,
+          f"本店={hb_code in reply} 混入中危={'心跳中断' in reply}")
+
+    # 停用（拉黑）指令：二次确认后生效
+    st, p = req("POST", "/api/wecom/simulate", {"text": f"停用 {hb_code}", "userid": f"u{ts}"}, token=token)
+    step1 = "确认停用" in (p or {}).get("reply", "")
+    st, p = req("POST", "/api/wecom/simulate", {"text": f"确认停用 {hb_code}", "userid": f"u{ts}"}, token=token)
+    step2 = "已停用" in (p or {}).get("reply", "")
+    st, hs = req("GET", f"/api/hotels?page=1&page_size=200&keyword={hb_code}", token=token)
+    items = (hs or {}).get("items") if isinstance(hs, dict) else hs
+    status_now = next((h.get("status") for h in (items or []) if h.get("code") == hb_code), "")
+    check("T27.3", "变更操作防谎称", "停用（拉黑）指令二次确认后生效",
+          step1 and step2 and status_now == "已停用",
+          f"确认={step1} 执行={step2} status={status_now}")
+
     # ---------------- 19. 大模型接入（本地 Ollama/llama.cpp + 云端 API） ----------------
     print("【19. 大模型接入（本地+云端）】")
 

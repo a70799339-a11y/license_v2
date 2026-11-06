@@ -424,15 +424,25 @@ def _query_data(db: Session, text: str, binding) -> tuple:
     if any(k in text for k in ("告警", "风险", "异常")):
         hit = True
         code_of = {h.name: (h.code or "") for h in hotels}
+        # 风险等级过滤（v1.1.1）：问『高风险/高危/紧急』只给高+紧急，问『中风险/中危』只给中
+        level_filter = None
+        if any(k in text for k in ("高风险", "高危", "紧急", "严重")):
+            level_filter = ("高", "紧急")
+        elif any(k in text for k in ("中风险", "中危")):
+            level_filter = ("中",)
+
+        def _lv_ok(a: Alert) -> bool:
+            return level_filter is None or a.level in level_filter
+
         # 单店提问（问题里出现该店编码/全名）→ 取该店全量告警，避免老告警被全局窗口挤掉
         target = next((h for h in hotels if h.code and h.code in text), None) or next(
             (h for h in hotels if h.name and h.name in text), None
         )
         if target is not None:
-            rows = (
-                db.query(Alert).filter(Alert.hotel_name == target.name)
-                .order_by(Alert.time.desc()).limit(30).all()
-            )
+            rows = [
+                a for a in db.query(Alert).filter(Alert.hotel_name == target.name)
+                .order_by(Alert.time.desc()).limit(30).all() if _lv_ok(a)
+            ]
             guard_n = min(len(rows), 30)
             strict = guard_n > 0  # 单店全量：无论问法都必须完整，漏项即切数据直出
             by_lv: dict = {}
@@ -451,7 +461,7 @@ def _query_data(db: Session, text: str, binding) -> tuple:
             names = {h.name for h in hotels if h.status != "已停用"}
             rows = [
                 a for a in db.query(Alert).order_by(Alert.time.desc()).limit(400).all()
-                if a.hotel_name in names and a.status != "已处置"
+                if a.hotel_name in names and a.status != "已处置" and _lv_ok(a)
             ]
             by_hotel: dict = {}
             for a in rows:
@@ -551,6 +561,12 @@ def _query_data(db: Session, text: str, binding) -> tuple:
 
 
 ACK_TEXT = "🔍 正在检索，请稍候…（数据查询/AI 生成中）"
+
+# 变更类操作请求（拉黑/停用等）：机器人无对话内变更能力，不得谎称执行
+ACTION_WORDS = ("拉黑", "封禁", "黑名单", "黑掉", "停用", "吊销", "删除", "解绑", "禁用", "冻结", "取消授权")
+ACTION_CLAIMS = ("已拉黑", "将拉黑", "拉黑成功", "已封禁", "已停用", "已删除", "已吊销", "已处理完毕",
+                 "我们将", "将为您", "已为您", "已经拉黑", "已加入黑名单", "处置完成")
+ACTION_FOOTER = "\n\n⚠️ 说明：拉黑/停用/删除等变更操作我未执行、也不会代为执行。可回复『停用 HT-XXXX』（二次确认）或到后台「客户管理」页操作。"
 
 
 def _analysis_stats(db: Session, binding, gt=None) -> str:
@@ -657,6 +673,8 @@ def _llm_answer(db: Session, text: str, sender: str, binding, on_slow=None) -> s
         "数据里的范围说明（如『共 N 条/涉及 N 家/前 N 家/完整清单到后台查看』）回答须原样保留，"
         "让用户分得清这是全量还是节选；"
         "分析/建议类问题请结合【统计基座】的精确数字回答（直接引用，不要自己重新统计）；"
+        "用户请求执行变更操作（拉黑/停用/删除/吊销等）时，**严禁声称已执行或将代为执行**，"
+        "只给涉及对象清单并引导到后台或确定性指令；"
         "非清单问题用中文简洁回答（不超过 250 字）。\n"
         f"{_analysis_stats(db, binding, _match_group(db, text))}\n"
         f"【实时数据】\n{data or '（本次提问未命中结构化明细，按统计基座回答）'}\n"
@@ -696,7 +714,16 @@ def _llm_answer(db: Session, text: str, sender: str, binding, on_slow=None) -> s
         if exp_occ > 0 and (act_occ < min(exp_occ, guard_n) or matched < min(len(exp_codes), guard_n)):
             return direct()  # AI 漏项/抄错编码 → 静默切换完整数据（兜底路径细节见审计日志）
 
-    return out or (direct() if data else "（模型无输出）")
+    reply = out or (direct() if data else "（模型无输出）")
+
+    # 变更操作请求（v1.1.1）：模型若谎称执行/承诺代办 → 丢弃叙述只给数据；一律附「未执行」说明
+    if any(k in text for k in ACTION_WORDS):
+        if out and any(c in out for c in ACTION_CLAIMS):
+            reply = direct() if data else (
+                "该操作我无法代为执行。可回复『停用 HT-XXXX』（二次确认）或到后台「客户管理」页操作。"
+            )
+        reply += ACTION_FOOTER
+    return reply
 
 
 def process_command(db: Session, text: str, sender: str = "unknown", on_slow=None) -> str:
@@ -712,6 +739,7 @@ def process_command(db: Session, text: str, sender: str = "unknown", on_slow=Non
             "· 状态 HT-0001 —— 查授权状态\n"
             "· 告警 HT-0001 —— 查最近告警\n"
             "· 续期 HT-0001 —— 续期一年（需回复『确认续期 HT-0001』）\n"
+            "· 停用 HT-0001 —— 停用/拉黑该客户（需回复『确认停用 HT-0001』）\n"
             "· 其他问题直接发 —— AI 为你解答\n"
             "（使用前需管理员绑定你的企微账号）"
         )
@@ -767,6 +795,19 @@ def process_command(db: Session, text: str, sender: str = "unknown", on_slow=Non
         _audit(db, operator, "企微续期", hotel.name, "续期一年至 2027-12-31")
         db.commit()
         return f"✅ {hotel.name} 已续期至 2027-12-31"
+
+    # 停用（拉黑）：v1.1.1 二次确认后停用客户（等效拉黑，剔除统计与查询）
+    if cmd in ("停用", "确认停用", "拉黑", "确认拉黑") and hotel is not None and allowed(hotel):
+        if cmd in ("停用", "拉黑"):
+            return f"确认执行？回复：确认停用 {hotel.code}（停用后该店不再计入统计，可到后台恢复）"
+        hotel.status = "已停用"
+        _audit(db, operator, "企微停用", hotel.name, "对话停用（拉黑）")
+        db.commit()
+        try:
+            push_message(db, f"**⛔ 客户已停用（拉黑）**\n> {hotel.name}（{hotel.code}）\n> 操作人：{operator}\n> 时间：{_fmt_bj(datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'))}")
+        except Exception:
+            pass
+        return f"✅ {hotel.name}（{hotel.code}）已停用（拉黑），不再计入统计；如需恢复请到后台启用"
 
     # 未命中指令 → 大模型问答（本地/云端均可，经审计网关全量留痕）
     return _llm_answer(db, text, sender, binding, on_slow)

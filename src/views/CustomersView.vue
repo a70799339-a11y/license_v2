@@ -2,7 +2,7 @@
 import { h, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { api, type Hotel } from '../api/client'
+import { api, type Hotel, downloadCsv } from '../api/client'
 import { useAuthStore } from '../stores/auth'
 
 const router = useRouter()
@@ -216,6 +216,7 @@ async function renewOne(row: Hotel) {
       </div>
       <div style="display: flex; gap: 8px">
         <el-button @click="exportCsv">导出 CSV</el-button>
+        <el-button @click="downloadCsv('/reports/expiring.csv?days=90', '到期预测报表.csv')">到期预测报表</el-button>
         <el-button v-if="auth.canWrite" type="primary" @click="showCreate = true">新增客户</el-button>
       </div>
     </div>

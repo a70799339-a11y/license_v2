@@ -4,7 +4,7 @@
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -26,6 +26,14 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     db = next(get_db())
     try:
+        # 幂等列迁移（老库升级补列，新库由 create_all 建全）
+        for ddl in (
+            "ALTER TABLE alerts ADD COLUMN IF NOT EXISTS handled_by VARCHAR(64) DEFAULT ''",
+            "ALTER TABLE alerts ADD COLUMN IF NOT EXISTS handle_note VARCHAR(256) DEFAULT ''",
+            "ALTER TABLE alerts ADD COLUMN IF NOT EXISTS handled_at VARCHAR(32) DEFAULT ''",
+        ):
+            db.execute(__import__("sqlalchemy").text(ddl))
+        db.commit()
         seed(db)
     finally:
         db.close()
@@ -39,7 +47,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="酒店AI管理 License 授权管理系统", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="酒店AI管理 License 授权管理系统", version="1.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -268,15 +276,96 @@ def list_alerts(db: Session = Depends(get_db), _: User = Depends(get_current_use
     return [AlertOut.from_orm_model(a) for a in db.query(Alert).order_by(Alert.time.desc()).all()]
 
 
+class AlertHandleReq(BaseModel):
+    note: str = ""  # 处置备注（可空）
+
+
 @app.post("/api/alerts/{alert_id}/handle")
-def handle_alert(alert_id: str, db: Session = Depends(get_db), user: User = Depends(require_roles("admin", "operator"))):
+def handle_alert(
+    alert_id: str,
+    req: AlertHandleReq = AlertHandleReq(),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("admin", "operator")),
+):
     a = db.query(Alert).filter(Alert.id == alert_id).first()
     if a is None:
         raise HTTPException(status_code=404, detail="告警不存在")
     a.status = "已处置"
-    write_log(db, user, "处置告警", a.rule, f"{a.hotel_name}：{a.detail}")
+    a.handled_by = user.name or user.username
+    a.handle_note = (req.note or "").strip()[:250]
+    a.handled_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    write_log(db, user, "处置告警", a.rule, f"{a.hotel_name}：{a.detail}｜备注：{a.handle_note or '（无）'}")
     db.commit()
-    return {"ok": True, "status": a.status}
+    # 处置结果推企微（路由到该店/集团通道，失败不影响处置）
+    try:
+        from .wecom import notify_alert_handled
+
+        notify_alert_handled(db, a, a.handled_by, a.handle_note)
+    except Exception:
+        pass
+    return {"ok": True, "status": a.status, "handledBy": a.handled_by, "handledAt": a.handled_at}
+
+
+def _csv_response(filename: str, rows: list) -> Response:
+    """CSV 导出（带 BOM，Excel 直接打开中文不乱码）"""
+    import csv
+    import io
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    for row in rows:
+        w.writerow(row)
+    return Response(
+        content="﻿" + buf.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/reports/alerts.csv")
+def export_alerts_csv(
+    status: str = "",
+    level: str = "",
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("admin", "operator")),
+):
+    """告警报表导出（可按状态/等级过滤）"""
+    q = db.query(Alert).order_by(Alert.time.desc())
+    if status:
+        q = q.filter(Alert.status == status)
+    if level:
+        q = q.filter(Alert.level == level)
+    rows = [["等级", "规则", "酒店", "详情", "时间(UTC)", "状态", "处置人", "处置备注", "处置时间(UTC)"]]
+    for a in q.limit(5000).all():
+        rows.append([a.level, a.rule, a.hotel_name, a.detail, a.time, a.status,
+                     getattr(a, "handled_by", "") or "", getattr(a, "handle_note", "") or "",
+                     getattr(a, "handled_at", "") or ""])
+    return _csv_response(f"alerts_{datetime.utcnow():%Y%m%d}.csv", rows)
+
+
+@app.get("/api/reports/expiring.csv")
+def export_expiring_csv(
+    days: int = 90,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("admin", "operator")),
+):
+    """到期预测报表导出：N 天内到期 + 已过期未续"""
+    from datetime import date as _date, timedelta as _td
+
+    today = (datetime.utcnow() + timedelta(hours=8)).date()  # 北京日期
+    horizon = (today + _td(days=days)).isoformat()
+    rows = [["客户编号", "客户名称", "集团", "套餐", "状态", "到期日", "剩余天数", "设备数", "自动续期"]]
+    for h in db.query(Hotel).order_by(Hotel.expire_at).all():
+        if not h.expire_at or h.status == "已停用":
+            continue
+        if h.expire_at <= horizon:
+            try:
+                left = (_date.fromisoformat(h.expire_at) - today).days
+            except Exception:
+                left = ""
+            rows.append([h.code, h.name, h.group or "", h.plan, h.status, h.expire_at, left,
+                         f"{h.devices}/{h.max_devices}", "是" if h.auto_renew else "否"])
+    return _csv_response(f"expiring_{days}d_{datetime.utcnow():%Y%m%d}.csv", rows)
 
 
 @app.get("/api/alerts/groups")
@@ -729,6 +818,7 @@ class LLMSlotLocal(BaseModel):
     provider: str = ""          # ollama / llama.cpp / 空
     endpoint: str = ""
     model: str = ""
+    fastModel: str = ""         # 可选快模型（短咨询提速，如 qwen2.5:3b）
 
 
 class LLMSlotCloud(BaseModel):
@@ -772,7 +862,8 @@ def llm_config_update(
             db,
             active=req.active or (local.provider and "local") or "",
             fallback=req.fallback,
-            local={"provider": local.provider, "endpoint": local.endpoint, "model": local.model},
+            local={"provider": local.provider, "endpoint": local.endpoint, "model": local.model,
+                   "fastModel": local.fastModel},
             cloud={"endpoint": req.cloud.endpoint, "model": req.cloud.model, "apiKey": req.cloud.apiKey},
         )
     except ValueError as e:

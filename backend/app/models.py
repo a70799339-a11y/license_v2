@@ -92,6 +92,10 @@ class Alert(Base):
     detail = Column(String(256), default="")
     time = Column(String(32), default="")
     status = Column(String(16), default="待处理")
+    # 处置闭环（v1.1）：谁在什么时候处理、处置备注
+    handled_by = Column(String(64), default="")
+    handle_note = Column(String(256), default="")
+    handled_at = Column(String(32), default="")
 
 
 class Plan(Base):

@@ -129,7 +129,7 @@ function sourceTypeLabel(t: string) {
 const llmCfg = ref({
   active: '',
   fallback: true,
-  local: { provider: '', endpoint: '', model: '' },
+  local: { provider: '', endpoint: '', model: '', fastModel: '' },
   cloud: { endpoint: '', model: '', apiKey: '' },
 })
 const llmPing = ref<{ ok: boolean; detail: string; local?: { ok: boolean; detail: string }; cloud?: { ok: boolean; detail: string } } | null>(null)
@@ -140,7 +140,7 @@ async function loadLlmCfg() {
     llmCfg.value = {
       active: s.active,
       fallback: s.fallback !== 'off',
-      local: { ...s.local },
+      local: { ...s.local, fastModel: s.fastModel || s.local.fastModel || '' },
       cloud: { endpoint: s.cloud.endpoint, model: s.cloud.model, apiKey: '' },
     }
     llmPing.value = s.ping
@@ -298,6 +298,7 @@ async function revokeWithReason(row: License) {
         </el-select>
         <el-input v-model="llmCfg.local.endpoint" placeholder="http://localhost:11434" style="width: 210px" />
         <el-input v-model="llmCfg.local.model" placeholder="如 qwen2.5:7b" style="width: 160px" />
+        <el-input v-model="llmCfg.local.fastModel" placeholder="快模型（可选，如 qwen2.5:3b）" style="width: 190px" />
         <el-tag v-if="llmPing?.local" size="small" :type="llmPing.local.ok ? 'success' : 'info'">
           {{ llmPing.local.ok ? '本地正常' : '本地未就绪' }}
         </el-tag>

@@ -62,6 +62,7 @@ def llm_config(db: Session) -> dict:
             "model": _setting(db, "llm_cloud_model", ""),
             "apiKeySet": bool(cloud_key),
         },
+        "fastModel": _setting(db, "llm_fast_model", ""),
     }
 
 
@@ -76,6 +77,7 @@ def save_config(db: Session, *, active: str, fallback: bool, local: dict, cloud:
     _set(db, "llm_local_provider", lp)
     _set(db, "llm_local_endpoint", (local.get("endpoint") or "").strip())
     _set(db, "llm_local_model", (local.get("model") or "").strip())
+    _set(db, "llm_fast_model", (local.get("fastModel") or "").strip())
     _set(db, "llm_cloud_endpoint", (cloud.get("endpoint") or "").strip())
     _set(db, "llm_cloud_model", (cloud.get("model") or "").strip())
     key = (cloud.get("apiKey") or "").strip()
@@ -172,6 +174,21 @@ def get_backend(db: Session):
         raise RuntimeError("模型后端全部失败（" + "；".join(errs) + "）")
 
     return backend
+
+
+def get_fast_backend(db: Session):
+    """短咨询类问题的快通道（v1.1）：本地小模型（llm_fast_model，如 qwen2.5:3b）。
+    未配置或不可用返回 None（调用方回落主力模型）。数据类问题一律不走快通道。"""
+    fast = _setting(db, "llm_fast_model", "").strip()
+    if not fast:
+        return None
+    lp = _setting(db, "llm_local_provider", "llm_provider").strip()
+    ep = _setting(db, "llm_local_endpoint", "llm_endpoint").strip()
+    if lp not in ("ollama", "llama.cpp") or not ep:
+        return None
+    if lp == "ollama":
+        return lambda p: _chat_ollama(ep, fast, p)
+    return lambda p: _chat_llamacpp(ep, fast, p)
 
 
 def ping(db: Session) -> dict:

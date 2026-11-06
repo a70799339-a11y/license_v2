@@ -111,12 +111,18 @@ class AlertOut(BaseModel):
     detail: str
     time: str
     status: str
+    handledBy: str = ""
+    handleNote: str = ""
+    handledAt: str = ""
 
     @classmethod
     def from_orm_model(cls, a):
         return cls(
             id=a.id, level=a.level, rule=a.rule, hotelName=a.hotel_name,
             detail=a.detail, time=a.time, status=a.status,
+            handledBy=getattr(a, "handled_by", "") or "",
+            handleNote=getattr(a, "handle_note", "") or "",
+            handledAt=getattr(a, "handled_at", "") or "",
         )
 
 

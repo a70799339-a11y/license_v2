@@ -30,6 +30,19 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   return res.json()
 }
 
+/** 下载 CSV 报表（带鉴权头，浏览器直接存文件） */
+export async function downloadCsv(path: string, filename: string) {
+  const token = getToken()
+  const res = await fetch(`/api${path}`, { headers: token ? { Authorization: `Bearer ${token}` } : {} })
+  if (!res.ok) throw new Error(`导出失败 ${res.status}`)
+  const blob = await res.blob()
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(blob)
+  a.download = filename
+  a.click()
+  URL.revokeObjectURL(a.href)
+}
+
 export interface Hotel {
   id: string
   name: string
@@ -198,7 +211,8 @@ export const api = {
 
   // alerts
   listAlerts: () => request<Alert[]>('/alerts'),
-  handleAlert: (id: string) => request<{ ok: boolean }>(`/alerts/${id}/handle`, { method: 'POST' }),
+  handleAlert: (id: string, note?: string) =>
+    request<{ ok: boolean }>(`/alerts/${id}/handle`, { method: 'POST', body: JSON.stringify({ note: note || '' }) }),
   alertGroups: () => request<AlertGroup[]>('/alerts/groups'),
 
   // users（admin）
@@ -258,14 +272,15 @@ export const api = {
     request<{
       active: string
       fallback: string
-      local: { provider: string; endpoint: string; model: string }
+      local: { provider: string; endpoint: string; model: string; fastModel?: string }
+      fastModel?: string
       cloud: { endpoint: string; model: string; apiKeySet: boolean }
       ping: { ok: boolean; detail: string; local?: { ok: boolean; detail: string }; cloud?: { ok: boolean; detail: string } }
     }>('/ai/llm-status'),
   llmConfigSave: (data: {
     active: string
     fallback: boolean
-    local: { provider: string; endpoint: string; model: string }
+    local: { provider: string; endpoint: string; model: string; fastModel?: string }
     cloud: { endpoint: string; model: string; apiKey?: string }
   }) => request<{ ok: boolean }>('/ai/config', { method: 'POST', body: JSON.stringify(data) }),
   aiExplainAlert: (data: { alertId?: string; rule?: string; hotelName?: string; detail?: string }) =>

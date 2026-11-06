@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api, type Alert, type AlertGroup } from '../api/client'
+import { downloadCsv } from '../api/client'
 import { useAuthStore } from '../stores/auth'
 import { fmtBJ } from '../utils/time'
 
@@ -44,12 +45,25 @@ function statusType(s: Alert['status']) {
   return s === '待处理' ? 'danger' : s === '处理中' ? 'warning' : 'success'
 }
 
-async function handle(a: Alert) {
+// 处置闭环：弹窗填备注 → 落库 + 推企微
+const handleDialog = ref(false)
+const handleAlert = ref<Alert | null>(null)
+const handleNote = ref('')
+
+function openHandle(a: Alert) {
+  handleAlert.value = a
+  handleNote.value = ''
+  handleDialog.value = true
+}
+
+async function confirmHandle() {
+  if (!handleAlert.value) return
   try {
-    await api.handleAlert(a.id)
+    await api.handleAlert(handleAlert.value.id, handleNote.value)
+    handleDialog.value = false
     all.value = await api.listAlerts()
     groups.value = await api.alertGroups()
-    ElMessage.success('已标记处置')
+    ElMessage.success('已处置，结果已推送企微')
   } catch (e) {
     ElMessage.error(e instanceof Error ? e.message : '操作失败')
   }
@@ -91,6 +105,7 @@ function groupLevel(l: string) {
         <h1 class="page-title">AI 智能风控</h1>
         <p class="page-sub">授权违规与使用行为双重检测，自动预警与处置</p>
       </div>
+      <el-button @click="downloadCsv('/reports/alerts.csv', '告警报表.csv')">导出报表</el-button>
       <el-button>风控规则配置</el-button>
     </div>
 
@@ -188,14 +203,29 @@ function groupLevel(l: string) {
             <el-button
               v-if="row.status !== '已处置' && auth.canWrite"
               link type="primary" size="small"
-              @click="handle(row)"
-            >标记处置</el-button>
+              @click="openHandle(row)"
+            >处置</el-button>
             <el-button v-else-if="row.status === '已处置'" link size="small" disabled>已处置</el-button>
             <el-button v-else link size="small" disabled>无权限</el-button>
           </template>
         </el-table-column>
       </el-table>
     </div>
+
+    <el-dialog v-model="handleDialog" title="处置告警" width="480px">
+      <template v-if="handleAlert">
+        <p style="margin: 0 0 12px">
+          <el-tag :type="levelType(handleAlert.level)" size="small">{{ handleAlert.level }}</el-tag>
+          {{ handleAlert.rule }} ｜ {{ handleAlert.hotelName }}
+        </p>
+        <p class="muted" style="font-size: 12px; margin: 0 0 12px">{{ handleAlert.detail }}</p>
+        <el-input v-model="handleNote" type="textarea" :rows="3" placeholder="处置备注（可空，将随结果推送企微）" />
+      </template>
+      <template #footer>
+        <el-button @click="handleDialog = false">取消</el-button>
+        <el-button type="primary" @click="confirmHandle">确认处置</el-button>
+      </template>
+    </el-dialog>
 
     <el-dialog v-model="aiDialog" title="告警 AI 解读（本地大模型）" width="620px">
       <template v-if="aiAlert">

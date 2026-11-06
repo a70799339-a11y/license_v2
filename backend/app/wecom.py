@@ -154,22 +154,99 @@ def hotel_id_by_name(db: Session, hotel_name: str) -> str:
 
 
 def notify_alert(db: Session, alert: Alert) -> None:
-    """紧急/高危告警即时推；中危进日报汇总（不单独推）。失败不影响告警落库。"""
+    """紧急/高危告警即时推；中危进日报汇总（不单独推）。失败不影响告警落库。
+    防刷屏（v1.1）：同规则 5 分钟窗口内首条即时推，其余进聚合缓冲，窗口结束合并补发。"""
     try:
         if alert.level not in ("紧急", "高"):
             return
         gid = hotel_group_id(db, alert.hotel_name)
         hid = hotel_id_by_name(db, alert.hotel_name)
+        item = {
+            "level": alert.level, "rule": alert.rule, "hotel": alert.hotel_name,
+            "detail": alert.detail, "time": alert.time, "gid": gid, "hid": hid,
+        }
+        agg = json.loads(get_setting(db, "alert_push_agg", "") or '{"start":"","items":[]}')
+        now = datetime.utcnow()
+        start = agg.get("start") or ""
+        # 窗口到期（>5 分钟）→ 先冲刷窗口内聚合项，再开新窗口
+        try:
+            window_age_ok = bool(start) and (now - datetime.strptime(start, "%Y-%m-%d %H:%M:%S")).total_seconds() > 300
+        except Exception:
+            window_age_ok = True
+        buffered = agg.get("items") or []
+        if window_age_ok and buffered:
+            _flush_alert_agg(db, buffered)
+            buffered = []
+        # 按规则聚合：同规则窗口内首条即时推，其余合并补发；不同规则各自首条都即时
+        first_of_rule = not any(i.get("rule") == alert.rule for i in buffered)
+        buffered.append(item)
+        set_setting(db, "alert_push_agg", json.dumps(
+            {"start": start or now.strftime("%Y-%m-%d %H:%M:%S"), "items": buffered}, ensure_ascii=False)[:4000])
+        db.commit()
+        if first_of_rule:
+            content = (
+                f"**🚨 风控告警（{alert.level}）**\n"
+                f"> 规则：{alert.rule}\n"
+                f"> 酒店：{alert.hotel_name}\n"
+                f"> 详情：{alert.detail}\n"
+                f"> 时间：{_fmt_bj(alert.time)}\n"
+                f"> 窗口内同类告警将合并推送"
+            )
+            push_message(db, content, group_id=gid, hotel_id=hid)
+    except Exception:
+        pass  # 推送失败不影响告警记账
+
+
+def _flush_alert_agg(db: Session, items: list) -> None:
+    """把聚合缓冲里的告警合并为一条推送（按规则分组，最多列 8 条）"""
+    if not items:
+        return
+    by_rule: dict = {}
+    for it in items:
+        by_rule.setdefault(it.get("rule", ""), []).append(it)
+    lines = [f"**📉 窗口内聚合告警 {len(items)} 条**"]
+    for rule, lst in list(by_rule.items())[:6]:
+        lines.append(f"> {rule}：{len(lst)} 条（{('、'.join(i.get('hotel', '') for i in lst[:3]))}{'…' if len(lst) > 3 else ''}）")
+    # 路由到运营群（聚合项跨多个实体，统一进 ops 通道）
+    push_message(db, "\n".join(lines))
+    set_setting(db, "alert_push_agg", json.dumps({"start": "", "items": []}, ensure_ascii=False))
+    db.commit()
+
+
+def flush_alert_agg_if_due(db: Session) -> None:
+    """窗口到期冲刷入口（日报/健康检查等调用；未到期静默）"""
+    try:
+        agg = json.loads(get_setting(db, "alert_push_agg", "") or "{}")
+        items = agg.get("items") or []
+        start = agg.get("start") or ""
+        if not items:
+            return
+        try:
+            due = (datetime.utcnow() - datetime.strptime(start, "%Y-%m-%d %H:%M:%S")).total_seconds() > 300
+        except Exception:
+            due = True
+        if due:
+            _flush_alert_agg(db, items)
+    except Exception:
+        pass
+
+
+def notify_alert_handled(db: Session, alert: Alert, handler: str, note: str) -> None:
+    """处置结果推企微（闭环）：路由到该店/集团通道。失败不影响处置记录。"""
+    try:
+        gid = hotel_group_id(db, alert.hotel_name)
+        hid = hotel_id_by_name(db, alert.hotel_name)
         content = (
-            f"**🚨 风控告警（{alert.level}）**\n"
+            f"**✅ 告警已处置（{alert.level}）**\n"
             f"> 规则：{alert.rule}\n"
             f"> 酒店：{alert.hotel_name}\n"
-            f"> 详情：{alert.detail}\n"
-            f"> 时间：{_fmt_bj(alert.time)}"
+            f"> 处置人：{handler or '—'}\n"
+            f"> 备注：{note or '（无）'}\n"
+            f"> 处置时间：{_fmt_bj(alert.handled_at)}"
         )
         push_message(db, content, group_id=gid, hotel_id=hid)
     except Exception:
-        pass  # 推送失败不影响告警记账
+        pass
 
 
 # ---------- 日报（惰性：当日首次读取告警/统计时生成） ----------
@@ -196,6 +273,18 @@ def build_ops_daily(db: Session) -> str:
     lines = [f"**📋 运营日报 {today}**"]
     lines.append(f"- 新增告警：{len(alerts)} 条（紧急 {sum(1 for a in alerts if a.level == '紧急')} / 高 {sum(1 for a in alerts if a.level == '高')}）")
     lines.append(f"- 7 天内到期提醒：{sum(1 for h in soon if h.status in ('即将到期', '已过期'))} 家")
+    # 超时未处置升级提醒：紧急/高危超过 24 小时仍未处理
+    cutoff = (datetime.utcnow() - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M")
+    overdue = [
+        a for a in db.query(Alert).filter(Alert.status != "已处置", Alert.level.in_(["紧急", "高"])).all()
+        if (a.time or "") < cutoff
+    ]
+    if overdue:
+        lines.append(f"- ⏰ **超时未处置（紧急/高 >24h）：{len(overdue)} 条**，请尽快处理：")
+        for a in overdue[:5]:
+            lines.append(f"  - [{a.level}] {a.rule} · {a.hotel_name} · {_fmt_bj(a.time, '%m-%d %H:%M')}")
+        if len(overdue) > 5:
+            lines.append(f"  - …等共 {len(overdue)} 条，完整清单到后台风险页查看")
     for a in sorted(alerts, key=lambda x: x.level)[:8]:
         lines.append(f"- [{a.level}] {a.rule} · {a.hotel_name}")
     return "\n".join(lines)
@@ -226,6 +315,7 @@ def build_group_daily(db: Session, group_id: str) -> str:
 
 def flush_daily(db: Session) -> dict:
     """生成并推送当日日报（幂等：当日已推则跳过）"""
+    flush_alert_agg_if_due(db)  # 窗口到期的聚合告警先冲刷
     today = _daily_key()
     if get_setting(db, "wecom_daily_last") == today:
         return {"skipped": True, "reason": "今日已推送"}
@@ -563,7 +653,7 @@ def _llm_answer(db: Session, text: str, sender: str, binding, on_slow=None) -> s
     prompt = (
         "你是酒店 AI 授权管理系统的企微助手。严格依据下面【实时数据】回答，"
         "禁止编造数据中不存在的酒店名、日期或数字；数据不足就如实说明。"
-        "若数据含清单请**完整列出全部条目**（每行一条、保留（编码），不要省略或概括掉条目）；"
+        "若数据含清单请**完整列出全部条目**（每行一条、保留（编码），不要省略或概括掉条目，编码必须逐字引用不得改动）；"
         "数据里的范围说明（如『共 N 条/涉及 N 家/前 N 家/完整清单到后台查看』）回答须原样保留，"
         "让用户分得清这是全量还是节选；"
         "分析/建议类问题请结合【统计基座】的精确数字回答（直接引用，不要自己重新统计）；"
@@ -572,9 +662,19 @@ def _llm_answer(db: Session, text: str, sender: str, binding, on_slow=None) -> s
         f"【实时数据】\n{data or '（本次提问未命中结构化明细，按统计基座回答）'}\n"
         f"用户问题：{text}"
     )
+    # 快通道（v1.1）：短咨询类问题（无数据意图且 ≤30 字）走本地小模型提速；数据类一律主力模型
+    fast_fn = None
+    if data is None and len(text) <= 30:
+        try:
+            from .llm_backend import get_fast_backend
+
+            fast_fn = get_fast_backend(db)
+        except Exception:
+            fast_fn = None
     r = llm_call(
         db, source_type=source_type, source_id=source_id, source_name=source_name,
         user_id=sender, scene="企微问答", user_input=text, prompt=prompt,
+        backend=fast_fn,
     )
     if r["status"] == "error":
         return direct() if data else (
@@ -582,14 +682,19 @@ def _llm_answer(db: Session, text: str, sender: str, binding, on_slow=None) -> s
         )
     out = (r["output"] or "").strip()[:2400]
 
-    # 完整性校验：清单类问法或单店告警全量（strict）时生效，对标主清单条目数
-    # （防小模型截断漏项；不误伤咨询类回答——咨询回答本就无需罗列全部编码）
+    # 完整性校验：清单类问法或单店告警全量（strict）时生效
+    # 双重判据（v1.1）：①编码出现次数 ②期望编码逐一精确命中（防模型抄错编码漏检）；
+    # 任一不满足即切数据直出。不误伤咨询类回答——咨询回答本就无需罗列全部编码
     if data and out and guard_n > 0 and (strict or _is_list_query(text)):
         import re as _re
-        exp = len(_re.findall(r"（[A-Z]{2}-[^）]+）", data))
-        act = len(_re.findall(r"（[A-Z]{2}-[^）]+）", out))
-        if exp > 0 and act < min(exp, guard_n):
-            return direct()  # AI 漏项 → 静默切换完整数据（兜底路径细节见审计日志）
+        pat = r"（([A-Z]{2}-[^）]+)）"
+        exp_occ = len(_re.findall(pat, data))
+        act_occ = len(_re.findall(pat, out))
+        exp_codes = set(_re.findall(pat, data))
+        act_codes = set(_re.findall(pat, out))
+        matched = len(exp_codes & act_codes)
+        if exp_occ > 0 and (act_occ < min(exp_occ, guard_n) or matched < min(len(exp_codes), guard_n)):
+            return direct()  # AI 漏项/抄错编码 → 静默切换完整数据（兜底路径细节见审计日志）
 
     return out or (direct() if data else "（模型无输出）")
 

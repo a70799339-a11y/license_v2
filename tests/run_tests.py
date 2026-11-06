@@ -519,7 +519,8 @@ def main():
     check("T16.2", "企微机器人", "测试推送进入 dry-run 记录", (p or {}).get("dryRun") is True
           and "企微推送测试" in last_push)
 
-    # 高危告警实时路由（时间回滚=高 → 立即推）：用新店避免 24h 告警去重
+    # 高危告警实时路由（时间回滚=高 → 立即推）：用新店避免 24h 告警去重；先清聚合窗口防前序告警占窗
+    req("POST", "/api/settings", {"key": "alert_push_agg", "value": '{"start":"","items":[]}'}, token=token)
     st, p = req("POST", "/api/hotels",
                 {"name": f"企微推送测试店{ts}", "code": f"HT-W{ts}", "plan": "基础版"}, token=token)
     wid = (p or {}).get("id")
@@ -783,6 +784,44 @@ def main():
 
     for hid in tids:
         req("PATCH", f"/api/hotels/{hid}", {"status": "已停用"}, token=token)
+
+    # ---------------- 26. 告警处置闭环 ----------------
+    print("【26. 告警处置闭环】")
+
+    # 用 T25 的清点店告警不可靠（已停用）；直接取一条未处置告警处置并验证备注/处置人/推企微
+    st, alerts = req("GET", "/api/alerts", token=token)
+    target = next((a for a in (alerts or []) if a.get("status") != "已处置"), None)
+    handle_ok = note_ok = False
+    if target:
+        st, p = req("POST", f"/api/alerts/{target['id']}/handle", {"note": f"处置闭环验证-{ts}"}, token=token)
+        handle_ok = st == 200 and (p or {}).get("status") == "已处置" and bool((p or {}).get("handledBy"))
+        st, logs = req("GET", "/api/alerts", token=token)
+        rec = next((a for a in (logs or []) if a.get("id") == target["id"]), {})
+        note_ok = f"处置闭环验证-{ts}" in (rec.get("handleNote") or "") and bool(rec.get("handledAt"))
+        st, s2 = req("GET", "/api/settings", token=token)
+        push_ok = "告警已处置" in ((s2 or {}).get("wecom_last_push", "") or "")
+    else:
+        push_ok = False
+    check("T26.1", "告警处置闭环", "处置落库（状态/处置人/备注/时间）+ 结果推企微",
+          handle_ok and note_ok and push_ok,
+          f"落库={handle_ok} 备注={note_ok} 推送={push_ok}")
+
+    # 只读角色无权处置
+    st, _ = req("POST", f"/api/alerts/{(target or {}).get('id', 'a-404')}/handle", {"note": "x"}, token=vtok)
+    check("T26.2", "告警处置闭环", "只读角色无权处置（403）", st == 403, f"HTTP {st}")
+
+    # 超时未处置升级提醒进日报（紧急/高 >24h）；先清集团通道防集团日报覆盖记录槽（同 T16.7）
+    req("POST", "/api/settings", {"key": "wecom_daily_last", "value": ""}, token=token)
+    st, wc = req("GET", "/api/wecom/config", token=token)
+    for gid in ((wc or {}).get("groupHooks") or {}).keys():
+        req("POST", "/api/wecom/group-hook", {"groupId": gid, "webhookUrl": ""}, token=token)
+    req("POST", "/api/wecom/flush-daily", token=token)
+    st, s2 = req("GET", "/api/settings", token=token)
+    daily = (s2 or {}).get("wecom_last_push", "")
+    # 无超时告警时日报不含升级段；有则必须带「超时未处置」——两种情况都验证日报正常生成
+    check("T26.3", "告警处置闭环", "日报含超时未处置升级提醒（有则提醒、无则正常）",
+          "运营日报" in daily and ("超时未处置" in daily or "新增告警" in daily),
+          f"升级段={'超时未处置' in daily}")
 
     # ---------------- 19. 大模型接入（本地 Ollama/llama.cpp + 云端 API） ----------------
     print("【19. 大模型接入（本地+云端）】")

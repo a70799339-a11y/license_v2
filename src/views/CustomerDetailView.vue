@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { api, type HotelDetail } from '../api/client'
+import { fmtBJ } from '../utils/time'
 
 const route = useRoute()
 const router = useRouter()
@@ -88,7 +89,7 @@ async function toggleAutoRenew(val: boolean) {
         </div>
         <div class="card kpi-card">
           <div class="kpi-label">最近活跃</div>
-          <div class="kpi-value mono" style="font-size: 15px">{{ hotel.lastActive || '—' }}</div>
+          <div class="kpi-value mono" style="font-size: 15px">{{ fmtBJ(hotel.lastActive) }}</div>
         </div>
       </div>
 
@@ -104,7 +105,7 @@ async function toggleAutoRenew(val: boolean) {
               <el-form-item label="联系人">{{ hotel.contact }}</el-form-item>
               <el-form-item label="联系电话"><span class="mono">{{ hotel.phone }}</span></el-form-item>
               <el-form-item label="套餐类型">{{ hotel.plan }}</el-form-item>
-              <el-form-item label="注册时间"><span class="mono">{{ hotel.createdAt }}</span></el-form-item>
+              <el-form-item label="注册时间"><span class="mono">{{ fmtBJ(hotel.createdAt) }}</span></el-form-item>
               <el-form-item label="到期时间"><span class="mono">{{ hotel.expireAt }}</span></el-form-item>
               <el-form-item label="自动续期">{{ hotel.autoRenew ? '已开启' : '已关闭' }}</el-form-item>
             </el-form>
@@ -121,7 +122,7 @@ async function toggleAutoRenew(val: boolean) {
                 <template #default="{ row }"><span class="mono text-3">{{ row.fingerprint }}</span></template>
               </el-table-column>
               <el-table-column prop="lastActive" label="最近活跃" width="150">
-                <template #default="{ row }"><span class="mono">{{ row.lastActive }}</span></template>
+                <template #default="{ row }"><span class="mono">{{ fmtBJ(row.lastActive) }}</span></template>
               </el-table-column>
               <el-table-column label="状态" width="90">
                 <template #default="{ row }">
@@ -178,7 +179,7 @@ async function toggleAutoRenew(val: boolean) {
               <el-table-column prop="rule" label="规则" width="160" />
               <el-table-column prop="detail" label="详情" min-width="220" show-overflow-tooltip />
               <el-table-column prop="time" label="时间" width="150">
-                <template #default="{ row }"><span class="mono">{{ row.time }}</span></template>
+                <template #default="{ row }"><span class="mono">{{ fmtBJ(row.time) }}</span></template>
               </el-table-column>
               <el-table-column label="状态" width="100">
                 <template #default="{ row }">

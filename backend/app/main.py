@@ -553,6 +553,21 @@ def wecom_test(db: Session = Depends(get_db), user: User = Depends(require_roles
     return {"ok": True, "sent": r.get("sent"), "dryRun": r.get("dry_run")}
 
 
+@app.get("/api/health")
+def health(db: Session = Depends(get_db)):
+    """健康探活（免认证，供自监控/负载均衡使用）：数据库连通 + 企微长连接状态"""
+    from .wecom_ws import ws_status
+
+    try:
+        db.execute(__import__("sqlalchemy").text("SELECT 1"))
+        db_ok = True
+    except Exception:
+        db_ok = False
+    ws = ws_status()
+    ok = db_ok and bool(ws.get("running"))
+    return {"status": "ok" if ok else "degraded", "db": db_ok, "wecom_ws": ws}
+
+
 @app.get("/api/wecom/ws-status")
 def wecom_ws_status(_: User = Depends(require_roles("admin", "operator"))):
     from .wecom_ws import ws_status

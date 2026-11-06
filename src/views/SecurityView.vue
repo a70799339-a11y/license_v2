@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api, type License, type LlmCallLog } from '../api/client'
+import { fmtBJ } from '../utils/time'
 
 const licenses = ref<License[]>([])
 const loading = ref(true)
@@ -323,7 +324,7 @@ async function revokeWithReason(row: License) {
       </div>
       <el-table :data="llmLogs" size="small" max-height="360">
         <el-table-column label="时间" width="140">
-          <template #default="{ row }"><span class="mono">{{ row.createdAt }}</span></template>
+          <template #default="{ row }"><span class="mono">{{ fmtBJ(row.createdAt) }}</span></template>
         </el-table-column>
         <el-table-column label="来源" width="110">
           <template #default="{ row }">

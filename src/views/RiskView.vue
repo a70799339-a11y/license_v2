@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api, type Alert, type AlertGroup } from '../api/client'
 import { useAuthStore } from '../stores/auth'
+import { fmtBJ } from '../utils/time'
 
 const auth = useAuthStore()
 const all = ref<Alert[]>([])
@@ -170,7 +171,7 @@ function groupLevel(l: string) {
         <el-table-column prop="hotelName" label="酒店" width="180" />
         <el-table-column prop="detail" label="告警详情" min-width="220" show-overflow-tooltip />
         <el-table-column prop="time" label="时间" width="150">
-          <template #default="{ row }"><span class="mono">{{ row.time }}</span></template>
+          <template #default="{ row }"><span class="mono">{{ fmtBJ(row.time) }}</span></template>
         </el-table-column>
         <el-table-column label="状态" width="100">
           <template #default="{ row }">

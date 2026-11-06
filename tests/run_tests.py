@@ -952,6 +952,16 @@ def main():
     # 还原模型配置（测试改动不污染环境；apiKey 空串=不修改已有 Key）
     req("POST", "/api/ai/config", llm_snapshot, token=token)
 
+    # 收尾清扫：停用本轮/历史遗留的测试店（按命名特征），防止污染后续数据查询
+    st, hs = req("GET", "/api/hotels", token=token)
+    swept = 0
+    for h in (hs or []):
+        name = h.get("name") or ""
+        if any(k in name for k in ("测试店", "复现", "核对", "清点", "防撞", "调试", "调一店", "调二店")) and h.get("status") != "已停用":
+            req("PATCH", f"/api/hotels/{h.get('id')}", {"status": "已停用"}, token=token)
+            swept += 1
+    print(f"[cleanup] 测试店清扫：停用 {swept} 家")
+
     # ---------------- 汇总 ----------------
     passed = sum(1 for r in results if r["pass"])
     total = len(results)

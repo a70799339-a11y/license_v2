@@ -2,7 +2,6 @@
 import os
 from datetime import datetime, timedelta
 from hashlib import pbkdf2_hmac
-from secrets import token_hex
 from typing import Optional
 
 import jwt
@@ -13,7 +12,13 @@ from sqlalchemy.orm import Session
 from .database import get_db
 from .models import User
 
-JWT_SECRET = os.environ.get("JWT_SECRET", "change-me-in-production-" + token_hex(8))
+# 生产必须显式注入强密钥：缺失或弱口令直接启动失败（禁止随机回落——重启后已签发令牌会全部失效）
+JWT_SECRET = os.environ.get("JWT_SECRET", "")
+if not JWT_SECRET or JWT_SECRET.startswith("change-me") or len(JWT_SECRET) < 32:
+    raise RuntimeError(
+        "JWT_SECRET 未配置或过于弱（要求 ≥32 字符随机值）。"
+        "请在部署环境变量（/opt/license/env.file）中设置后重启服务。"
+    )
 ALGORITHM = "HS256"
 EXPIRE_HOURS = 24
 

@@ -769,7 +769,7 @@ def main():
     reply = (p or {}).get("reply", "")
     check("T21.1", "企微数据接地", "到期查询返回真实酒店（非编造模板）",
           f"接地测试店{ts}" in reply and expire_20d in reply and "[酒店名称]" not in reply
-          and "直出" in reply,
+          and "📋" in reply,
           f"含真实店={f'接地测试店{ts}' in reply} 含日期={expire_20d in reply}")
 
     # 数据隔离：集团用户问到期 → 不得出现非本集团门店
@@ -778,7 +778,7 @@ def main():
                 {"text": "哪些酒店快到期？", "userid": f"ugx{ts}"}, token=token)
     reply = (p or {}).get("reply", "")
     check("T21.2", "企微数据接地", "集团问答只含本集团数据（隔离）",
-          f"接地测试店{ts}" not in reply and ("本集团" in reply or "直出" in reply),
+          f"接地测试店{ts}" not in reply and ("本集团" in reply or "📋" in reply),
           f"越界店出现={f'接地测试店{ts}' in reply}")
     # 清理测试酒店（停用，防残留污染数据查询）
     req("PATCH", f"/api/hotels/{gid}", {"status": "已停用"}, token=token)

@@ -343,7 +343,7 @@ def _llm_answer(db: Session, text: str, sender: str, binding, on_slow=None) -> s
     data, guard_n = _query_data(db, text, binding)
 
     def direct() -> str:
-        return f"📋 查询结果（系统数据直出）：\n{data}"
+        return f"📋 查询结果：\n{data}"
 
     has_model = get_backend(db) is not None
     if not has_model:
@@ -370,8 +370,8 @@ def _llm_answer(db: Session, text: str, sender: str, binding, on_slow=None) -> s
         user_id=sender, scene="企微问答", user_input=text, prompt=prompt,
     )
     if r["status"] == "error":
-        return (direct() + "\n（AI 摘要暂不可用，以上为系统数据直出）") if data else (
-            "AI 问答暂不可用（模型服务异常，已记录），请稍后再试或回复『帮助』看指令列表。"
+        return direct() if data else (
+            "AI 问答暂不可用，请稍后再试或回复『帮助』看指令列表。"
         )
     out = (r["output"] or "").strip()[:1600]
 
@@ -382,7 +382,7 @@ def _llm_answer(db: Session, text: str, sender: str, binding, on_slow=None) -> s
         exp = len(_re.findall(r"（[A-Z]{2}-[^）]+）", data))
         act = len(_re.findall(r"（[A-Z]{2}-[^）]+）", out))
         if exp > 0 and act < min(exp, guard_n):
-            return direct() + f"\n（模型输出不完整 {act}/{min(exp, guard_n)} 条，已切换为系统数据直出）"
+            return direct()  # AI 漏项 → 静默切换完整数据（兜底路径细节见审计日志）
 
     return out or (direct() if data else "（模型无输出）")
 

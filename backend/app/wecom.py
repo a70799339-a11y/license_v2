@@ -311,6 +311,23 @@ def _query_data(db: Session, text: str, binding) -> tuple:
         for h in sorted((x for x in hotels if x.status != "已停用"), key=lambda x: -(x.devices or 0))[:15]:
             lines.append(f"- {h.name}：{h.devices}/{h.max_devices}")
 
+    # 酒店总清单（兜底问法：仅当未命中更具体意图时生效，避免与到期/告警/设备叠加）
+    if not hit and any(k in text for k in ("酒店", "客户")) and any(
+        k in text for k in ("列出", "全部", "清单", "列表", "有哪些", "哪些", "所有")
+    ):
+        hit = True
+        active = sorted((x for x in hotels if x.status != "已停用"), key=lambda x: x.code or "")
+        guard_n = min(len(active), 30)  # 清单直出上限 30 条，基线对标实际给出的条目
+        head = f"【{scope}酒店清单】共 {len(active)} 家"
+        if len(active) > 30:
+            head += "（仅列前 30 家，完整清单请到后台查看）"
+        lines.append(head + "：")
+        if active:
+            for h in active[:30]:
+                lines.append(f"- {h.name}（{h.code}）到期 {h.expire_at} 套餐 {h.plan} 状态 {h.status}")
+        else:
+            lines.append("（暂无酒店）")
+
     return ("\n".join(lines), guard_n) if hit else (None, 0)
 
 

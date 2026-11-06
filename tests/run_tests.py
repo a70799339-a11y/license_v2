@@ -25,7 +25,7 @@ def req(method: str, path: str, body=None, token=None, headers=None):
     for k, v in (headers or {}).items():
         r.add_header(k, v)
     try:
-        with urllib.request.urlopen(r, timeout=30) as resp:
+        with urllib.request.urlopen(r, timeout=300) as resp:
             raw = resp.read().decode()
             return resp.status, (json.loads(raw) if raw else None)
     except urllib.error.HTTPError as e:

@@ -663,6 +663,15 @@ def main():
     # ---------------- 19. 大模型接入（本地 Ollama/llama.cpp + 云端 API） ----------------
     print("【19. 大模型接入（本地+云端）】")
 
+    # 快照当前模型配置（本段用例会改动配置，结束时还原，避免破坏环境）
+    st, llm_snapshot = req("GET", "/api/ai/llm-status", token=token)
+    llm_snapshot = {
+        "active": (llm_snapshot or {}).get("active", ""),
+        "fallback": (llm_snapshot or {}).get("fallback", "on") != "off",
+        "local": (llm_snapshot or {}).get("local", {}),
+        "cloud": {**(llm_snapshot or {}).get("cloud", {}), "apiKey": ""},
+    }
+
     st, p = req("POST", "/api/ai/config",
                 {"active": "local", "fallback": False,
                  "local": {"provider": "ollama", "endpoint": "http://localhost:11434", "model": "qwen2.5:7b"},
@@ -740,9 +749,9 @@ def main():
     after = len([l for l in (logs_b or []) if l.get("scene") == "企微问答"])
     check("T20.3", "企微 AI 问答", "确定性指令优先（状态不进大模型）",
           "授权状态" in reply and after == before, f"reply={reply[:24]} qa增量={after - before}")
-    req("POST", "/api/ai/config",
-        {"active": "", "fallback": False, "local": {"provider": "", "endpoint": "", "model": ""},
-         "cloud": {"endpoint": "", "model": ""}}, token=token)
+
+    # 还原模型配置（测试改动不污染环境；apiKey 空串=不修改已有 Key）
+    req("POST", "/api/ai/config", llm_snapshot, token=token)
 
     # ---------------- 汇总 ----------------
     passed = sum(1 for r in results if r["pass"])

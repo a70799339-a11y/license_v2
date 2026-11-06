@@ -227,6 +227,48 @@ def _audit(db: Session, operator: str, action: str, target: str, detail: str) ->
     )
 
 
+def _llm_answer(db: Session, text: str, sender: str, binding) -> str:
+    """企微自由问答：经审计网关调用大模型（本地/云端），按绑定角色附数据上下文"""
+    from .llm_audit import llm_call
+
+    role = binding.role if binding else "viewer"
+    if role == "group":
+        source_type, source_id = "group", (binding.group_id or "")
+        g = db.query(Group).filter(Group.id == source_id).first()
+        source_name = g.name if g else source_id
+        members = db.query(Hotel).filter(Hotel.group_id == source_id).all()
+        ctx = "旗下门店：" + "、".join(f"{h.name}({h.status},{h.expire_at}到期)" for h in members[:15])
+    elif role in ("admin", "operator"):
+        source_type, source_id, source_name = "admin", sender, "企微后台"
+        n = db.query(Hotel).count()
+        expiring = db.query(Hotel).filter(Hotel.status.in_(("即将到期", "已过期"))).count()
+        alerts = db.query(Alert).filter(Alert.status != "已处置").count()
+        ctx = f"全网酒店 {n} 家，其中到期/过期 {expiring} 家，未处置告警 {alerts} 条。"
+    else:
+        source_type, source_id, source_name = "hotel", (binding.group_id or ""), "企微用户"
+        ctx = "（用户为单店/运营角色）"
+
+    prompt = (
+        "你是酒店 AI 授权管理系统的企微助手，用中文简洁回答运营问题（不超过 200 字）。\n"
+        f"数据背景：{ctx}\n用户问题：{text}"
+    )
+    r = llm_call(
+        db,
+        source_type=source_type,
+        source_id=source_id,
+        source_name=source_name,
+        user_id=sender,
+        scene="企微问答",
+        user_input=text,
+        prompt=prompt,
+    )
+    if r["status"] == "error":
+        return "AI 问答暂不可用（模型服务异常，已记录），请稍后再试或回复『帮助』看指令列表。"
+    if r["model"] == "none":  # 未配置模型后端（占位调用）
+        return "AI 模型未接入。可回复『帮助』看指令列表；管理员在后台配置本地/云端模型后此处自动生效。"
+    return (r["output"] or "").strip()[:800]
+
+
 def process_command(db: Session, text: str, sender: str = "unknown") -> str:
     """解析并执行企微指令。权限：续期需 operator+/集团绑定；查询需绑定。"""
     text = (text or "").strip()
@@ -239,6 +281,7 @@ def process_command(db: Session, text: str, sender: str = "unknown") -> str:
             "· 状态 HT-0001 —— 查授权状态\n"
             "· 告警 HT-0001 —— 查最近告警\n"
             "· 续期 HT-0001 —— 续期一年（需回复『确认续期 HT-0001』）\n"
+            "· 其他问题直接发 —— AI 为你解答\n"
             "（使用前需管理员绑定你的企微账号）"
         )
 
@@ -294,4 +337,5 @@ def process_command(db: Session, text: str, sender: str = "unknown") -> str:
         db.commit()
         return f"✅ {hotel.name} 已续期至 2027-12-31"
 
-    return f"无法识别：{text}（回复『帮助』看指令列表）"
+    # 未命中指令 → 大模型问答（本地/云端均可，经审计网关全量留痕）
+    return _llm_answer(db, text, sender, binding)

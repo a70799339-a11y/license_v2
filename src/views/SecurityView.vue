@@ -111,23 +111,39 @@ function sourceTypeLabel(t: string) {
   return t === 'group' ? '集团总端' : t === 'hotel' ? '门店客户端' : '管理后台'
 }
 
-// ---------- 本地大模型接入（Ollama / llama.cpp） ----------
-const llmCfg = ref({ provider: '', endpoint: '', model: '' })
-const llmPing = ref<{ ok: boolean; detail: string; models?: string[] } | null>(null)
+// ---------- 大模型接入（云端 + 本地双配置） ----------
+const llmCfg = ref({
+  active: '',
+  fallback: true,
+  local: { provider: '', endpoint: '', model: '' },
+  cloud: { endpoint: '', model: '', apiKey: '' },
+})
+const llmPing = ref<{ ok: boolean; detail: string; local?: { ok: boolean; detail: string }; cloud?: { ok: boolean; detail: string } } | null>(null)
 
 async function loadLlmCfg() {
   try {
     const s = await api.llmStatus()
-    llmCfg.value = { provider: s.provider, endpoint: s.endpoint, model: s.model }
+    llmCfg.value = {
+      active: s.active,
+      fallback: s.fallback !== 'off',
+      local: { ...s.local },
+      cloud: { endpoint: s.cloud.endpoint, model: s.cloud.model, apiKey: '' },
+    }
     llmPing.value = s.ping
   } catch { /* 无权限忽略 */ }
 }
 
 async function saveLlmCfg() {
   try {
-    await api.llmConfigSave(llmCfg.value)
+    await api.llmConfigSave({
+      active: llmCfg.value.active,
+      fallback: llmCfg.value.fallback,
+      local: llmCfg.value.local,
+      cloud: { ...llmCfg.value.cloud },
+    })
+    llmCfg.value.cloud.apiKey = ''
     await loadLlmCfg()
-    ElMessage.success('本地大模型配置已保存（调用统一经审计网关留痕）')
+    ElMessage.success('模型配置已保存（云端与本地并存，调用统一经审计网关留痕）')
   } catch (e) {
     ElMessage.error(e instanceof Error ? e.message : '保存失败')
   }
@@ -247,20 +263,40 @@ async function revokeWithReason(row: License) {
         所有大模型调用统一经服务端网关（客户端不直连 LLM），每次调用记录：调用来源、发起人、用户输入、模型输入/输出、token 用量、耗时——文本统一脱敏后落库。
       </p>
       <div class="llm-cfg-row">
-        <span class="muted small">本地模型（Ollama / llama.cpp）</span>
-        <el-select v-model="llmCfg.provider" placeholder="未接入" style="width: 130px" clearable>
-          <el-option label="Ollama" value="ollama" />
-          <el-option label="llama.cpp" value="llama.cpp" />
+        <span class="muted small">模型接入</span>
+        <el-select v-model="llmCfg.active" placeholder="未接入" style="width: 120px" clearable>
+          <el-option label="本地优先" value="local" />
+          <el-option label="云端优先" value="cloud" />
         </el-select>
-        <el-input v-model="llmCfg.endpoint" placeholder="http://localhost:11434" style="width: 230px" />
-        <el-input v-model="llmCfg.model" placeholder="模型名，如 qwen2.5:7b" style="width: 190px" />
+        <el-switch v-model="llmCfg.fallback" active-text="失败自动切另一套" />
         <el-button type="primary" @click="saveLlmCfg">保存</el-button>
         <el-button @click="testLlm">测试连通</el-button>
         <el-tag v-if="llmPing" size="small" :type="llmPing.ok ? 'success' : 'danger'">
           {{ llmPing.ok ? '正常' : '异常' }}
         </el-tag>
-        <span v-if="llmPing" class="muted small">{{ llmPing.detail }}</span>
       </div>
+      <div class="llm-cfg-row">
+        <span class="muted small">本地（Ollama / llama.cpp）</span>
+        <el-select v-model="llmCfg.local.provider" placeholder="未配置" style="width: 120px" clearable>
+          <el-option label="Ollama" value="ollama" />
+          <el-option label="llama.cpp" value="llama.cpp" />
+        </el-select>
+        <el-input v-model="llmCfg.local.endpoint" placeholder="http://localhost:11434" style="width: 210px" />
+        <el-input v-model="llmCfg.local.model" placeholder="如 qwen2.5:7b" style="width: 160px" />
+        <el-tag v-if="llmPing?.local" size="small" :type="llmPing.local.ok ? 'success' : 'info'">
+          {{ llmPing.local.ok ? '本地正常' : '本地未就绪' }}
+        </el-tag>
+      </div>
+      <div class="llm-cfg-row">
+        <span class="muted small">云端（OpenAI 兼容：DeepSeek / 腾讯混元等）</span>
+        <el-input v-model="llmCfg.cloud.endpoint" placeholder="https://api.deepseek.com/v1" style="width: 230px" />
+        <el-input v-model="llmCfg.cloud.model" placeholder="如 deepseek-chat" style="width: 150px" />
+        <el-input v-model="llmCfg.cloud.apiKey" type="password" show-password placeholder="API Key（留空不修改）" style="width: 190px" />
+        <el-tag v-if="llmPing?.cloud" size="small" :type="llmPing.cloud.ok ? 'success' : 'info'">
+          {{ llmPing.cloud.ok ? '云端正常' : '云端未就绪' }}
+        </el-tag>
+      </div>
+      <p v-if="llmPing" class="muted" style="font-size: 12px; margin: 4px 0 12px">{{ llmPing.detail }}</p>
       <div style="display: flex; gap: 12px; align-items: center; margin: 12px 0">
         <el-select v-model="llmFilter" placeholder="全部来源" style="width: 140px" clearable @change="loadLlmLogs">
           <el-option label="集团总端" value="group" />

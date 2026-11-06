@@ -660,43 +660,89 @@ def main():
     st, p = req("POST", "/api/llm-logs/simulate", {"sourceType": "admin", "userInput": "x"}, token=vtok)
     check("T18.4", "大模型审计", "只读角色无权触发调用（403）", st == 403, f"HTTP {st}")
 
-    # ---------------- 19. 本地大模型接入（Ollama / llama.cpp） ----------------
-    print("【19. 本地大模型接入】")
+    # ---------------- 19. 大模型接入（本地 Ollama/llama.cpp + 云端 API） ----------------
+    print("【19. 大模型接入（本地+云端）】")
 
     st, p = req("POST", "/api/ai/config",
-                {"provider": "ollama", "endpoint": "http://localhost:11434", "model": "qwen2.5:7b"},
+                {"active": "local", "fallback": False,
+                 "local": {"provider": "ollama", "endpoint": "http://localhost:11434", "model": "qwen2.5:7b"},
+                 "cloud": {"endpoint": "https://api.deepseek.com/v1", "model": "deepseek-chat", "apiKey": "sk-test-123456"}},
                 token=token)
     st2, s = req("GET", "/api/ai/llm-status", token=token)
-    check("T19.1", "本地大模型", "模型后端配置保存并回显（provider/endpoint/model）",
-          st == 200 and (s or {}).get("provider") == "ollama"
-          and "11434" in (s or {}).get("endpoint", ""),
-          f"provider={(s or {}).get('provider')}")
+    cloud = (s or {}).get("cloud", {})
+    check("T19.1", "大模型接入", "云端+本地双配置保存回显（Key 只回是否已配）",
+          st == 200 and (s or {}).get("active") == "local"
+          and (s or {}).get("local", {}).get("provider") == "ollama"
+          and "11434" in (s or {}).get("local", {}).get("endpoint", "")
+          and cloud.get("apiKeySet") is True and "sk-test-123456" not in json.dumps(s),
+          f"active={(s or {}).get('active')} keySet={cloud.get('apiKeySet')}")
 
-    st, p = req("POST", "/api/ai/config", {"provider": "llama.cpp"}, token=vtok)
-    check("T19.2", "本地大模型", "只读角色无权改模型配置（403）", st == 403, f"HTTP {st}")
+    st, p = req("POST", "/api/ai/config",
+                {"active": "cloud", "local": {"provider": "llama.cpp"}}, token=vtok)
+    check("T19.2", "大模型接入", "只读角色无权改模型配置（403）", st == 403, f"HTTP {st}")
 
-    # 未接入/占位路径：清空 provider 后解读 → 网关照常留痕
-    req("POST", "/api/ai/config", {"provider": "", "endpoint": "", "model": ""}, token=token)
+    # 未接入/占位路径：清空双槽位后解读 → 网关照常留痕
+    req("POST", "/api/ai/config",
+        {"active": "", "fallback": False, "local": {"provider": "", "endpoint": "", "model": ""},
+         "cloud": {"endpoint": "", "model": ""}}, token=token)
     st, p = req("POST", "/api/ai/alert-explain",
                 {"rule": "时间回滚", "hotelName": "接入测试店", "detail": "客户端时钟回滚 48 小时"},
                 token=token)
     st2, logs = req("GET", "/api/llm-logs?limit=10", token=token)
     rec = next((l for l in (logs or []) if l.get("scene") == "告警解读"), {})
-    check("T19.3", "本地大模型", "告警 AI 解读经审计网关（调用即留痕）",
+    check("T19.3", "大模型接入", "告警 AI 解读经审计网关（调用即留痕）",
           st == 200 and (p or {}).get("audit", {}).get("status") == "success" and bool(rec),
           f"model={(p or {}).get('audit', {}).get('model')} rec={'有' if rec else '无'}")
 
-    # 失败也留痕：指向不可达端点 → error 记录入审计
+    # 失败也留痕：本地指向不可达端点（关兜底）→ error 记录入审计
     req("POST", "/api/ai/config",
-        {"provider": "ollama", "endpoint": "http://127.0.0.1:59999", "model": "x"}, token=token)
+        {"active": "local", "fallback": False,
+         "local": {"provider": "ollama", "endpoint": "http://127.0.0.1:59999", "model": "x"}}, token=token)
     st, p = req("POST", "/api/ai/alert-explain",
                 {"rule": "设备指纹变更", "hotelName": "接入测试店", "detail": "指纹不一致"},
                 token=token)
     st2, logs = req("GET", "/api/llm-logs?limit=5", token=token)
     err_rec = next((l for l in (logs or []) if l.get("status") == "error"), {})
-    check("T19.4", "本地大模型", "模型调用失败同样留痕（error 记录）", bool(err_rec),
+    check("T19.4", "大模型接入", "模型调用失败同样留痕（error 记录）", bool(err_rec),
           f"error rec={'有' if err_rec else '无'}")
-    req("POST", "/api/ai/config", {"provider": "", "endpoint": "", "model": ""}, token=token)
+    req("POST", "/api/ai/config",
+        {"active": "", "fallback": False, "local": {"provider": "", "endpoint": "", "model": ""},
+         "cloud": {"endpoint": "", "model": ""}}, token=token)
+
+    # ---------------- 20. 企微机器人 AI 问答（大模型处理自由文本） ----------------
+    print("【20. 企微 AI 问答】")
+
+    # 未配置模型：占位调用留痕 + 提示接入
+    st, p = req("POST", "/api/wecom/simulate", {"text": "最近到期的酒店多吗？", "userid": f"u{ts}"}, token=token)
+    reply = (p or {}).get("reply", "")
+    st2, logs = req("GET", "/api/llm-logs?limit=10", token=token)
+    qa_rec = next((l for l in (logs or []) if l.get("scene") == "企微问答"), {})
+    check("T20.1", "企微 AI 问答", "自由文本走大模型管道（占位提示 + 留痕）",
+          "AI" in reply and bool(qa_rec), f"reply={reply[:24]} rec={'有' if qa_rec else '无'}")
+
+    # 配置云端不可达 → AI 问答失败提示 + error 留痕（兜底关闭）
+    req("POST", "/api/ai/config",
+        {"active": "cloud", "fallback": False,
+         "cloud": {"endpoint": "https://127.0.0.1:59999/v1", "model": "m", "apiKey": "sk-x"}}, token=token)
+    st, p = req("POST", "/api/wecom/simulate", {"text": "帮我看看风险", "userid": f"u{ts}"}, token=token)
+    reply = (p or {}).get("reply", "")
+    st2, logs = req("GET", "/api/llm-logs?limit=5", token=token)
+    err_qa = next((l for l in (logs or []) if l.get("scene") == "企微问答" and l.get("status") == "error"), {})
+    check("T20.2", "企微 AI 问答", "模型异常时优雅降级（提示+error 留痕）",
+          "暂不可用" in reply and bool(err_qa), f"reply={reply[:24]}")
+
+    # 指令仍优先于 AI（状态指令不进大模型）
+    st, logs_a = req("GET", "/api/llm-logs?limit=100", token=token)
+    before = len([l for l in (logs_a or []) if l.get("scene") == "企微问答"])
+    st, p = req("POST", "/api/wecom/simulate", {"text": "状态 HT-0001", "userid": f"u{ts}"}, token=token)
+    reply = (p or {}).get("reply", "")
+    st2, logs_b = req("GET", "/api/llm-logs?limit=100", token=token)
+    after = len([l for l in (logs_b or []) if l.get("scene") == "企微问答"])
+    check("T20.3", "企微 AI 问答", "确定性指令优先（状态不进大模型）",
+          "授权状态" in reply and after == before, f"reply={reply[:24]} qa增量={after - before}")
+    req("POST", "/api/ai/config",
+        {"active": "", "fallback": False, "local": {"provider": "", "endpoint": "", "model": ""},
+         "cloud": {"endpoint": "", "model": ""}}, token=token)
 
     # ---------------- 汇总 ----------------
     passed = sum(1 for r in results if r["pass"])

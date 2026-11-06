@@ -699,9 +699,26 @@ def simulate_llm_call(
     return {"ok": True, "result": r}
 
 
-# ---------- 本地大模型接入（Ollama / llama.cpp，经审计网关调用） ----------
+# ---------- 大模型接入（云端 API + 本地 Ollama / llama.cpp，经审计网关调用） ----------
+class LLMSlotLocal(BaseModel):
+    provider: str = ""          # ollama / llama.cpp / 空
+    endpoint: str = ""
+    model: str = ""
+
+
+class LLMSlotCloud(BaseModel):
+    endpoint: str = ""          # OpenAI 兼容基址（含 /v1），如 DeepSeek / 腾讯混元
+    model: str = ""
+    apiKey: str = ""            # 空 = 不修改既有 Key
+
+
 class LLMConfigUpdate(BaseModel):
-    provider: str = ""          # ollama / llama.cpp / 空=未接入
+    active: str = ""            # local / cloud / 空=未接入
+    fallback: bool = True       # 激活槽位失败自动切另一套
+    local: LLMSlotLocal = LLMSlotLocal()
+    cloud: LLMSlotCloud = LLMSlotCloud()
+    # 兼容旧版单槽位参数（映射到本地槽位）
+    provider: str = ""
     endpoint: str = ""
     model: str = ""
 
@@ -719,14 +736,26 @@ def llm_config_update(
     db: Session = Depends(get_db),
     user: User = Depends(require_roles("admin")),
 ):
-    from .wecom import set_setting
+    from .llm_backend import save_config
 
-    if req.provider not in ("", "ollama", "llama.cpp"):
-        raise HTTPException(status_code=400, detail="provider 须为 ollama / llama.cpp / 空")
-    set_setting(db, "llm_provider", req.provider)
-    set_setting(db, "llm_endpoint", (req.endpoint or "").strip())
-    set_setting(db, "llm_model", (req.model or "").strip())
-    write_log(db, user, "配置本地大模型", req.provider or "未接入", f"endpoint={req.endpoint} model={req.model}")
+    # 旧版参数兼容：provider/endpoint/model → 本地槽位
+    local = req.local
+    if req.provider or req.endpoint or req.model:
+        local = LLMSlotLocal(provider=req.provider, endpoint=req.endpoint or req.local.endpoint, model=req.model or req.local.model)
+    try:
+        save_config(
+            db,
+            active=req.active or (local.provider and "local") or "",
+            fallback=req.fallback,
+            local={"provider": local.provider, "endpoint": local.endpoint, "model": local.model},
+            cloud={"endpoint": req.cloud.endpoint, "model": req.cloud.model, "apiKey": req.cloud.apiKey},
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    write_log(
+        db, user, "配置大模型", req.active or (local.provider and "local") or "未接入",
+        f"本地={local.provider or '-'} 云端={'已配Key' if req.cloud.apiKey else ('已配' if req.cloud.endpoint else '-')} fallback={'开' if req.fallback else '关'}",
+    )
     db.commit()
     return {"ok": True}
 

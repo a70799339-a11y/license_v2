@@ -1,14 +1,12 @@
 """
-本地大模型后端适配（Ollama / llama.cpp）—— 供 llm_audit.llm_call() 网关调用
+大模型后端适配 —— 云端 API + 本地（Ollama / llama.cpp）双配置，供 llm_audit.llm_call() 网关调用
 
-部署形态（内网自持，无外网依赖、无 API Key 外泄）：
-- Ollama：   POST {endpoint}/api/chat        （默认 http://localhost:11434）
-- llama.cpp：POST {endpoint}/v1/chat/completions（默认 http://localhost:8080，OpenAI 兼容）
-
-配置（settings 表，后台「安全设计」可改）：
-- llm_provider：ollama / llama.cpp / 空（未接入）
-- llm_endpoint：服务地址
-- llm_model：    模型名（如 qwen2.5:7b / qwen2.5-7b-instruct）
+配置（settings 表，后台「安全设计」可改；两套并存互不覆盖）：
+- 激活槽位 llm_active：local（本地） / cloud（云端） / 空（未接入）
+- 兜底 llm_fallback：on 时激活槽位失败自动切另一套
+- 本地槽位：llm_local_provider（ollama / llama.cpp）、llm_local_endpoint、llm_local_model
+- 云端槽位（OpenAI 兼容，DeepSeek/腾讯混元/Kimi 等通用）：
+  llm_cloud_endpoint（含 /v1）、llm_cloud_model、llm_cloud_api_key（接口只回显是否已配，不回明文）
 
 统一出口：get_backend(db) -> fn(prompt) -> (output, model_name, tokens_in, tokens_out)
 任何大模型调用必须经 llm_audit.llm_call() 过账（自动审计+脱敏）。
@@ -26,96 +24,194 @@ def _setting(db: Session, key: str, default: str = "") -> str:
     return (row.value.strip() if row and row.value else default) or default
 
 
-def llm_config(db: Session) -> dict:
-    provider = _setting(db, "llm_provider", "")
-    if provider == "ollama":
-        endpoint = _setting(db, "llm_endpoint", "http://localhost:11434")
-    elif provider == "llama.cpp":
-        endpoint = _setting(db, "llm_endpoint", "http://localhost:8080")
+def _set(db: Session, key: str, value: str) -> None:
+    row = db.query(Setting).filter(Setting.key == key).first()
+    if row:
+        row.value = value
     else:
-        endpoint = _setting(db, "llm_endpoint", "")
+        db.add(Setting(key=key, value=value))
+
+
+def llm_config(db: Session) -> dict:
+    """完整配置（api key 只回是否已配，绝不回明文）"""
+
+    def get(key: str, legacy: str = "") -> str:
+        """新键存在则用新键（显式清空生效）；新键从未写过才回落旧键（v1 兼容）"""
+        row = db.query(Setting).filter(Setting.key == key).first()
+        if row is not None:
+            return (row.value or "").strip()
+        return _setting(db, legacy, "")
+
+    local_provider = get("llm_local_provider", "llm_provider")
+    if local_provider not in ("ollama", "llama.cpp"):
+        local_provider = ""
+    local_endpoint = get("llm_local_endpoint", "llm_endpoint")
+    local_model = get("llm_local_model", "llm_model")
+    cloud_key = _setting(db, "llm_cloud_api_key", "")
+    active = get("llm_active") or (local_provider and "local") or ""
     return {
-        "provider": provider,
-        "endpoint": endpoint.rstrip("/"),
-        "model": _setting(db, "llm_model", ""),
+        "active": active,
+        "fallback": _setting(db, "llm_fallback", "on"),
+        "local": {
+            "provider": local_provider,
+            "endpoint": local_endpoint,
+            "model": local_model,
+        },
+        "cloud": {
+            "endpoint": _setting(db, "llm_cloud_endpoint", ""),
+            "model": _setting(db, "llm_cloud_model", ""),
+            "apiKeySet": bool(cloud_key),
+        },
     }
 
 
-def _http_json(url: str, payload: dict, timeout: int = 120) -> dict:
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+def save_config(db: Session, *, active: str, fallback: bool, local: dict, cloud: dict) -> None:
+    if active not in ("", "local", "cloud"):
+        raise ValueError("active 须为 local / cloud / 空")
+    lp = (local.get("provider") or "").strip()
+    if lp not in ("", "ollama", "llama.cpp"):
+        raise ValueError("本地后端须为 ollama / llama.cpp / 空")
+    _set(db, "llm_active", active)
+    _set(db, "llm_fallback", "on" if fallback else "off")
+    _set(db, "llm_local_provider", lp)
+    _set(db, "llm_local_endpoint", (local.get("endpoint") or "").strip())
+    _set(db, "llm_local_model", (local.get("model") or "").strip())
+    _set(db, "llm_cloud_endpoint", (cloud.get("endpoint") or "").strip())
+    _set(db, "llm_cloud_model", (cloud.get("model") or "").strip())
+    key = (cloud.get("apiKey") or "").strip()
+    if key:  # 空值 = 不修改既有 Key
+        _set(db, "llm_cloud_api_key", key)
+
+
+def _http_json(url: str, payload: dict, headers: dict | None = None, timeout: int = 180) -> dict:
+    h = {"Content-Type": "application/json"}
+    h.update(headers or {})
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=h, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
 def _chat_ollama(endpoint: str, model: str, prompt: str) -> tuple:
     r = _http_json(
-        f"{endpoint}/api/chat",
-        {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": False,
-        },
-        timeout=180,
+        f"{endpoint.rstrip('/')}/api/chat",
+        {"model": model, "messages": [{"role": "user", "content": prompt}], "stream": False},
     )
     output = ((r.get("message") or {}).get("content")) or ""
-    tin = int(r.get("prompt_eval_count") or 0)
-    tout = int(r.get("eval_count") or 0)
-    return output, model, tin, tout
+    return output, model, int(r.get("prompt_eval_count") or 0), int(r.get("eval_count") or 0)
 
 
 def _chat_llamacpp(endpoint: str, model: str, prompt: str) -> tuple:
     r = _http_json(
-        f"{endpoint}/v1/chat/completions",
-        {
-            "model": model or "local",
-            "messages": [{"role": "user", "content": prompt}],
-        },
-        timeout=180,
+        f"{endpoint.rstrip('/')}/v1/chat/completions",
+        {"model": model or "local", "messages": [{"role": "user", "content": prompt}]},
     )
     choices = r.get("choices") or []
     output = ((choices[0].get("message") or {}).get("content")) if choices else ""
     usage = r.get("usage") or {}
-    tin = int(usage.get("prompt_tokens") or 0)
-    tout = int(usage.get("completion_tokens") or 0)
-    return output or "", model or "llama.cpp", tin, tout
+    return output or "", model or "llama.cpp", int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0)
+
+
+def _chat_openai_compatible(endpoint: str, api_key: str, model: str, prompt: str) -> tuple:
+    """云端 OpenAI 兼容接口（DeepSeek / 腾讯混元 / Kimi 等）"""
+    base = endpoint.rstrip("/")
+    url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
+    r = _http_json(
+        url,
+        {"model": model, "messages": [{"role": "user", "content": prompt}]},
+        headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
+        timeout=120,
+    )
+    choices = r.get("choices") or []
+    output = ((choices[0].get("message") or {}).get("content")) if choices else ""
+    usage = r.get("usage") or {}
+    return output or "", model, int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0)
+
+
+def _slot_backend(db: Session, slot: str):
+    """单槽位可调用后端；不可用返回 None"""
+    cfg = llm_config(db)
+    if slot == "local":
+        lp = cfg["local"]["provider"]
+        ep, mo = cfg["local"]["endpoint"], cfg["local"]["model"]
+        if not lp or not ep:
+            return None
+        if lp == "ollama":
+            return lambda p: _chat_ollama(ep, mo, p)
+        return lambda p: _chat_llamacpp(ep, mo, p)
+    if slot == "cloud":
+        ep = cfg["cloud"]["endpoint"]
+        key = _setting(db, "llm_cloud_api_key", "")
+        mo = cfg["cloud"]["model"]
+        if not ep:
+            return None
+        return lambda p: _chat_openai_compatible(ep, key, mo, p)
+    return None
 
 
 def get_backend(db: Session):
-    """返回 fn(prompt)->(output, model_name, tokens_in, tokens_out)；未配置返回 None"""
+    """激活槽位优先、可选另一槽位兜底；全不可用返回 None"""
     cfg = llm_config(db)
-    provider, endpoint, model = cfg["provider"], cfg["endpoint"], cfg["model"]
-    if not provider or not endpoint:
+    order = [cfg["active"]] if cfg["active"] in ("local", "cloud") else []
+    if cfg["fallback"] == "on":
+        for s in ("local", "cloud"):
+            if s not in order:
+                order.append(s)
+    slots = [(s, _slot_backend(db, s)) for s in order]
+    slots = [(s, fn) for s, fn in slots if fn is not None]
+    if not slots:
         return None
 
     def backend(prompt: str) -> tuple:
-        if provider == "ollama":
-            return _chat_ollama(endpoint, model, prompt)
-        if provider == "llama.cpp":
-            return _chat_llamacpp(endpoint, model, prompt)
-        raise ValueError(f"不支持的模型后端：{provider}")
+        errs = []
+        for s, fn in slots:
+            try:
+                return fn(prompt)
+            except Exception as e:
+                errs.append(f"{s}: {str(e)[:80]}")
+        raise RuntimeError("模型后端全部失败（" + "；".join(errs) + "）")
 
     return backend
 
 
 def ping(db: Session) -> dict:
-    """连通性检查（列出可用模型/版本）"""
+    """连通性检查（本地 + 云端分别报告）"""
+    out = {}
     cfg = llm_config(db)
-    if not cfg["provider"]:
-        return {"ok": False, "detail": "未接入（llm_provider 为空）"}
-    try:
-        if cfg["provider"] == "ollama":
-            with urllib.request.urlopen(f"{cfg['endpoint']}/api/tags", timeout=6) as r:
-                data = json.loads(r.read().decode("utf-8"))
-            names = [m.get("name") for m in (data.get("models") or [])]
-            return {"ok": True, "detail": f"Ollama 可用，已装模型 {len(names)} 个", "models": names[:10]}
-        if cfg["provider"] == "llama.cpp":
-            with urllib.request.urlopen(f"{cfg['endpoint']}/health", timeout=6) as r:
-                return {"ok": r.status == 200, "detail": f"llama.cpp 健康检查 HTTP {r.status}"}
-        return {"ok": False, "detail": f"未知后端 {cfg['provider']}"}
-    except Exception as e:
-        return {"ok": False, "detail": f"连不上：{str(e)[:120]}"}
+    # 本地
+    lp = cfg["local"]["provider"]
+    ep = cfg["local"]["endpoint"]
+    if lp and ep:
+        try:
+            if lp == "ollama":
+                with urllib.request.urlopen(f"{ep.rstrip('/')}/api/tags", timeout=6) as r:
+                    data = json.loads(r.read().decode("utf-8"))
+                n = len(data.get("models") or [])
+                out["local"] = {"ok": True, "detail": f"Ollama 可用，已装模型 {n} 个"}
+            else:
+                with urllib.request.urlopen(f"{ep.rstrip('/')}/health", timeout=6) as r:
+                    out["local"] = {"ok": r.status == 200, "detail": f"llama.cpp 健康检查 HTTP {r.status}"}
+        except Exception as e:
+            out["local"] = {"ok": False, "detail": f"连不上：{str(e)[:100]}"}
+    else:
+        out["local"] = {"ok": False, "detail": "未配置"}
+    # 云端（只验连通与鉴权，不发完整生成）
+    ep = cfg["cloud"]["endpoint"]
+    if ep:
+        key = _setting(db, "llm_cloud_api_key", "")
+        try:
+            base = ep.rstrip("/")
+            url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
+            _http_json(url, {"model": cfg["cloud"]["model"] or "unknown",
+                             "messages": [{"role": "user", "content": "ping"}],
+                             "max_tokens": 1},
+                       headers={"Authorization": f"Bearer {key}"} if key else {}, timeout=20)
+            out["cloud"] = {"ok": True, "detail": "云端 API 可用"}
+        except Exception as e:
+            out["cloud"] = {"ok": False, "detail": f"云端不可用：{str(e)[:100]}"}
+    else:
+        out["cloud"] = {"ok": False, "detail": "未配置"}
+    out["ok"] = (cfg["active"] in ("local", "cloud") and out.get(cfg["active"], {}).get("ok", False)) or (
+        cfg["fallback"] == "on" and any(out[s]["ok"] for s in ("local", "cloud"))
+    )
+    out["detail"] = f"本地：{out['local']['detail']}｜云端：{out['cloud']['detail']}"
+    return out

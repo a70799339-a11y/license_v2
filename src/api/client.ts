@@ -253,11 +253,21 @@ export const api = {
       body: JSON.stringify(data),
     }),
 
-  // 本地大模型（Ollama / llama.cpp）接入
+  // 云端 + 本地大模型接入（Ollama / llama.cpp / OpenAI 兼容云端 API）
   llmStatus: () =>
-    request<{ provider: string; endpoint: string; model: string; ping: { ok: boolean; detail: string; models?: string[] } }>('/ai/llm-status'),
-  llmConfigSave: (data: { provider: string; endpoint: string; model: string }) =>
-    request<{ ok: boolean }>('/ai/config', { method: 'POST', body: JSON.stringify(data) }),
+    request<{
+      active: string
+      fallback: string
+      local: { provider: string; endpoint: string; model: string }
+      cloud: { endpoint: string; model: string; apiKeySet: boolean }
+      ping: { ok: boolean; detail: string; local?: { ok: boolean; detail: string }; cloud?: { ok: boolean; detail: string } }
+    }>('/ai/llm-status'),
+  llmConfigSave: (data: {
+    active: string
+    fallback: boolean
+    local: { provider: string; endpoint: string; model: string }
+    cloud: { endpoint: string; model: string; apiKey?: string }
+  }) => request<{ ok: boolean }>('/ai/config', { method: 'POST', body: JSON.stringify(data) }),
   aiExplainAlert: (data: { alertId?: string; rule?: string; hotelName?: string; detail?: string }) =>
     request<{ ok: boolean; explain: string; audit: { status: string; model: string } }>('/ai/alert-explain', {
       method: 'POST',

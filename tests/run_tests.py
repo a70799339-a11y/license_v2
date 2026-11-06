@@ -740,8 +740,8 @@ def main():
     reply = (p or {}).get("reply", "")
     st2, logs = req("GET", "/api/llm-logs?limit=5", token=token)
     err_qa = next((l for l in (logs or []) if l.get("scene") == "企微问答" and l.get("status") == "error"), {})
-    check("T20.2", "企微 AI 问答", "模型异常时优雅降级（提示+error 留痕）",
-          "暂不可用" in reply and bool(err_qa), f"reply={reply[:24]}")
+    check("T20.2", "企微 AI 问答", "模型异常时优雅降级（数据兜底 + error 留痕）",
+          ("📋" in reply or "暂不可用" in reply) and bool(err_qa), f"reply={reply[:24]}")
 
     # 指令仍优先于 AI（状态指令不进大模型）
     st, logs_a = req("GET", "/api/llm-logs?limit=100", token=token)

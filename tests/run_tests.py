@@ -721,8 +721,8 @@ def main():
     # ---------------- 20. 企微机器人 AI 问答（大模型处理自由文本） ----------------
     print("【20. 企微 AI 问答】")
 
-    # 未配置模型：占位调用留痕 + 提示接入
-    st, p = req("POST", "/api/wecom/simulate", {"text": "最近到期的酒店多吗？", "userid": f"u{ts}"}, token=token)
+    # 未配置模型：非数据问题 → 占位提示 + 留痕（数据类问题走数据直出，见 T21）
+    st, p = req("POST", "/api/wecom/simulate", {"text": "介绍一下你能做什么", "userid": f"u{ts}"}, token=token)
     reply = (p or {}).get("reply", "")
     st2, logs = req("GET", "/api/llm-logs?limit=10", token=token)
     qa_rec = next((l for l in (logs or []) if l.get("scene") == "企微问答"), {})
@@ -749,6 +749,34 @@ def main():
     after = len([l for l in (logs_b or []) if l.get("scene") == "企微问答"])
     check("T20.3", "企微 AI 问答", "确定性指令优先（状态不进大模型）",
           "授权状态" in reply and after == before, f"reply={reply[:24]} qa增量={after - before}")
+
+    # ---------------- 21. 企微问答数据接地（真实数据直出，防模型编造） ----------------
+    print("【21. 企微问答数据接地】")
+
+    # 造一家 20 天后到期的酒店，并确保走「无模型数据直出」路径
+    expire_20d = time.strftime("%Y-%m-%d", time.localtime(time.time() + 20 * 86400))
+    st, p = req("POST", "/api/hotels",
+                {"name": f"接地测试店{ts}", "code": f"HT-G{ts}", "plan": "基础版"}, token=token)
+    gid = (p or {}).get("id")
+    req("PATCH", f"/api/hotels/{gid}", {"expireAt": expire_20d}, token=token)
+    req("POST", "/api/ai/config",
+        {"active": "", "fallback": False, "local": {"provider": ""}, "cloud": {}}, token=token)
+    st, p = req("POST", "/api/wecom/simulate",
+                {"text": "查询出还有一个月要过期的酒店信息", "userid": f"u{ts}"}, token=token)
+    reply = (p or {}).get("reply", "")
+    check("T21.1", "企微数据接地", "到期查询返回真实酒店（非编造模板）",
+          f"接地测试店{ts}" in reply and expire_20d in reply and "[酒店名称]" not in reply
+          and "直出" in reply,
+          f"含真实店={f'接地测试店{ts}' in reply} 含日期={expire_20d in reply}")
+
+    # 数据隔离：集团用户问到期 → 不得出现非本集团门店
+    req("POST", "/api/wecom/bindings", {"userid": f"ugx{ts}", "name": "隔离测试", "role": "group", "groupId": "g001"}, token=token)
+    st, p = req("POST", "/api/wecom/simulate",
+                {"text": "哪些酒店快到期？", "userid": f"ugx{ts}"}, token=token)
+    reply = (p or {}).get("reply", "")
+    check("T21.2", "企微数据接地", "集团问答只含本集团数据（隔离）",
+          f"接地测试店{ts}" not in reply and ("本集团" in reply or "直出" in reply),
+          f"越界店出现={f'接地测试店{ts}' in reply}")
 
     # 还原模型配置（测试改动不污染环境；apiKey 空串=不修改已有 Key）
     req("POST", "/api/ai/config", llm_snapshot, token=token)

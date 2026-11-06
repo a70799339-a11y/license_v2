@@ -227,46 +227,133 @@ def _audit(db: Session, operator: str, action: str, target: str, detail: str) ->
     )
 
 
+def _scoped_hotels(db: Session, binding) -> tuple:
+    """按绑定角色返回可见酒店列表与范围标签（数据隔离）"""
+    role = binding.role if binding else "viewer"
+    if role == "group":
+        return db.query(Hotel).filter(Hotel.group_id == (binding.group_id or "")).all(), "本集团"
+    if role in ("admin", "operator"):
+        return db.query(Hotel).all(), "全部"
+    return [], "无"
+
+
+def _query_data(db: Session, text: str, binding) -> str | None:
+    """按问题意图从数据库取真实数据（接地）；未命中数据意图返回 None"""
+    from datetime import date
+
+    hotels, scope = _scoped_hotels(db, binding)
+    today = date.today()
+    lines = [f"今天日期：{today.isoformat()}"]
+
+    def days_left(h: Hotel):
+        try:
+            return (date.fromisoformat(h.expire_at) - today).days
+        except Exception:
+            return None
+
+    hit = False
+    if any(k in text for k in ("到期", "过期", "临期", "续期")):
+        hit = True
+        if any(k in text for k in ("一个月", "1个月", "30天")):
+            win = 30
+        elif any(k in text for k in ("两个月", "2个月", "60天")):
+            win = 60
+        else:
+            win = 90
+        upcoming, overdue = [], []
+        for h in hotels:
+            d = days_left(h)
+            if d is None:
+                continue
+            if 0 <= d <= win:
+                upcoming.append((d, h))
+            elif d < 0 and -d <= 180:  # 已过期半年内一并提示
+                overdue.append((d, h))
+        upcoming.sort(key=lambda x: x[0])
+        overdue.sort(key=lambda x: x[0])
+        lines.append(f"【{scope}酒店 {win} 天内到期】共 {len(upcoming)} 家：")
+        for d, h in upcoming[:30]:
+            lines.append(f"- {h.name}（{h.code}）到期 {h.expire_at}（剩余 {d} 天）套餐 {h.plan} 状态 {h.status}")
+        if not upcoming:
+            lines.append("（无即将到期的酒店）")
+        if overdue:
+            lines.append(f"【已过期未续】共 {len(overdue)} 家：")
+            for d, h in overdue[:15]:
+                lines.append(f"- {h.name}（{h.code}）到期 {h.expire_at}（已过期 {-d} 天）套餐 {h.plan} 状态 {h.status}")
+
+    if any(k in text for k in ("告警", "风险", "异常")):
+        hit = True
+        names = {h.name for h in hotels}
+        alerts = [
+            a for a in db.query(Alert).order_by(Alert.time.desc()).limit(30).all()
+            if a.hotel_name in names
+        ][:10]
+        lines.append(f"【近期告警】共 {len(alerts)} 条：")
+        for a in alerts:
+            lines.append(f"- [{a.level}] {a.rule}｜{a.hotel_name}｜{a.status}｜{a.time}")
+        if not alerts:
+            lines.append("（无告警）")
+
+    if "设备" in text:
+        hit = True
+        lines.append("【设备使用】：")
+        for h in sorted(hotels, key=lambda x: -(x.devices or 0))[:15]:
+            lines.append(f"- {h.name}：{h.devices}/{h.max_devices}")
+
+    return "\n".join(lines) if hit else None
+
+
 def _llm_answer(db: Session, text: str, sender: str, binding) -> str:
-    """企微自由问答：经审计网关调用大模型（本地/云端），按绑定角色附数据上下文"""
+    """企微自由问答：先从数据库取真实数据（接地），再经审计网关调用大模型组织回答。
+    未配置模型时数据直出（保证查询类问题依然准确）；模型失败时降级为数据直出。"""
     from .llm_audit import llm_call
+    from .llm_backend import get_backend
 
     role = binding.role if binding else "viewer"
     if role == "group":
         source_type, source_id = "group", (binding.group_id or "")
         g = db.query(Group).filter(Group.id == source_id).first()
         source_name = g.name if g else source_id
-        members = db.query(Hotel).filter(Hotel.group_id == source_id).all()
-        ctx = "旗下门店：" + "、".join(f"{h.name}({h.status},{h.expire_at}到期)" for h in members[:15])
     elif role in ("admin", "operator"):
         source_type, source_id, source_name = "admin", sender, "企微后台"
-        n = db.query(Hotel).count()
-        expiring = db.query(Hotel).filter(Hotel.status.in_(("即将到期", "已过期"))).count()
-        alerts = db.query(Alert).filter(Alert.status != "已处置").count()
-        ctx = f"全网酒店 {n} 家，其中到期/过期 {expiring} 家，未处置告警 {alerts} 条。"
     else:
         source_type, source_id, source_name = "hotel", (binding.group_id or ""), "企微用户"
-        ctx = "（用户为单店/运营角色）"
+
+    data = _query_data(db, text, binding)
+
+    def direct() -> str:
+        return f"📋 查询结果（系统数据直出）：\n{data}"
+
+    has_model = get_backend(db) is not None
+    if not has_model:
+        # 无模型：审计留痕（占位）后按数据直出；非数据问题给提示
+        llm_call(
+            db, source_type=source_type, source_id=source_id, source_name=source_name,
+            user_id=sender, scene="企微问答", user_input=text,
+            prompt=f"（未配置模型，数据直出）\n{data or ''}\n用户问题：{text}",
+        )
+        return direct() if data else (
+            "AI 模型未接入。可回复『帮助』看指令列表；管理员在后台配置本地/云端模型后此处自动生效。"
+        )
 
     prompt = (
-        "你是酒店 AI 授权管理系统的企微助手，用中文简洁回答运营问题（不超过 200 字）。\n"
-        f"数据背景：{ctx}\n用户问题：{text}"
+        "你是酒店 AI 授权管理系统的企微助手。严格依据下面【实时数据】回答，"
+        "禁止编造数据中不存在的酒店名、日期或数字；数据不足就如实说明。"
+        "若数据含清单请**完整列出全部条目**（每行一条，不要省略或概括掉条目）；"
+        "非清单问题用中文简洁回答（不超过 250 字）。\n"
+        f"【实时数据】\n{data or '（本次提问未命中结构化数据，按通用助手回答）'}\n"
+        f"用户问题：{text}"
     )
     r = llm_call(
-        db,
-        source_type=source_type,
-        source_id=source_id,
-        source_name=source_name,
-        user_id=sender,
-        scene="企微问答",
-        user_input=text,
-        prompt=prompt,
+        db, source_type=source_type, source_id=source_id, source_name=source_name,
+        user_id=sender, scene="企微问答", user_input=text, prompt=prompt,
     )
     if r["status"] == "error":
-        return "AI 问答暂不可用（模型服务异常，已记录），请稍后再试或回复『帮助』看指令列表。"
-    if r["model"] == "none":  # 未配置模型后端（占位调用）
-        return "AI 模型未接入。可回复『帮助』看指令列表；管理员在后台配置本地/云端模型后此处自动生效。"
-    return (r["output"] or "").strip()[:800]
+        return (direct() + "\n（AI 摘要暂不可用，以上为系统数据直出）") if data else (
+            "AI 问答暂不可用（模型服务异常，已记录），请稍后再试或回复『帮助』看指令列表。"
+        )
+    out = (r["output"] or "").strip()[:1600]
+    return out or (direct() if data else "（模型无输出）")
 
 
 def process_command(db: Session, text: str, sender: str = "unknown") -> str:

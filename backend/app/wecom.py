@@ -317,6 +317,59 @@ def _query_data(db: Session, text: str, binding) -> tuple:
 ACK_TEXT = "🔍 正在检索，请稍候…（数据查询/AI 生成中）"
 
 
+def _analysis_stats(db: Session, binding) -> str:
+    """系统预计算聚合指标（分析类问题的事实基座）——
+    小模型不擅长自己统计，由系统算好全量指标喂给它解读，消除『分析时数据缺失』。"""
+    from datetime import date
+
+    hotels, scope = _scoped_hotels(db, binding)
+    hotels = [h for h in hotels if h.status != "已停用"]
+    today = date.today()
+
+    def days_left(h: Hotel):
+        try:
+            return (date.fromisoformat(h.expire_at) - today).days
+        except Exception:
+            return None
+
+    total = len(hotels)
+    by_status: dict = {}
+    by_plan: dict = {}
+    soon7 = soon30 = soon90 = overdue = 0
+    for h in hotels:
+        by_status[h.status] = by_status.get(h.status, 0) + 1
+        by_plan[h.plan] = by_plan.get(h.plan, 0) + 1
+        d = days_left(h)
+        if d is None:
+            continue
+        if d < 0 and -d <= 180:
+            overdue += 1
+        elif 0 <= d <= 7:
+            soon7 += 1
+        if d is not None and 0 <= d <= 30:
+            soon30 += 1
+        if d is not None and 0 <= d <= 90:
+            soon90 += 1
+    names = {h.name for h in hotels}
+    alerts = [a for a in db.query(Alert).filter(Alert.status != "已处置").all() if a.hotel_name in names]
+    by_level: dict = {}
+    for a in alerts:
+        by_level[a.level] = by_level.get(a.level, 0) + 1
+    dev_total = sum(h.devices or 0 for h in hotels)
+    dev_cap = sum(h.max_devices or 0 for h in hotels)
+
+    return (
+        f"【统计基座（系统精确计算，回答时请直接引用这些数字）】\n"
+        f"- 范围：{scope}｜酒店总数 {total} 家\n"
+        f"- 状态分布：{'、'.join(f'{k} {v} 家' for k, v in by_status.items()) or '无'}\n"
+        f"- 套餐分布：{'、'.join(f'{k} {v} 家' for k, v in by_plan.items()) or '无'}\n"
+        f"- 到期风险：7 天内 {soon7} 家｜30 天内 {soon30} 家｜90 天内 {soon90} 家｜已过期未续 {overdue} 家\n"
+        f"- 未处置告警：{len(alerts)} 条"
+        f"（{'、'.join(f'{k} {v} 条' for k, v in by_level.items()) or '无'}）\n"
+        f"- 设备占用：{dev_total}/{dev_cap}"
+    )
+
+
 def _llm_answer(db: Session, text: str, sender: str, binding, on_slow=None) -> str:
     """企微自由问答：先从数据库取真实数据（接地），再经审计网关调用大模型组织回答。
     未配置模型时数据直出（保证查询类问题依然准确）；模型失败时降级为数据直出。
@@ -361,8 +414,10 @@ def _llm_answer(db: Session, text: str, sender: str, binding, on_slow=None) -> s
         "你是酒店 AI 授权管理系统的企微助手。严格依据下面【实时数据】回答，"
         "禁止编造数据中不存在的酒店名、日期或数字；数据不足就如实说明。"
         "若数据含清单请**完整列出全部条目**（每行一条，不要省略或概括掉条目）；"
+        "分析/建议类问题请结合【统计基座】的精确数字回答（直接引用，不要自己重新统计）；"
         "非清单问题用中文简洁回答（不超过 250 字）。\n"
-        f"【实时数据】\n{data or '（本次提问未命中结构化数据，按通用助手回答）'}\n"
+        f"{_analysis_stats(db, binding)}\n"
+        f"【实时数据】\n{data or '（本次提问未命中结构化明细，按统计基座回答）'}\n"
         f"用户问题：{text}"
     )
     r = llm_call(

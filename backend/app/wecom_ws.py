@@ -116,6 +116,7 @@ def _run(bot_id: str, secret: str) -> None:
                 body = frame.get("body", {}) or {}
                 text = _strip_mention((body.get("text") or {}).get("content", ""))
                 userid = ((body.get("from") or {}).get("userid")) or "unknown"
+                print(f"[wecom] 收到消息 #{_STATUS['msg_count']} from={userid} text={text[:30]!r}", flush=True)
                 if not text:
                     return
                 sid = generate_req_id("stream")
@@ -143,8 +144,17 @@ def _run(bot_id: str, secret: str) -> None:
                     await client.reply_stream(frame, sid, reply, True)  # 续写同一气泡
                 else:
                     await client.reply_stream(frame, sid, reply, True)
-            except Exception as e:  # 单条消息失败不影响连接
-                _STATUS["last_error"] = f"消息处理失败：{str(e)[:100]}"
+            except Exception as e:  # 单条消息失败不影响连接，但必须回话（杜绝静默）
+                err = str(e)[:100]
+                _STATUS["last_error"] = f"消息处理失败：{err}"
+                print(f"[wecom] 消息处理失败：{err}", flush=True)
+                try:
+                    await client.reply_stream(
+                        frame, generate_req_id("stream"),
+                        f"⚠️ 处理出错（{err}），请稍后重试或回复『帮助』。", True,
+                    )
+                except Exception:
+                    pass
 
         await client.connect()
         await asyncio.Event().wait()  # 常驻（SDK 内部负责心跳与重连）

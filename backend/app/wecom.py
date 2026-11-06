@@ -237,8 +237,15 @@ def _scoped_hotels(db: Session, binding) -> tuple:
     return [], "无"
 
 
-def _query_data(db: Session, text: str, binding) -> str | None:
-    """按问题意图从数据库取真实数据（接地）；未命中数据意图返回 None"""
+def _is_list_query(text: str) -> bool:
+    """是否为「清单类」问法（完整性兜底只对这类生效，避免误伤咨询类回答）"""
+    return any(k in text for k in ("查询", "查一下", "列出", "清单", "哪些", "有哪些", "多少", "列表"))
+
+
+def _query_data(db: Session, text: str, binding) -> tuple:
+    """按问题意图从数据库取真实数据（接地）。
+    返回 (数据文本, 完整性基线)；未命中数据意图返回 (None, 0)。
+    完整性基线 = 主清单（临期/告警/设备）条目数，不含「已过期」附录。"""
     from datetime import date
 
     hotels, scope = _scoped_hotels(db, binding)
@@ -252,6 +259,7 @@ def _query_data(db: Session, text: str, binding) -> str | None:
             return None
 
     hit = False
+    guard_n = 0
     if any(k in text for k in ("到期", "过期", "临期", "续期")):
         hit = True
         if any(k in text for k in ("一个月", "1个月", "30天")):
@@ -273,6 +281,7 @@ def _query_data(db: Session, text: str, binding) -> str | None:
                 overdue.append((d, h))
         upcoming.sort(key=lambda x: x[0])
         overdue.sort(key=lambda x: x[0])
+        guard_n = len(upcoming)  # 主清单基线（已过期附录不计入）
         lines.append(f"【{scope}酒店 {win} 天内到期】共 {len(upcoming)} 家：")
         for d, h in upcoming[:30]:
             lines.append(f"- {h.name}（{h.code}）到期 {h.expire_at}（剩余 {d} 天）套餐 {h.plan} 状态 {h.status}")
@@ -302,7 +311,7 @@ def _query_data(db: Session, text: str, binding) -> str | None:
         for h in sorted((x for x in hotels if x.status != "已停用"), key=lambda x: -(x.devices or 0))[:15]:
             lines.append(f"- {h.name}：{h.devices}/{h.max_devices}")
 
-    return "\n".join(lines) if hit else None
+    return ("\n".join(lines), guard_n) if hit else (None, 0)
 
 
 def _llm_answer(db: Session, text: str, sender: str, binding) -> str:
@@ -321,7 +330,7 @@ def _llm_answer(db: Session, text: str, sender: str, binding) -> str:
     else:
         source_type, source_id, source_name = "hotel", (binding.group_id or ""), "企微用户"
 
-    data = _query_data(db, text, binding)
+    data, guard_n = _query_data(db, text, binding)
 
     def direct() -> str:
         return f"📋 查询结果（系统数据直出）：\n{data}"
@@ -356,13 +365,14 @@ def _llm_answer(db: Session, text: str, sender: str, binding) -> str:
         )
     out = (r["output"] or "").strip()[:1600]
 
-    # 完整性校验：数据含酒店清单时，模型输出条目数不得少于数据条目数（防小模型截断漏项）
-    if data and out:
+    # 完整性校验：仅对「清单类」问法生效，且只对标主清单条目数（防小模型截断漏项；
+    # 不误伤咨询类回答——咨询回答本就无需罗列全部编码）
+    if data and out and guard_n > 0 and _is_list_query(text):
         import re as _re
         exp = len(_re.findall(r"（[A-Z]{2}-[^）]+）", data))
         act = len(_re.findall(r"（[A-Z]{2}-[^）]+）", out))
-        if exp > 0 and act < exp:
-            return direct() + f"\n（模型输出不完整 {act}/{exp} 条，已切换为系统数据直出）"
+        if exp > 0 and act < min(exp, guard_n):
+            return direct() + f"\n（模型输出不完整 {act}/{min(exp, guard_n)} 条，已切换为系统数据直出）"
 
     return out or (direct() if data else "（模型无输出）")
 

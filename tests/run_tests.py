@@ -871,6 +871,21 @@ def main():
           step1 and step2 and status_now == "已停用",
           f"确认={step1} 执行={step2} status={status_now}")
 
+    # ---------------- 28. 日常指令健壮性 ----------------
+    print("【28. 日常指令健壮性】")
+
+    r = (req("POST", "/api/wecom/simulate", {"text": "状态 HT-9999", "userid": f"u{ts}"}, token=token)[1] or {}).get("reply", "")
+    check("T28.1", "日常指令健壮性", "未知编码确定性拒绝（不进 AI 瞎答）",
+          "未找到" in r and "HT-9999" in r, r[:40])
+
+    r = (req("POST", "/api/wecom/simulate", {"text": "帮助", "userid": f"u{ts}"}, token=token)[1] or {}).get("reply", "")
+    check("T28.2", "日常指令健壮性", "帮助含全部日常指令（状态/告警/续期/停用）",
+          all(k in r for k in ("状态", "告警", "续期", "停用")), r[:30])
+
+    r = (req("POST", "/api/wecom/simulate", {"text": "续期 HT-9999", "userid": f"u{ts}"}, token=token)[1] or {}).get("reply", "")
+    check("T28.3", "日常指令健壮性", "未知编码续期同样明确拒绝",
+          "未找到" in r, r[:30])
+
     # ---------------- 19. 大模型接入（本地 Ollama/llama.cpp + 云端 API） ----------------
     print("【19. 大模型接入（本地+云端）】")
 

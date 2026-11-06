@@ -763,6 +763,22 @@ def process_command(db: Session, text: str, sender: str = "unknown", on_slow=Non
 
     hotel = db.query(Hotel).filter((Hotel.code == code) | (Hotel.name == code)).first() if code else None
 
+    # 确定性指令缺编码 → 用法提示（不进 AI）
+    if not code and cmd in ("状态", "告警", "续期", "停用", "拉黑"):
+        return f"用法：{cmd} HT-0001（请带上客户编码）。回复『帮助』看全部指令。"
+
+    # 确定性指令带未知编码/名称 → 直接明确拒绝（不进 AI，防瞎答）
+    if hotel is None and code and cmd in (
+        "状态", "告警", "续期", "确认续期", "停用", "确认停用", "拉黑", "确认拉黑"
+    ):
+        return f"未找到编号/名称为「{code}」的客户。请核对编码（如 HT-0001），或回复『帮助』看指令列表。"
+
+    # 确定性指令目标存在但无权限（如只读角色/非本集团）→ 明确拒绝（不进 AI）
+    if hotel is not None and not allowed(hotel) and cmd in (
+        "状态", "告警", "续期", "确认续期", "停用", "确认停用", "拉黑", "确认拉黑"
+    ):
+        return f"你没有操作「{hotel.name}（{hotel.code}）」的权限，请联系管理员。"
+
     if cmd == "状态" and hotel is not None and allowed(hotel):
         from .client_api import find_active_license, license_status
 

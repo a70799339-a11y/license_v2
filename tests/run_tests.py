@@ -895,6 +895,21 @@ def main():
     check("T28.5", "日常指令健壮性", "无空格+真实编码返回真实数据（大小写归一）",
           "HT-0001" in r and "到期" in r and "未找到" not in r, r[:40])
 
+    # 自由问法带不存在编码（ht9999的状态详情）→ 确定性拒绝，禁止全局统计冒充该店
+    r = (req("POST", "/api/wecom/simulate", {"text": "ht9999的状态详情", "userid": f"u{ts}"}, token=token)[1] or {}).get("reply", "")
+    check("T28.6", "日常指令健壮性", "自由问法带不存在编码确定性拒绝（不进 AI 编造/不套全局统计）",
+          "未找到" in r and "ht9999" in r and "统计基座" not in r and "酒店总数" not in r, r[:40])
+
+    r = (req("POST", "/api/wecom/simulate", {"text": "查一下ht9999的状态", "userid": f"u{ts}"}, token=token)[1] or {}).get("reply", "")
+    check("T28.7", "日常指令健壮性", "自然语言问法带不存在编码同样确定性拒绝",
+          "未找到" in r and "ht9999" in r, r[:40])
+
+    # 单店自由问法：只给该店数据，禁止全局设备占用/总量冒充单店
+    r = (req("POST", "/api/wecom/simulate", {"text": "HT-0004的状态详情", "userid": f"u{ts}"}, token=token)[1] or {}).get("reply", "")
+    import re as _re
+    check("T28.8", "日常指令健壮性", "单店详情不含全局统计冒充（设备占用为单店数值）",
+          "HT-0004" in r and not _re.search(r"\d{3,}/\d{3,}", r), r[:40])
+
     # ---------------- 19. 大模型接入（本地 Ollama/llama.cpp + 云端 API） ----------------
     print("【19. 大模型接入（本地+云端）】")
 

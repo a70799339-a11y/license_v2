@@ -7,6 +7,7 @@
 （未配置真实 webhook 前不外发，最近推送存 settings 供测试断言）。
 """
 import json
+import re
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta
@@ -389,6 +390,22 @@ def _query_data(db: Session, text: str, binding) -> tuple:
 
     hit = False
     guard_n = 0
+
+    # 单店档案（问题指名到具体门店）：真实字段直出，
+    # 杜绝把全局统计（设备占用/告警总量等）冒充该店数据。
+    code_norms = {_norm_code(t) for t in _find_code_tokens(text)}
+    _targets = [
+        h for h in hotels
+        if (h.code and _norm_code(h.code) in code_norms) or (h.name and h.name in text)
+    ]
+    for th in _targets:
+        hit = True
+        un = db.query(Alert).filter(Alert.hotel_name == th.name, Alert.status != "已处置").count()
+        lines.append(
+            f"【单店档案】{th.name}（{th.code}）：状态 {th.status}｜套餐 {th.plan}｜到期 {th.expire_at}"
+            f"｜设备 {th.devices}/{th.max_devices}｜自动续期 {'开' if th.auto_renew else '关'}｜未处置告警 {un} 条"
+        )
+
     if any(k in text for k in ("到期", "过期", "临期", "续期")):
         hit = True
         if any(k in text for k in ("一个月", "1个月", "30天")):
@@ -436,7 +453,8 @@ def _query_data(db: Session, text: str, binding) -> tuple:
             return level_filter is None or a.level in level_filter
 
         # 单店提问（问题里出现该店编码/全名）→ 取该店全量告警，避免老告警被全局窗口挤掉
-        target = next((h for h in hotels if h.code and h.code in text), None) or next(
+        # （编码匹配走归一化，ht-0004 也能命中 HT-0004）
+        target = _targets[0] if _targets else next(
             (h for h in hotels if h.name and h.name in text), None
         )
         if target is not None:
@@ -667,6 +685,15 @@ def _llm_answer(db: Session, text: str, sender: str, binding, on_slow=None) -> s
             "AI 模型未接入。可回复『帮助』看指令列表；管理员在后台配置本地/云端模型后此处自动生效。"
         )
 
+    # 单店提问：禁止把【统计基座】全局数字（酒店总数/套餐分布/设备占用等）冒充该店数据
+    single_mode = bool(data and "【单店档案】" in data)
+    stats_block = "" if single_mode else f"{_analysis_stats(db, binding, _match_group(db, text))}\n"
+    single_rule = (
+        "本次提问指名到具体门店：只允许用【单店档案】里的字段回答；"
+        "档案里没有的字段写『暂无数据』；"
+        "严禁引用全局统计数字（酒店总数/套餐分布/设备占用/告警总量等）作为该店数据。\n"
+        if single_mode else ""
+    )
     prompt = (
         "你是酒店 AI 授权管理系统的企微助手。严格依据下面【实时数据】回答，"
         "禁止编造数据中不存在的酒店名、日期或数字；数据不足就如实说明。"
@@ -677,7 +704,8 @@ def _llm_answer(db: Session, text: str, sender: str, binding, on_slow=None) -> s
         "用户请求执行变更操作（拉黑/停用/删除/吊销等）时，**严禁声称已执行或将代为执行**，"
         "只给涉及对象清单并引导到后台或确定性指令；"
         "非清单问题用中文简洁回答（不超过 250 字）。\n"
-        f"{_analysis_stats(db, binding, _match_group(db, text))}\n"
+        f"{single_rule}"
+        f"{stats_block}"
         f"【实时数据】\n{data or '（本次提问未命中结构化明细，按统计基座回答）'}\n"
         f"用户问题：{text}"
     )
@@ -725,6 +753,25 @@ def _llm_answer(db: Session, text: str, sender: str, binding, on_slow=None) -> s
             )
         reply += ACTION_FOOTER
     return reply
+
+
+def _norm_code(raw: str) -> str:
+    """酒店编码归一：ht9999 / ht-9999 / HT 9999 → HT-9999（大小写与连字符统一）"""
+    s = re.sub(r"[\s\-]+", "", (raw or "").strip().upper())
+    if s.startswith("HT") and len(s) > 2:
+        return "HT-" + s[2:]
+    return s
+
+
+def _find_code_tokens(text: str) -> list:
+    """从自由文本中提取疑似酒店编码的 token（ht9999 / HT-0001 / HT-XA123 …）。
+    要求 ht 后紧跟数字或带连字符，避免误伤 html 之类普通单词。"""
+    out = []
+    for m in re.finditer(r"(?i)(?<![0-9a-z])ht[- ]?[0-9a-z]+(?![0-9a-z])", text):
+        tok = m.group(0)
+        if tok.lower().startswith("ht-") or tok[2:3].isdigit():
+            out.append(tok)
+    return out
 
 
 def process_command(db: Session, text: str, sender: str = "unknown", on_slow=None) -> str:
@@ -775,13 +822,14 @@ def process_command(db: Session, text: str, sender: str = "unknown", on_slow=Non
             return h.group_id == binding.group_id
         return binding.role in ("operator",)
 
-    # 编码大小写归一（ht-0004 ≡ HT-0004）；同时支持按名称精确查找
+    # 编码归一（ht0004 ≡ ht-0004 ≡ HT-0004）；同时支持按名称精确查找
     code_stripped = code.strip()
     hotel = None
     if code_stripped:
+        code_norm = _norm_code(code_stripped)
         hotel = (
             db.query(Hotel)
-            .filter((func.upper(Hotel.code) == code_stripped.upper()) | (Hotel.name == code_stripped))
+            .filter((func.upper(Hotel.code) == code_norm) | (Hotel.name == code_stripped))
             .first()
         )
 
@@ -846,6 +894,14 @@ def process_command(db: Session, text: str, sender: str = "unknown", on_slow=Non
         except Exception:
             pass
         return f"✅ {hotel.name}（{hotel.code}）已停用（拉黑），不再计入统计；如需恢复请到后台启用"
+
+    # AI 前置接地门：消息里出现的酒店编码逐一查库，任一查无此店 → 确定性拒绝。
+    # 否则「ht9999的状态详情」这类编码开头的提问会掉进 LLM，
+    # 把全局统计冒充单店数据或直接编造状态（谎称）。
+    for raw_tok in _find_code_tokens(text):
+        cn = _norm_code(raw_tok)
+        if db.query(Hotel).filter(func.upper(Hotel.code) == cn).first() is None:
+            return f"未找到编号/名称为「{raw_tok}」的客户。请核对编码（如 HT-0001），或回复『帮助』看指令列表。"
 
     # 未命中指令 → 大模型问答（本地/云端均可，经审计网关全量留痕）
     return _llm_answer(db, text, sender, binding, on_slow)

@@ -886,6 +886,15 @@ def main():
     check("T28.3", "日常指令健壮性", "未知编码续期同样明确拒绝",
           "未找到" in r, r[:30])
 
+    # 无空格写法（状态HT-xxxx）：必须同样进确定性通道，不得掉进 AI 编造
+    r = (req("POST", "/api/wecom/simulate", {"text": "状态ht-888", "userid": f"u{ts}"}, token=token)[1] or {}).get("reply", "")
+    check("T28.4", "日常指令健壮性", "无空格+不存在编码仍确定性拒绝（不进 AI 编造）",
+          "未找到" in r and "ht-888" in r, r[:40])
+
+    r = (req("POST", "/api/wecom/simulate", {"text": "状态HT-0001", "userid": f"u{ts}"}, token=token)[1] or {}).get("reply", "")
+    check("T28.5", "日常指令健壮性", "无空格+真实编码返回真实数据（大小写归一）",
+          "HT-0001" in r and "到期" in r and "未找到" not in r, r[:40])
+
     # ---------------- 19. 大模型接入（本地 Ollama/llama.cpp + 云端 API） ----------------
     print("【19. 大模型接入（本地+云端）】")
 

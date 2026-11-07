@@ -11,6 +11,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from .masking import mask_text
@@ -750,8 +751,21 @@ def process_command(db: Session, text: str, sender: str = "unknown", on_slow=Non
             f"请联系管理员绑定后使用；回复『帮助』可先看指令列表。"
         )
 
-    parts = text.split()
-    cmd, code = parts[0], (parts[1] if len(parts) > 1 else "")
+    # 指令解析：不依赖空格。「状态HT-0004」「状态ht-888」等无空格写法
+    # 必须同样进入确定性通道，否则会绕过全部防瞎答保护掉进 LLM 编造。
+    _KNOWN_CMDS = (
+        "确认续期", "确认停用", "确认拉黑", "状态", "告警", "续期", "停用", "拉黑",
+    )
+    first_tok = text.split()[0] if text.split() else ""
+    cmd, code = first_tok, ""
+    if len(text.split()) > 1:
+        code = text.split()[1]
+    else:
+        # 无空格：尝试按已知动词前缀切分（最长匹配优先）
+        for known in _KNOWN_CMDS:
+            if first_tok.startswith(known) and len(first_tok) > len(known):
+                cmd, code = known, first_tok[len(known):].strip()
+                break
 
     # 集团绑定用户只能操作本集团门店
     def allowed(h: Hotel) -> bool:
@@ -761,7 +775,15 @@ def process_command(db: Session, text: str, sender: str = "unknown", on_slow=Non
             return h.group_id == binding.group_id
         return binding.role in ("operator",)
 
-    hotel = db.query(Hotel).filter((Hotel.code == code) | (Hotel.name == code)).first() if code else None
+    # 编码大小写归一（ht-0004 ≡ HT-0004）；同时支持按名称精确查找
+    code_stripped = code.strip()
+    hotel = None
+    if code_stripped:
+        hotel = (
+            db.query(Hotel)
+            .filter((func.upper(Hotel.code) == code_stripped.upper()) | (Hotel.name == code_stripped))
+            .first()
+        )
 
     # 确定性指令缺编码 → 用法提示（不进 AI）
     if not code and cmd in ("状态", "告警", "续期", "停用", "拉黑"):

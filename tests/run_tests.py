@@ -920,6 +920,13 @@ def main():
     check("T28.10", "日常指令健壮性", "无数据问法不编造清单/编码（如实说明）",
           "编码0" not in r and "编码1" not in r, r[:40])
 
+    # 日志中的授权号掩码必须逐字保留（不得抹成 LIC-03）
+    r = (req("POST", "/api/wecom/simulate", {"text": "提取前十条日志信息", "userid": f"u{ts}"}, token=token)[1] or {}).get("reply", "")
+    import re as _re2
+    lic_unmasked = _re2.search(r"LIC-(?!\*)[0-9A-Za-z]", r)
+    check("T28.11", "日常指令健壮性", "日志转抄保留授权号掩码（LIC-**** 不被抹掉）",
+          (not lic_unmasked) and ("```" not in r), r[:40])
+
     # ---------------- 19. 大模型接入（本地 Ollama/llama.cpp + 云端 API） ----------------
     print("【19. 大模型接入（本地+云端）】")
 

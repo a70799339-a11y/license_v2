@@ -910,6 +910,16 @@ def main():
     check("T28.8", "日常指令健壮性", "单店详情不含全局统计冒充（设备占用为单店数值）",
           "HT-0004" in r and not _re.search(r"\d{3,}/\d{3,}", r), r[:40])
 
+    # 日志类提问：接真实操作日志，杜绝编造「编码001」式假条目
+    r = (req("POST", "/api/wecom/simulate", {"text": "提取前十条日志信息", "userid": f"u{ts}"}, token=token)[1] or {}).get("reply", "")
+    check("T28.9", "日常指令健壮性", "日志查询返回真实操作日志（不编造条目/编码）",
+          "编码0" not in r and ("企微" in r or "管理员" in r) and ("HT-" in r or "查询" in r or "客户" in r), r[:40])
+
+    # 无接地数据的问法：严禁编造清单/编码，如实说明
+    r = (req("POST", "/api/wecom/simulate", {"text": "帮我提取前十条神秘记录", "userid": f"u{ts}"}, token=token)[1] or {}).get("reply", "")
+    check("T28.10", "日常指令健壮性", "无数据问法不编造清单/编码（如实说明）",
+          "编码0" not in r and "编码1" not in r, r[:40])
+
     # ---------------- 19. 大模型接入（本地 Ollama/llama.cpp + 云端 API） ----------------
     print("【19. 大模型接入（本地+云端）】")
 

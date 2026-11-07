@@ -517,6 +517,37 @@ def _query_data(db: Session, text: str, binding) -> tuple:
         for h in sorted((x for x in hotels if x.status != "已停用"), key=lambda x: -(x.devices or 0))[:15]:
             lines.append(f"- {h.name}：{h.devices}/{h.max_devices}")
 
+    # 操作/审计日志（提取 N 条）：真实数据直出，杜绝模型编造日志条目
+    if any(k in text for k in ("日志", "操作记录", "审计")):
+        hit = True
+        m = re.search(r"(\d+)\s*条", text)
+        if m:
+            n = int(m.group(1))
+        else:
+            _cn_num = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+            m2 = re.search(r"前\s*([一二两三四五六七八九十])\s*条", text)
+            n = _cn_num.get(m2.group(1), 10) if m2 else 10
+        n = max(1, min(n, 50))
+        name_code = {h.name: (h.code or "") for h in hotels}
+        rows = db.query(AuditLog).order_by(AuditLog.id.desc()).limit(n).all()
+        if binding and binding.role == "group":
+            names = set(name_code)
+            rows = [a for a in rows if any(nm in (a.target or "") for nm in names)][:n]
+        guard_n = len(rows)
+        strict = guard_n > 0  # 日志条目必须完整列出，漏项即切数据直出
+        lines.append(f"【操作日志（最近 {len(rows)} 条）】：")
+        if rows:
+            for a in rows:
+                code_hint = ""
+                for nm, cd in name_code.items():
+                    if nm and nm in (a.target or ""):
+                        code_hint = f"（{cd}）"
+                        break
+                t = _fmt_bj(a.created_at.strftime("%Y-%m-%d %H:%M:%S") if a.created_at else "")
+                lines.append(f"- {t}｜{a.action}｜{a.target}{code_hint}｜{a.operator}｜{a.detail}")
+        else:
+            lines.append("（暂无操作日志）")
+
     # 集团/子酒店（未命中更具体意图时）：单集团→列成员；全局→各集团子酒店数
     if not hit and scope != "无" and ("集团" in text or "子酒店" in text) and any(
         k in text for k in ("几家", "多少", "数量", "子酒店", "成员", "门店", "分别",
@@ -706,7 +737,7 @@ def _llm_answer(db: Session, text: str, sender: str, binding, on_slow=None) -> s
         "非清单问题用中文简洁回答（不超过 250 字）。\n"
         f"{single_rule}"
         f"{stats_block}"
-        f"【实时数据】\n{data or '（本次提问未命中结构化明细，按统计基座回答）'}\n"
+        f"【实时数据】\n{data or '（本次提问未命中结构化明细：不要编造任何清单/日志/明细条目/酒店编码；分析类问题仅可引用统计基座的聚合数字；需要明细数据就如实说明暂无并引导到后台查询）'}\n"
         f"用户问题：{text}"
     )
     # 快通道（v1.1）：短咨询类问题（无数据意图且 ≤30 字）走本地小模型提速；数据类一律主力模型

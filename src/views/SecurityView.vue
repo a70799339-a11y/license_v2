@@ -14,6 +14,7 @@ onMounted(async () => {
     licenses.value = l
     if (s.heartbeat_timeout_hours) graceHours.value = s.heartbeat_timeout_hours
     await loadWecom()
+    await loadPushCfg()
     await loadLlmLogs()
     await loadLlmCfg()
   } finally {
@@ -78,6 +79,49 @@ async function testWecom() {
 async function pushDaily() {
   await api.wecomFlushDaily()
   ElMessage.success('日报已生成推送（dry-run 时仅记录）')
+}
+
+// ---------- 每日定时推送（服务端异常汇总） ----------
+const pushCfg = ref({ enabled: false, time: '09:00', lastPushDate: '', webhookConfigured: false, dryRun: true })
+const pushPreview = ref('')
+const pushPreviewShow = ref(false)
+
+async function loadPushCfg() {
+  try {
+    const c = await api.pushServerConfig()
+    pushCfg.value = {
+      enabled: c.enabled,
+      time: c.time || '09:00',
+      lastPushDate: c.lastPushDate || '',
+      webhookConfigured: c.webhookConfigured,
+      dryRun: c.dryRun,
+    }
+  } catch { /* 无权限时忽略 */ }
+}
+
+async function savePushCfg() {
+  if (!/^\d{2}:\d{2}$/.test(pushCfg.value.time)) {
+    ElMessage.warning('推送时间格式应为 HH:MM，如 09:00')
+    return
+  }
+  try {
+    await api.pushServerConfigSave(pushCfg.value.enabled, pushCfg.value.time)
+    ElMessage.success(`已保存：服务端异常汇总每日 ${pushCfg.value.time} 推送（${pushCfg.value.enabled ? '开' : '关'}）`)
+    await loadPushCfg()
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '保存失败')
+  }
+}
+
+async function testPushServer() {
+  try {
+    const r = await api.pushServerTest()
+    pushPreview.value = r.preview
+    pushPreviewShow.value = true
+    ElMessage.success(r.dryRun ? '异常汇总已生成（dry-run 未外发）' : `已推送：${r.sent.join(',')}`)
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '推送失败')
+  }
 }
 
 async function runSim() {
@@ -270,6 +314,28 @@ async function revokeWithReason(row: License) {
         <p v-if="simLoading" class="muted sim-ack">{{ simAck || '🔍 正在检索，请稍候…' }}</p>
         <pre v-else-if="simReply" class="sim-reply">{{ simReply }}</pre>
       </div>
+    </div>
+
+    <div class="card flow-card mb-20">
+      <div class="card-title">每日定时推送（服务端异常汇总）</div>
+      <p class="muted" style="font-size: 12px; margin-bottom: 12px">
+        服务端每天在设定时间向运营群推送「异常酒店汇总」（已过期未续 / 30 天内到期 / 未处置告警 / 设备满负荷）。
+        集团与子酒店的每日营业简报由各自客户端在「消息通知」中开启并设置推送时间。
+      </p>
+      <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap">
+        <el-switch v-model="pushCfg.enabled" active-text="启用推送" />
+        <el-time-select v-model="pushCfg.time" start="00:00" step="00:30" end="23:30" placeholder="推送时间" style="width: 120px" />
+        <el-button type="primary" @click="savePushCfg">保存</el-button>
+        <el-button @click="testPushServer">立即推送一次</el-button>
+        <el-tag v-if="!pushCfg.webhookConfigured" type="warning" size="small">未配置运营群 webhook</el-tag>
+        <el-tag v-if="pushCfg.dryRun" type="info" size="small">dry-run 模式（只记录不外发）</el-tag>
+        <span class="muted" style="font-size: 12px">
+          上次推送：{{ pushCfg.lastPushDate || '尚未推送过' }}
+        </span>
+      </div>
+      <el-dialog v-model="pushPreviewShow" title="异常汇总预览" width="560px">
+        <pre class="sim-reply">{{ pushPreview }}</pre>
+      </el-dialog>
     </div>
 
     <div class="card flow-card mb-20">

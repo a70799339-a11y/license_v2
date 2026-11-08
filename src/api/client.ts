@@ -243,6 +243,14 @@ export const api = {
   wecomSimulate: (text: string, userid = 'admin-sim') =>
     request<{ reply: string; ackSent: boolean; ack: string }>('/wecom/simulate', { method: 'POST', body: JSON.stringify({ text, userid }) }),
 
+  // 每日定时推送（服务端异常汇总；集团/子酒店在客户端配置）
+  pushServerConfig: () =>
+    request<{ scope: string; enabled: boolean; time: string; lastPushDate: string; webhookConfigured: boolean; dryRun: boolean }>('/push/server-config'),
+  pushServerConfigSave: (enabled: boolean, time: string) =>
+    request<{ ok: boolean }>('/push/server-config', { method: 'POST', body: JSON.stringify({ enabled, time }) }),
+  pushServerTest: () =>
+    request<{ ok: boolean; sent: string[]; dryRun: boolean; preview: string }>('/push/server-test', { method: 'POST' }),
+
   // plans & stats
   listPlans: () => request<Plan[]>('/plans'),
   stats: () => request<{ total: number; devices: number; expiring: number; alerts: number; expireSoon: { d7: number; d30: number; d60: number; d90: number } }>('/stats'),

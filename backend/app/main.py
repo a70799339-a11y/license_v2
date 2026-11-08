@@ -44,6 +44,15 @@ async def lifespan(app: FastAPI):
         start_ws()
     except Exception:
         pass
+    # 每日定时推送调度线程（服务端异常汇总 / 集团日报 / 子酒店日报）
+    try:
+        import threading
+
+        from .push_daily import push_scheduler_loop
+
+        threading.Thread(target=push_scheduler_loop, daemon=True, name="push-daily").start()
+    except Exception:
+        pass
     yield
 
 
@@ -640,6 +649,75 @@ def wecom_test(db: Session = Depends(get_db), user: User = Depends(require_roles
     write_log(db, user, "企微测试", "wecom", f"测试推送 {r.get('sent')}")
     db.commit()
     return {"ok": True, "sent": r.get("sent"), "dryRun": r.get("dry_run")}
+
+
+# ---------- 每日定时推送（服务端在后台设置；集团/子酒店在客户端设置） ----------
+class PushServerConfigReq(BaseModel):
+    enabled: bool
+    time: str = "09:00"
+
+
+class PushRunReq(BaseModel):
+    time: str = ""  # 指定触发时刻（HH:MM），用于测试/补推；空=按当前时间
+    force: bool = False  # 忽略「今天已推过」（补推/测试用）
+
+
+@app.get("/api/push/server-config")
+def push_server_config_get(db: Session = Depends(get_db), _: User = Depends(require_roles("admin", "operator"))):
+    from .push_daily import get_push_config
+    from .wecom import is_dry_run, ops_webhook
+
+    cfg = get_push_config(db, "server")
+    cfg["webhookConfigured"] = bool(ops_webhook(db))
+    cfg["dryRun"] = is_dry_run(db)
+    return cfg
+
+
+@app.post("/api/push/server-config")
+def push_server_config_set(
+    req: PushServerConfigReq,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("admin")),
+):
+    from .push_daily import set_push_config, valid_hhmm
+
+    if not valid_hhmm(req.time):
+        raise HTTPException(status_code=400, detail="推送时间格式应为 HH:MM（如 09:00）")
+    set_push_config(db, "server", "", enabled=req.enabled, push_time=req.time)
+    write_log(db, user, "推送设置", "服务端", f"每日异常汇总 {'开启' if req.enabled else '关闭'}，推送时间 {req.time}")
+    db.commit()
+    return {"ok": True}
+
+
+@app.post("/api/push/server-test")
+def push_server_test(db: Session = Depends(get_db), user: User = Depends(require_roles("admin", "operator"))):
+    """立即生成并推送服务端异常汇总（不影响每日定时；dry-run 时仅记录）"""
+    from .push_daily import _push_one, content_server
+
+    content = content_server(db)
+    r = _push_one(db, "server", "", content)
+    write_log(db, user, "推送测试", "服务端", f"异常汇总预览 {r.get('sent')}")
+    db.commit()
+    return {"ok": True, "sent": r.get("sent"), "dryRun": r.get("dry_run"), "preview": content}
+
+
+@app.post("/api/push/run")
+def push_run(
+    req: PushRunReq = None,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("admin")),
+):
+    """手动触发一次调度 tick（测试/补推）。body.time 指定触发时刻 HH:MM"""
+    from .push_daily import now_bj, run_due_pushes, valid_hhmm
+
+    t = now_bj()
+    if req and req.time:
+        if not valid_hhmm(req.time):
+            raise HTTPException(status_code=400, detail="时间格式应为 HH:MM")
+        hh, mm = req.time.strip().split(":")
+        t = t.replace(hour=int(hh), minute=int(mm))
+    pushed = run_due_pushes(db, now=t, force=bool(req and req.force))
+    return {"ok": True, "pushed": pushed}
 
 
 @app.get("/api/health")

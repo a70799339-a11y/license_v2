@@ -398,7 +398,12 @@ fn fetch_notify_config(state: State<AppState>) -> Result<Value, String> {
 }
 
 #[tauri::command]
-fn save_notify_config(state: State<AppState>, webhook_url: String) -> Result<Value, String> {
+fn save_notify_config(
+    state: State<AppState>,
+    webhook_url: String,
+    push_enabled: Option<bool>,
+    push_time: Option<String>,
+) -> Result<Value, String> {
     let fp = state.fingerprint.clone();
     let (token, server) = {
         let s = state.inner.lock().unwrap();
@@ -407,7 +412,11 @@ fn save_notify_config(state: State<AppState>, webhook_url: String) -> Result<Val
     if token.is_empty() {
         return Err("尚未激活".into());
     }
-    let body = json!({ "webhookUrl": webhook_url });
+    let body = json!({
+        "webhookUrl": webhook_url,
+        "pushEnabled": push_enabled,
+        "pushTime": push_time.unwrap_or_default(),
+    });
     http_post(&api_url(&server, "/api/client/notify/config"), &fp, &token, &body)
 }
 
@@ -423,6 +432,25 @@ fn test_notify(state: State<AppState>) -> Result<Value, String> {
     }
     http_post(
         &api_url(&server, "/api/client/notify/test"),
+        &fp,
+        &token,
+        &json!({}),
+    )
+}
+
+/// 立即推送今日简报（每日定时推送的手动触发）
+#[tauri::command]
+fn test_push_daily(state: State<AppState>) -> Result<Value, String> {
+    let fp = state.fingerprint.clone();
+    let (token, server) = {
+        let s = state.inner.lock().unwrap();
+        (s.token.clone(), s.server_url.clone())
+    };
+    if token.is_empty() {
+        return Err("尚未激活".into());
+    }
+    http_post(
+        &api_url(&server, "/api/client/notify/push-test"),
         &fp,
         &token,
         &json!({}),
@@ -692,6 +720,7 @@ fn main() {
             fetch_notify_config,
             save_notify_config,
             test_notify,
+            test_push_daily,
             set_server,
             logout
         ])

@@ -927,6 +927,57 @@ def main():
     check("T28.11", "日常指令健壮性", "日志转抄保留授权号掩码（LIC-**** 不被抹掉）",
           (not lic_unmasked) and ("```" not in r), r[:40])
 
+    # ---------------- 29. 每日定时推送（服务端/集团/子酒店） ----------------
+    print("【29. 每日定时推送】")
+
+    # 服务端配置读写 + 时间校验
+    st, _ = req("POST", "/api/push/server-config", {"enabled": True, "time": "03:07"}, token=token)
+    st, c = req("GET", "/api/push/server-config", token=token)
+    ok_cfg = st == 200 and (c or {}).get("enabled") is True and (c or {}).get("time") == "03:07"
+    st, e = req("POST", "/api/push/server-config", {"enabled": True, "time": "25:00"}, token=token)
+    check("T29.1", "每日定时推送", "服务端推送配置读写 + 非法时间拒绝",
+          ok_cfg and st == 400, f"cfg={ok_cfg} bad={st}")
+
+    # 手动触发调度 tick：推一次成功，同日再触发不重复（幂等）
+    st, r1 = req("POST", "/api/push/run", {"time": "03:07", "force": True}, token=token)
+    pushed1 = [x for x in ((r1 or {}).get("pushed") or []) if x.get("scope") == "server"]
+    st, r2 = req("POST", "/api/push/run", {"time": "03:07"}, token=token)
+    pushed2 = [x for x in ((r2 or {}).get("pushed") or []) if x.get("scope") == "server"]
+    check("T29.2", "每日定时推送", "到点推送成功且当日幂等（不重复推）",
+          len(pushed1) == 1 and len(pushed2) == 0,
+          f"第一次={len(pushed1)} 第二次={len(pushed2)}")
+
+    # 服务端异常汇总内容接地（真实编码 + 异常分类）
+    st, t = req("POST", "/api/push/server-test", {}, token=token)
+    pv = (t or {}).get("preview", "")
+    check("T29.3", "每日定时推送", "异常汇总内容接地（含真实编码与异常分类）",
+          st == 200 and "HT-00" in pv and ("已过期" in pv or "到期" in pv or "告警" in pv or "无异常" in pv),
+          pv[:40])
+
+    # 客户端推送设置（门店）：开关+时间保存回显 + 非法时间拒绝
+    st, _ = req("POST", "/api/client/notify/config",
+                {"webhookUrl": HOOK, "pushEnabled": True, "pushTime": "08:30"},
+                token=ctoken, headers={"X-Device-Fingerprint": FP})
+    st, c = req("GET", "/api/client/notify/config",
+                token=ctoken, headers={"X-Device-Fingerprint": FP})
+    ok_push = st == 200 and (c or {}).get("pushEnabled") is True and (c or {}).get("pushTime") == "08:30"
+    st, _ = req("POST", "/api/client/notify/config",
+                {"pushEnabled": True, "pushTime": "9点"},
+                token=ctoken, headers={"X-Device-Fingerprint": FP})
+    check("T29.4", "每日定时推送", "客户端推送开关/时间设置 + 非法时间拒绝",
+          ok_push and st == 400, f"cfg={ok_push} bad={st}")
+
+    # 客户端立即推送今日简报（接地：含本店编码）
+    st, p = req("POST", "/api/client/notify/push-test", {},
+                token=ctoken, headers={"X-Device-Fingerprint": FP})
+    pv2 = (p or {}).get("preview", "")
+    check("T29.5", "每日定时推送", "子酒店简报立即推送（内容含本店数据）",
+          st == 200 and (p or {}).get("ok") is True and "简报" in pv2 and "HT-" in pv2,
+          pv2[:40])
+
+    # 恢复默认（每天 9 点，保持开启）
+    req("POST", "/api/push/server-config", {"enabled": True, "time": "09:00"}, token=token)
+
     # ---------------- 19. 大模型接入（本地 Ollama/llama.cpp + 云端 API） ----------------
     print("【19. 大模型接入（本地+云端）】")
 

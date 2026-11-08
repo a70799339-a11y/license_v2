@@ -638,6 +638,8 @@ def group_renew(
 # ---------- 消息通知自助配置（门店/集团在客户端内配置自己的企微群 webhook） ----------
 class NotifyConfigReq(BaseModel):
     webhookUrl: str = ""
+    pushEnabled: Optional[bool] = None  # 每日定时推送开关（None=不修改）
+    pushTime: str = ""  # 推送时间 HH:MM（默认 09:00）
 
 
 @router.get("/notify/config")
@@ -650,12 +652,22 @@ def notify_config_get(
     if fingerprint and fingerprint != ctx.fingerprint:
         raise HTTPException(status_code=401, detail="设备指纹不一致")
     from .wecom import group_hooks, hotel_hook
+    from .push_daily import get_push_config
 
+    scope = "group" if ctx.scope == "group" else "hotel"
     if ctx.scope == "group":
         url = group_hooks(db).get(ctx.hotel_id, "")
     else:
         url = hotel_hook(db, ctx.hotel_id)
-    return {"scope": ctx.scope, "webhookUrl": url, "entityId": ctx.hotel_id}
+    cfg = get_push_config(db, scope, ctx.hotel_id)
+    return {
+        "scope": ctx.scope,
+        "webhookUrl": url,
+        "entityId": ctx.hotel_id,
+        "pushEnabled": cfg["enabled"],
+        "pushTime": cfg["time"],
+        "lastPushDate": cfg["lastPushDate"],
+    }
 
 
 @router.post("/notify/config")
@@ -665,15 +677,23 @@ def notify_config_set(
     fingerprint: str = Depends(get_fingerprint_header),
     db: Session = Depends(get_db),
 ):
-    """保存本实体的通知 webhook（只写自己的配置；域名白名单防 SSRF）"""
+    """保存本实体的通知 webhook + 每日推送设置（只写自己的配置；域名白名单防 SSRF）"""
     if fingerprint and fingerprint != ctx.fingerprint:
         raise HTTPException(status_code=401, detail="设备指纹不一致")
     from .wecom import set_group_hook, set_hotel_hook, validate_webhook_url
     from .masking import mask_text
+    from .push_daily import get_push_config, set_push_config, valid_hhmm
 
     url = (req.webhookUrl or "").strip()
     if url and not validate_webhook_url(url):
         raise HTTPException(status_code=400, detail="仅支持企业微信官方机器人 webhook（https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...）")
+    scope = "group" if ctx.scope == "group" else "hotel"
+    if req.pushEnabled is not None or req.pushTime:
+        t = (req.pushTime or "").strip() or get_push_config(db, scope, ctx.hotel_id)["time"]
+        if not valid_hhmm(t):
+            raise HTTPException(status_code=400, detail="推送时间格式应为 HH:MM（如 09:00）")
+        enabled = req.pushEnabled if req.pushEnabled is not None else get_push_config(db, scope, ctx.hotel_id)["enabled"]
+        set_push_config(db, scope, ctx.hotel_id, enabled=bool(enabled), push_time=t)
     if ctx.scope == "group":
         set_group_hook(db, ctx.hotel_id, url)
         target = f"集团:{ctx.hotel_id}"
@@ -685,11 +705,32 @@ def notify_config_set(
             operator=f"客户端({target})",
             action="配置企微通知",
             target=target,
-            detail=mask_text(f"webhook {url or '（已清空）'}"),
+            detail=mask_text(f"webhook {url or '（已清空）'}；每日推送 {'开' if (req.pushEnabled is not None and req.pushEnabled) else '保持'} {req.pushTime or ''}"),
         )
     )
     db.commit()
     return {"ok": True, "saved": bool(url)}
+
+
+@router.post("/notify/push-test")
+def notify_push_test(
+    ctx: ClientContext = Depends(get_client_context),
+    fingerprint: str = Depends(get_fingerprint_header),
+    db: Session = Depends(get_db),
+):
+    """立即生成并推送本实体今日日报（不影响每日定时；dry-run 时仅记录）"""
+    if fingerprint and fingerprint != ctx.fingerprint:
+        raise HTTPException(status_code=401, detail="设备指纹不一致")
+    from .push_daily import content_group, content_hotel, _push_one
+
+    if ctx.scope == "group":
+        content = content_group(db, ctx.hotel_id)
+    else:
+        content = content_hotel(db, ctx.hotel_id)
+    if not content:
+        raise HTTPException(status_code=404, detail="实体不存在")
+    r = _push_one(db, "group" if ctx.scope == "group" else "hotel", ctx.hotel_id, content)
+    return {"ok": True, "sent": r.get("sent"), "dryRun": r.get("dry_run"), "preview": content}
 
 
 @router.post("/notify/test")

@@ -720,6 +720,64 @@ def push_run(
     return {"ok": True, "pushed": pushed}
 
 
+# ---------- 长连接机器人推送目标（服务端汇报走主动发送，无需群 webhook） ----------
+class WsTargetReq(BaseModel):
+    chatid: str
+
+
+@app.get("/api/push/ws-target")
+def push_ws_target_get(db: Session = Depends(get_db), _: User = Depends(require_roles("admin", "operator"))):
+    import json
+
+    from .wecom import get_setting
+    from .wecom_ws import ws_status
+
+    last_chat = {}
+    try:
+        last_chat = json.loads(get_setting(db, "wecom_last_chat", "") or "{}")
+    except Exception:
+        pass
+    return {
+        "chatid": get_setting(db, "wecom_ws_push_chatid"),
+        "lastChat": last_chat,
+        "ws": ws_status(),
+    }
+
+
+@app.post("/api/push/ws-target")
+def push_ws_target_set(
+    req: WsTargetReq,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("admin")),
+):
+    from .wecom import set_setting
+
+    chatid = (req.chatid or "").strip()
+    if not chatid:
+        raise HTTPException(status_code=400, detail="chatid 不能为空")
+    set_setting(db, "wecom_ws_push_chatid", chatid)
+    write_log(db, user, "推送设置", "长连接机器人", f"绑定推送目标会话 {chatid[:8]}***")
+    db.commit()
+    return {"ok": True}
+
+
+@app.post("/api/push/ws-test")
+def push_ws_test(db: Session = Depends(get_db), user: User = Depends(require_roles("admin", "operator"))):
+    """向绑定会话真发一条测试消息（不走 dry-run，验证长连接主动发送链路）"""
+    from .push_daily import now_bj
+    from .wecom import get_setting
+    from .wecom_ws import ws_send_markdown
+
+    chatid = get_setting(db, "wecom_ws_push_chatid")
+    if not chatid:
+        raise HTTPException(status_code=400, detail="尚未绑定推送目标会话（先在群里 @机器人 发条消息，然后捕获绑定）")
+    content = f"✅ **推送链路测试**\n服务端每日汇报将发送到此会话。\n（{now_bj().strftime('%Y-%m-%d %H:%M')}）"
+    r = ws_send_markdown(chatid, content)
+    write_log(db, user, "推送测试", "长连接机器人", f"发送到 {chatid[:8]}*** → {'ok' if r.get('ok') else 'fail ' + (r.get('error') or '')[:40]}")
+    db.commit()
+    return {"ok": r.get("ok"), "error": r.get("error"), "detail": r.get("detail")}
+
+
 @app.get("/api/health")
 def health(db: Session = Depends(get_db)):
     """健康探活（免认证，供自监控/负载均衡使用）：数据库连通 + 企微长连接状态"""

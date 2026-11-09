@@ -250,6 +250,12 @@ export const api = {
     request<{ ok: boolean }>('/push/server-config', { method: 'POST', body: JSON.stringify({ enabled, time }) }),
   pushServerTest: () =>
     request<{ ok: boolean; sent: string[]; dryRun: boolean; preview: string }>('/push/server-test', { method: 'POST' }),
+  pushWsTarget: () =>
+    request<{ chatid: string; lastChat: Record<string, string>; ws: Record<string, unknown> }>('/push/ws-target'),
+  pushWsTargetSave: (chatid: string) =>
+    request<{ ok: boolean }>('/push/ws-target', { method: 'POST', body: JSON.stringify({ chatid }) }),
+  pushWsTest: () =>
+    request<{ ok: boolean; error: string; detail: string }>('/push/ws-test', { method: 'POST' }),
 
   // plans & stats
   listPlans: () => request<Plan[]>('/plans'),

@@ -15,6 +15,7 @@ onMounted(async () => {
     if (s.heartbeat_timeout_hours) graceHours.value = s.heartbeat_timeout_hours
     await loadWecom()
     await loadPushCfg()
+    await loadWsTarget()
     await loadLlmLogs()
     await loadLlmCfg()
   } finally {
@@ -121,6 +122,55 @@ async function testPushServer() {
     ElMessage.success(r.dryRun ? '异常汇总已生成（dry-run 未外发）' : `已推送：${r.sent.join(',')}`)
   } catch (e) {
     ElMessage.error(e instanceof Error ? e.message : '推送失败')
+  }
+}
+
+// ---------- 长连接机器人推送目标（在群里 @机器人 发条消息即可捕获会话 ID） ----------
+const wsTarget = ref({ chatid: '', lastChat: {} as Record<string, string>, wsOk: false })
+
+async function loadWsTarget() {
+  try {
+    const t = await api.pushWsTarget()
+    wsTarget.value = {
+      chatid: t.chatid || '',
+      lastChat: t.lastChat || {},
+      wsOk: Boolean((t.ws as Record<string, unknown>)?.authenticated),
+    }
+  } catch { /* 无权限时忽略 */ }
+}
+
+async function captureWsTarget() {
+  await loadWsTarget()
+  const lc = wsTarget.value.lastChat
+  if (lc && lc.chatid) {
+    wsTarget.value.chatid = lc.chatid
+    ElMessage.success(`已捕获最近会话：${lc.chatid.slice(0, 12)}…（来自 ${lc.userid || '未知用户'}，${lc.time || ''}）`)
+  } else {
+    ElMessage.warning('尚未捕获到会话：请在目标群里 @机器人 发一条消息后重试')
+  }
+}
+
+async function saveWsTarget() {
+  if (!wsTarget.value.chatid.trim()) {
+    ElMessage.warning('请先填写或捕获会话 ID（chatid）')
+    return
+  }
+  try {
+    await api.pushWsTargetSave(wsTarget.value.chatid.trim())
+    ElMessage.success('推送目标已绑定：服务端每日汇报将发送到该会话')
+    await loadWsTarget()
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '绑定失败')
+  }
+}
+
+async function testWsPush() {
+  try {
+    const r = await api.pushWsTest()
+    if (r.ok) ElMessage.success('测试消息已通过长连接机器人发送，请到群里查看')
+    else ElMessage.error(`发送失败：${r.error || r.detail || '未知'}`)
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '发送失败')
   }
 }
 
@@ -336,6 +386,18 @@ async function revokeWithReason(row: License) {
       <el-dialog v-model="pushPreviewShow" title="异常汇总预览" width="560px">
         <pre class="sim-reply">{{ pushPreview }}</pre>
       </el-dialog>
+      <div class="llm-cfg-row" style="margin-top: 12px">
+        <span class="muted small">汇报机器人（长连接）</span>
+        <el-input v-model="wsTarget.chatid" placeholder="会话 ID chatid（在群里 @机器人 发条消息后点「捕获」）" style="flex: 1" />
+        <el-button @click="captureWsTarget">捕获最近会话</el-button>
+        <el-button type="primary" @click="saveWsTarget">绑定</el-button>
+        <el-button @click="testWsPush">测试发送</el-button>
+        <el-tag v-if="wsTarget.wsOk" type="success" size="small">机器人在线</el-tag>
+        <el-tag v-else type="info" size="small">机器人离线</el-tag>
+      </div>
+      <p class="muted" style="font-size: 12px; margin: 4px 0 0">
+        绑定后服务端每日异常汇总通过长连接机器人主动发送到该会话（单聊填 userid / 群聊填群 chatid），无需配置群机器人 webhook。
+      </p>
     </div>
 
     <div class="card flow-card mb-20">

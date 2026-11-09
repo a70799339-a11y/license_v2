@@ -27,6 +27,8 @@ _STATUS = {
 _thread: threading.Thread | None = None
 _stop_event = threading.Event()
 _lock_fd = None  # 进程级互斥锁（保证全局只有一条企微长连接，防互踢）
+_ws_client = None  # 当前 WSClient 实例（主动发送消息用，send_message）
+_ws_loop = None  # 长连接线程的事件循环（跨线程投递协程）
 
 
 def _acquire_singleton() -> bool:
@@ -52,6 +54,54 @@ def _acquire_singleton() -> bool:
 
 def ws_status() -> dict:
     return dict(_STATUS)
+
+
+def _record_chat(body: dict) -> None:
+    """记录最近收到消息的会话信息（供后台一键捕获推送目标 chatid）"""
+    try:
+        import json
+
+        from .wecom import set_setting
+
+        info = {
+            "chatid": body.get("chatid") or body.get("chat_id") or "",
+            "userid": ((body.get("from") or {}) or {}).get("userid", ""),
+            "chat_type": body.get("chat_type", ""),
+            "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            "text": (((body.get("text") or {}) or {}).get("content") or "")[:50],
+            "bodyKeys": ",".join(list((body or {}).keys())[:12]),
+        }
+        set_setting(SessionLocal(), "wecom_last_chat", json.dumps(info, ensure_ascii=False))
+    except Exception:
+        pass
+
+
+def ws_send_markdown(chatid: str, content: str, timeout: int = 10) -> dict:
+    """线程安全：长连接机器人向指定会话主动推送 markdown 消息（无需回调帧）。
+    chatid：单聊填用户 userid，群聊填群 chatid。返回 {ok, error, detail}"""
+    global _ws_client, _ws_loop
+    if _ws_client is None or _ws_loop is None:
+        return {"ok": False, "error": "长连接未就绪"}
+    if not chatid:
+        return {"ok": False, "error": "chatid 为空"}
+    try:
+        fut = asyncio.run_coroutine_threadsafe(
+            _ws_client.send_message(
+                chatid, {"msgtype": "markdown", "markdown": {"content": content}}
+            ),
+            _ws_loop,
+        )
+        frame = fut.result(timeout=timeout)
+        detail = ""
+        try:
+            body = frame.get("body", {}) if isinstance(frame, dict) else {}
+            errcode = body.get("errcode")
+            detail = f"errcode={errcode}" if errcode is not None else str(frame)[:120]
+        except Exception:
+            detail = str(frame)[:120]
+        return {"ok": True, "error": "", "detail": detail}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:120], "detail": ""}
 
 
 def _load_env_file() -> dict:
@@ -105,12 +155,21 @@ def _run(bot_id: str, secret: str) -> None:
 
         @client.on("authenticated")
         def on_auth():
+            global _ws_client, _ws_loop
+            _ws_client = client
+            try:
+                _ws_loop = asyncio.get_running_loop()
+            except Exception:
+                pass
             _STATUS["authenticated"] = True
             _STATUS["last_error"] = ""
             _STATUS["started_at"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
         @client.on("disconnected")
         def on_disc(reason=""):
+            global _ws_client, _ws_loop
+            _ws_client = None
+            _ws_loop = None
             _STATUS["authenticated"] = False
             _STATUS["last_error"] = f"连接断开：{reason}"
 
@@ -136,6 +195,7 @@ def _run(bot_id: str, secret: str) -> None:
             _STATUS["msg_count"] += 1
             try:
                 body = frame.get("body", {}) or {}
+                _record_chat(body)  # 捕获会话信息（后台绑定推送目标用）
                 text = _strip_mention((body.get("text") or {}).get("content", ""))
                 userid = ((body.get("from") or {}).get("userid")) or "unknown"
                 print(f"[wecom] 收到消息 #{_STATUS['msg_count']} from={userid} text={text[:30]!r}", flush=True)

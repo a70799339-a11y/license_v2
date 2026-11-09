@@ -124,6 +124,23 @@ def push_message(db: Session, content: str, *, group_id: str = "", hotel_id: str
         record["sent"] = ["dry-run"]
         return record
 
+    # 服务端推送目标走长连接机器人主动发送（chatid 在后台绑定，无需群 webhook）
+    if not group_id and not hotel_id:
+        ws_chat = get_setting(db, "wecom_ws_push_chatid")
+        if ws_chat:
+            try:
+                from .wecom_ws import ws_send_markdown
+
+                r = ws_send_markdown(ws_chat, masked)
+                record["sent"].append(
+                    f"ws:{'ok' if r.get('ok') else 'fail ' + (r.get('error') or '')[:60]}"
+                )
+            except Exception as e:
+                record["sent"].append(f"ws:fail {str(e)[:60]}")
+            set_setting(db, "wecom_last_push", json.dumps(record, ensure_ascii=False)[:2000])
+            db.commit()
+            return record
+
     targets = []
     if push_enabled(db):
         if ops_webhook(db):

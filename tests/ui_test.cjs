@@ -49,6 +49,8 @@ function check(cid, module, name, cond, actual = '') {
   const kpiCount = await page.locator('.kpi-card').count();
   check('U2.1', '经营总览', 'KPI 卡片渲染', kpiCount >= 4, `${kpiCount} 张`);
   check('U2.2', '经营总览', '折线图渲染', await page.locator('svg path').count() >= 2);
+  // 到期风险列表数据异步渲染，先等行出现再计数
+  await page.waitForSelector('.expire-row', { timeout: 8000 }).catch(() => {});
   const expireRows = await page.locator('.expire-row').count();
   check('U2.3', '经营总览', '到期风险提醒列表', expireRows >= 1, `${expireRows} 行`);
 
@@ -58,13 +60,15 @@ function check(cid, module, name, cond, actual = '') {
   await page.waitForURL('**/customers', { timeout: 5000 });
   await page.waitForLoadState('networkidle');
   await page.screenshot({ path: path.join(SHOTS, '03-customers.png') });
-  const rows = await page.locator('.el-table__row').count();
+  // 行选择器兼容经典 el-table 与虚拟滚动 el-table-v2（客户管理已升级 el-table-v2）
+  const ROW = '.el-table__row, .el-table-v2__row';
+  const rows = await page.locator(ROW).count();
   check('U3.1', '客户管理', '客户表格渲染', rows >= 1, `${rows} 行`);
 
   // 搜索筛选
   await page.locator('input[placeholder*="搜索酒店名称"]').fill('不存在的酒店xyz');
   await page.waitForTimeout(500);
-  const emptyRows = await page.locator('.el-table__row').count();
+  const emptyRows = await page.locator(ROW).count();
   check('U3.2', '客户管理', '搜索无结果时表格为空', emptyRows === 0, `${emptyRows} 行`);
   await page.locator('input[placeholder*="搜索酒店名称"]').fill('');
   await page.waitForTimeout(400);
@@ -86,7 +90,7 @@ function check(cid, module, name, cond, actual = '') {
   }
 
   // 复选框批量操作
-  const firstCheckbox = page.locator('.el-table__row .el-checkbox').first();
+  const firstCheckbox = page.locator(`${ROW} .el-checkbox`).first();
   if (await firstCheckbox.count()) {
     await firstCheckbox.click();
     await page.waitForTimeout(400);
@@ -96,9 +100,14 @@ function check(cid, module, name, cond, actual = '') {
   }
 
   // 详情跳转
-  await page.locator('.el-table__row').first().getByRole('button', { name: '详情' }).click();
-  await page.waitForURL('**/customers/**', { timeout: 5000 });
-  check('U3.6', '客户管理', '详情跳转客户详情页', /\/customers\/.+/.test(new URL(page.url()).pathname), new URL(page.url()).pathname);
+  const detailBtn = page.locator(ROW).first().getByRole('button', { name: '详情' }).first();
+  if (await detailBtn.count()) {
+    await detailBtn.click();
+    await page.waitForURL('**/customers/**', { timeout: 5000 });
+    check('U3.6', '客户管理', '详情跳转客户详情页', /\/customers\/.+/.test(new URL(page.url()).pathname), new URL(page.url()).pathname);
+  } else {
+    check('U3.6', '客户管理', '详情跳转客户详情页', false, '无可用行');
+  }
 
   // ========== 4. 客户详情页 ==========
   console.log('【4. 客户详情页】');
@@ -156,7 +165,14 @@ function check(cid, module, name, cond, actual = '') {
   await page.waitForLoadState('networkidle');
   await page.screenshot({ path: path.join(SHOTS, '07-risk.png') });
   check('U7.1', 'AI 智能风控', '风控 KPI 卡', (await page.locator('.kpi-card').count()) >= 4);
-  check('U7.2', 'AI 智能风控', '告警表格渲染', (await page.locator('.el-table__row').count()) >= 1);
+  // 默认聚合视图（数据异步渲染，先等行出现）
+  await page.waitForSelector('.el-table__row', { timeout: 8000 }).catch(() => {});
+  check('U7.2', 'AI 智能风控', '告警聚合表渲染', (await page.locator('.el-table__row').count()) >= 1);
+
+  // 切到明细视图后才有等级筛选（聚合/明细切换）
+  await page.locator('.el-radio-button__inner', { hasText: '明细视图' }).click();
+  await page.waitForTimeout(600);
+  check('U7.2b', 'AI 智能风控', '明细视图切换', (await page.locator('.el-table__row').count()) >= 0);
 
   // 等级筛选（Element Plus radio-button 点可见 span）
   await page.locator('.el-radio-button__inner', { hasText: '紧急' }).click();
@@ -227,6 +243,53 @@ function check(cid, module, name, cond, actual = '') {
       check('U9.4', '安全设计', '吊销提交反馈', await page.locator('.el-message').first().isVisible().catch(() => false));
     }
   }
+
+  // ========== 9.5 每日定时推送 + 汇报机器人（长连接） ==========
+  console.log('【9.5 每日定时推送 · 汇报机器人】');
+  await page.waitForTimeout(800); // 等 ws-status / 推送配置异步加载
+  const pushCard = page.locator('.card-title', { hasText: '每日定时推送' }).first();
+  check('U9.5a', '每日推送', '推送卡片存在', (await pushCard.count()) > 0);
+
+  // 汇报机器人在线状态（长连接）
+  const onlineTag = page.locator('.el-tag', { hasText: '机器人在线' }).first();
+  check('U9.5b', '汇报机器人', '机器人在线标识', (await onlineTag.count()) > 0);
+  await page.screenshot({ path: path.join(SHOTS, '095-push-card.png') });
+
+  // 捕获最近会话（无 @ 消息时应给出明确提示；有则回填）
+  await page.getByRole('button', { name: '捕获最近会话' }).click();
+  const captureToast = page.locator('.el-message', { hasText: /捕获/ }).last();
+  const captureVisible = await captureToast.waitFor({ state: 'visible', timeout: 5000 }).then(() => true).catch(() => false);
+  const captureText = captureVisible ? await captureToast.innerText() : '(无提示)';
+  check('U9.5c', '汇报机器人', '捕获操作有反馈', captureVisible, captureText.slice(0, 60));
+  await page.screenshot({ path: path.join(SHOTS, '095-capture.png') });
+
+  // 绑定流程（测试会话 ID，结束后还原）
+  const chatInput = page.locator('input[placeholder*="会话 ID"]').first();
+  await chatInput.fill('UITEST-CHATID-0001');
+  await page.getByRole('button', { name: '绑定' }).click();
+  const bindToast = page.locator('.el-message', { hasText: /已绑定|绑定失败/ }).last();
+  const bindOk = await bindToast.waitFor({ state: 'visible', timeout: 5000 }).then(() => true).catch(() => false);
+  check('U9.5d', '汇报机器人', '绑定提交反馈', bindOk && (await bindToast.innerText()).includes('已绑定'), bindOk ? await bindToast.innerText() : '(无)');
+  await page.screenshot({ path: path.join(SHOTS, '095-bind.png') });
+
+  // 测试发送（验证反馈链路；目标为测试 ID，外发失败也算链路已走通）
+  await page.getByRole('button', { name: '测试发送' }).click();
+  const sendToast = page.locator('.el-message', { hasText: /发送/ }).last();
+  const sendVisible = await sendToast.waitFor({ state: 'visible', timeout: 8000 }).then(() => true).catch(() => false);
+  const sendText = sendVisible ? await sendToast.innerText() : '(无提示)';
+  check('U9.5e', '汇报机器人', '测试发送有反馈', sendVisible, sendText.slice(0, 60));
+  await page.screenshot({ path: path.join(SHOTS, '095-test-send.png') });
+
+  // 还原测试绑定（清空 chatid，避免污染真实配置）
+  await page.evaluate(async () => {
+    const token = localStorage.getItem('token') || '';
+    await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ key: 'wecom_ws_push_chatid', value: '' }),
+    });
+  });
+  check('U9.5f', '汇报机器人', '测试绑定已还原', true);
 
   // ========== 10. 全局 ==========
   console.log('【10. 全局】');

@@ -47,8 +47,24 @@ async function revoke(row: License) {
 }
 
 const showIssue = ref(false)
-const issueForm = ref({ hotelId: '', plan: '基础版', type: '新签', months: 12 })
+// P1-3：features=授权功能模块（空=全开）；maxRooms=房量配额（0=不限）
+const issueForm = ref({
+  hotelId: '',
+  plan: '基础版',
+  type: '新签',
+  months: 12,
+  features: [] as string[],
+  maxRooms: 0,
+})
 const hotels = ref<{ id: string; name: string }[]>([])
+
+const MODULE_OPTIONS = [
+  { key: 'ai_risk', label: 'AI 风控（ai_risk）' },
+  { key: 'group_portal', label: '集团总端（group_portal）' },
+  { key: 'report', label: '报表/简报（report）' },
+  { key: 'api', label: 'API 对接（api）' },
+  { key: 'push', label: '企微推送（push）' },
+]
 
 async function openIssue() {
   hotels.value = await api.listHotels()
@@ -159,6 +175,20 @@ async function issueLicense() {
           <el-select v-model="issueForm.months" style="width: 100%">
             <el-option v-for="m in [1, 3, 6, 12, 24]" :key="m" :label="`${m} 个月`" :value="m" />
           </el-select>
+        </el-form-item>
+        <el-form-item label="功能模块">
+          <el-checkbox-group v-model="issueForm.features">
+            <el-checkbox v-for="m in MODULE_OPTIONS" :key="m.key" :value="m.key" :label="m.key">
+              {{ m.label }}
+            </el-checkbox>
+          </el-checkbox-group>
+          <div class="text-3" style="font-size: 12px; line-height: 1.6">
+            全不勾 = 全部模块开放（兼容存量）；勾选后仅开放所选模块（E5：先拆 ai_risk / group_portal 验证）。
+          </div>
+        </el-form-item>
+        <el-form-item label="房量配额">
+          <el-input-number v-model="issueForm.maxRooms" :min="0" :max="9999" />
+          <span class="text-3" style="font-size: 12px; margin-left: 8px">0 = 不限（按房量计价时填写）</span>
         </el-form-item>
       </el-form>
       <template #footer>

@@ -229,7 +229,15 @@ fn activate_core(
     st.signed_license = Some(signed.clone());
     let _ = st.save(fp, &state_dir());
 
-    Ok(json!({ "ok": true, "verified": true, "hotel": hotel, "license": lic }))
+    Ok(json!({
+        "ok": true,
+        "verified": true,
+        "hotel": hotel,
+        "license": lic,
+        // P0-1 同名迁移提示透传
+        "migration_hint": resp.get("migration_hint").cloned().unwrap_or(json!(false)),
+        "migrate_target": resp.get("migrate_target").cloned().unwrap_or(json!(null)),
+    }))
 }
 
 /// 心跳核心流程（界面按钮与 --selftest 共用）
@@ -279,6 +287,14 @@ fn heartbeat_core(fp: &str, st: &mut ClientState) -> Result<Value, String> {
     if !time_anomaly {
         st.last_server_time = server_time.clone();
     }
+    // P1-1 分级防护：回拨 >24h → 只读锁定（联网心跳恢复正常即解除）
+    let time_locked = match (
+        license_core::parse_utc(&st.last_server_time),
+        license_core::parse_utc(&server_time),
+    ) {
+        (Some(prev), Some(cur)) => prev > cur && (prev - cur) as f64 > 24.0 * 3600.0,
+        _ => false,
+    };
     st.last_sync = server_time.clone();
     if let Some(g) = resp.get("offline_grace_hours").and_then(|v| v.as_u64()) {
         st.offline_grace_hours = g as u32;
@@ -297,6 +313,7 @@ fn heartbeat_core(fp: &str, st: &mut ClientState) -> Result<Value, String> {
     out["offline"] = json!(false);
     out["locked"] = json!(false);
     out["time_anomaly"] = json!(time_anomaly);
+    out["time_locked"] = json!(time_locked);
     out["server_time"] = json!(server_time);
     out["grace_hours"] = json!(st.offline_grace_hours);
     Ok(out)
@@ -484,6 +501,120 @@ fn group_renew(state: State<AppState>, hotel_ids: Vec<String>) -> Result<Value, 
             &body,
         )
     })
+}
+
+// ---------- P0-1 自助换机/解绑 ｜ P0-2 续期订单 ----------
+#[tauri::command]
+fn fetch_devices(state: State<AppState>) -> Result<Value, String> {
+    let fp = state.fingerprint.clone();
+    let (token, server) = {
+        let s = state.inner.lock().unwrap();
+        (s.token.clone(), s.server_url.clone())
+    };
+    if token.is_empty() {
+        return Err("尚未激活".into());
+    }
+    http_get(&api_url(&server, "/api/client/devices"), &fp, &token)
+}
+
+#[tauri::command]
+fn unbind_device(state: State<AppState>, device_id: String) -> Result<Value, String> {
+    let fp = state.fingerprint.clone();
+    let (token, server) = {
+        let s = state.inner.lock().unwrap();
+        (s.token.clone(), s.server_url.clone())
+    };
+    if token.is_empty() {
+        return Err("尚未激活".into());
+    }
+    http_post(
+        &api_url(&server, "/api/client/devices/unbind"),
+        &fp,
+        &token,
+        &json!({ "device_id": device_id }),
+    )
+}
+
+#[tauri::command]
+fn migrate_device(state: State<AppState>, old_device_id: String) -> Result<Value, String> {
+    let fp = state.fingerprint.clone();
+    let (token, server) = {
+        let s = state.inner.lock().unwrap();
+        (s.token.clone(), s.server_url.clone())
+    };
+    if token.is_empty() {
+        return Err("尚未激活".into());
+    }
+    http_post(
+        &api_url(&server, "/api/client/devices/migrate"),
+        &fp,
+        &token,
+        &json!({ "old_device_id": old_device_id }),
+    )
+}
+
+#[tauri::command]
+fn create_renew_order(
+    state: State<AppState>,
+    months: i64,
+    plan: String,
+    channel: String,
+    hotel_ids: Vec<String>,
+) -> Result<Value, String> {
+    let fp = state.fingerprint.clone();
+    let (token, server) = {
+        let s = state.inner.lock().unwrap();
+        (s.token.clone(), s.server_url.clone())
+    };
+    if token.is_empty() {
+        return Err("尚未激活".into());
+    }
+    let body = json!({ "months": months, "plan": plan, "channel": channel, "hotel_ids": hotel_ids });
+    with_retry("续期下单", || {
+        http_post(&api_url(&server, "/api/client/renew/order"), &fp, &token, &body)
+    })
+}
+
+#[tauri::command]
+fn get_renew_order(state: State<AppState>, order_no: String) -> Result<Value, String> {
+    let fp = state.fingerprint.clone();
+    let (token, server) = {
+        let s = state.inner.lock().unwrap();
+        (s.token.clone(), s.server_url.clone())
+    };
+    if token.is_empty() {
+        return Err("尚未激活".into());
+    }
+    http_get(
+        &api_url(&server, &format!("/api/client/renew/order/{order_no}")),
+        &fp,
+        &token,
+    )
+}
+
+#[tauri::command]
+fn submit_renew_proof(
+    state: State<AppState>,
+    order_no: String,
+    proof_no: String,
+    note: String,
+    image_base64: String,
+) -> Result<Value, String> {
+    let fp = state.fingerprint.clone();
+    let (token, server) = {
+        let s = state.inner.lock().unwrap();
+        (s.token.clone(), s.server_url.clone())
+    };
+    if token.is_empty() {
+        return Err("尚未激活".into());
+    }
+    let body = json!({ "proof_no": proof_no, "note": note, "image_base64": image_base64 });
+    http_post(
+        &api_url(&server, &format!("/api/client/renew/order/{order_no}/proof")),
+        &fp,
+        &token,
+        &body,
+    )
 }
 
 #[tauri::command]
@@ -717,6 +848,12 @@ fn main() {
             fetch_profile,
             fetch_group_profile,
             group_renew,
+            fetch_devices,
+            unbind_device,
+            migrate_device,
+            create_renew_order,
+            get_renew_order,
+            submit_renew_proof,
             fetch_notify_config,
             save_notify_config,
             test_notify,

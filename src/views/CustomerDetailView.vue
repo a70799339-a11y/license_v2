@@ -40,6 +40,18 @@ async function toggleAutoRenew(val: boolean) {
   await api.updateHotel(hotel.value.id, { autoRenew: val })
   ElMessage.success(val ? '已开启自动续期' : '已关闭自动续期')
 }
+
+// P0-1 误操作恢复（E2）：恢复已解绑/已迁移设备
+async function restoreDevice(deviceId: string) {
+  if (!hotel.value) return
+  await api.restoreDevice(hotel.value.id, deviceId)
+  detail.value = await api.hotelDetail(hotel.value.id)
+  ElMessage.success('设备已恢复绑定')
+}
+
+function unboundByText(u?: string) {
+  return u === 'self' ? '客户自助' : u === 'admin' ? '服务商' : u === 'migration' ? '同名迁移' : ''
+}
 </script>
 
 <template>
@@ -126,7 +138,23 @@ async function toggleAutoRenew(val: boolean) {
               </el-table-column>
               <el-table-column label="状态" width="90">
                 <template #default="{ row }">
-                  <el-tag :type="row.status === '在线' ? 'success' : 'info'" size="small">{{ row.status }}</el-tag>
+                  <el-tag :type="row.status === '在线' ? 'success' : row.status === '已解绑' || row.status === '已迁移' ? 'info' : 'info'" size="small">{{ row.status }}</el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="解绑来源" width="90">
+                <template #default="{ row }"><span class="text-3" style="font-size: 12px">{{ unboundByText(row.unboundBy) || '—' }}</span></template>
+              </el-table-column>
+              <el-table-column label="操作" width="90">
+                <template #default="{ row }">
+                  <el-button
+                    v-if="row.status === '已解绑' || row.status === '已迁移'"
+                    link
+                    type="primary"
+                    size="small"
+                    @click="restoreDevice(row.id)"
+                  >
+                    恢复
+                  </el-button>
                 </template>
               </el-table-column>
             </el-table>

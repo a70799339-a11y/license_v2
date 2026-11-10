@@ -76,6 +76,9 @@ class LicenseCreate(BaseModel):
     plan: str = "基础版"
     type: str = "新签"
     months: int = 12
+    # P1-3 模块/配额位：功能模块 key 列表（空=全开）；maxRooms 0=不限
+    features: list[str] = []
+    maxRooms: int = 0
 
 
 class RevokeRequest(BaseModel):
@@ -93,13 +96,26 @@ class LicenseOut(BaseModel):
     status: str
     devices: int
     maxDevices: int
+    features: list[str] = []
+    maxRooms: int = 0
 
     @classmethod
     def from_orm_model(cls, l):
+        import json as _json
+
+        feats: list[str] = []
+        try:
+            if l.features:
+                arr = _json.loads(l.features)
+                if isinstance(arr, list):
+                    feats = [str(x) for x in arr]
+        except Exception:
+            feats = []
         return cls(
             id=l.id, code=l.code, hotelName=l.hotel_name, plan=l.plan, type=l.type,
             issuedAt=l.issued_at, expireAt=l.expire_at, status=l.status,
             devices=l.devices, maxDevices=l.max_devices,
+            features=feats, maxRooms=l.max_rooms or 0,
         )
 
 
@@ -133,12 +149,15 @@ class DeviceOut(BaseModel):
     fingerprint: str
     lastActive: str
     status: str
+    unboundAt: str = ""
+    unboundBy: str = ""  # self / admin / migration
 
     @classmethod
     def from_orm_model(cls, d):
         return cls(
             id=d.id, name=d.name, os=d.os, fingerprint=d.fingerprint,
             lastActive=d.last_active, status=d.status,
+            unboundAt=d.unbound_at or "", unboundBy=d.unbound_by or "",
         )
 
 

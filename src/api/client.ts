@@ -102,6 +102,8 @@ export interface Device {
   fingerprint: string
   lastActive: string
   status: string
+  unboundAt?: string
+  unboundBy?: string
 }
 
 export interface AuditLog {
@@ -204,8 +206,14 @@ export const api = {
 
   // licenses
   listLicenses: () => request<License[]>('/licenses'),
-  createLicense: (data: { hotelId: string; plan?: string; type?: string; months?: number }) =>
-    request<License>('/licenses', { method: 'POST', body: JSON.stringify(data) }),
+  createLicense: (data: {
+    hotelId: string
+    plan?: string
+    type?: string
+    months?: number
+    features?: string[]
+    maxRooms?: number
+  }) => request<License>('/licenses', { method: 'POST', body: JSON.stringify(data) }),
   revokeLicense: (id: string, reason = '手动吊销') =>
     request<{ ok: boolean }>(`/licenses/${id}/revoke`, { method: 'POST', body: JSON.stringify({ reason }) }),
 
@@ -302,4 +310,77 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(data),
     }),
+
+  // P2-2 续期流失预测 + AI 跟进话术
+  renewalRisks: () =>
+    request<
+      Array<{
+        hotel_id: string
+        hotel_name: string
+        code: string
+        group: string
+        plan: string
+        expire_at: string
+        days_left: number
+        active_ratio: number
+        idle_days: number
+        unpaid_orders: number
+        auto_renew: boolean
+        risk: string
+        factors: string[]
+      }>
+    >('/renewal-risks'),
+  aiRenewScript: (hotelId: string) =>
+    request<{ ok: boolean; script: string; facts: string; audit: { status: string; model: string } }>(
+      '/ai/renew-script',
+      { method: 'POST', body: JSON.stringify({ hotelId }) }
+    ),
+
+  // P2-1 授权盘点
+  renewalAudit: () =>
+    request<{
+      summary: { total: number; idle: number; underused: number; suspect: number; empty: number }
+      idle: Array<{ hotel: string; code: string; idleDays: number; expireAt: string }>
+      underused: Array<{ hotel: string; code: string; activeRatio: number; devices: number }>
+      suspects: Array<{ hotel: string; alerts: Array<{ rule: string; detail: string; level: string }> }>
+      empty: Array<{ hotel: string; code: string; group: string }>
+    }>('/renewal-audit'),
+
+  // P0-2 续期订单（后台确认/驳回）
+  renewOrders: (status?: string) =>
+    request<
+      Array<{
+        id: number
+        orderNo: string
+        targetType: string
+        targetId: string
+        targetIds: string
+        targetName: string
+        plan: string
+        months: number
+        amount: number
+        channel: string
+        status: string
+        proofNo: string
+        proofNote: string
+        confirmedBy: string
+        rejectReason: string
+        createdAt: string
+        paidAt: string
+      }>
+    >(`/renew-orders${status ? `?status=${encodeURIComponent(status)}` : ''}`),
+  confirmRenewOrder: (id: number, note = '') =>
+    request<{ ok: boolean; renewed: string[] }>(`/renew-orders/${id}/confirm`, {
+      method: 'POST',
+      body: JSON.stringify({ note }),
+    }),
+  rejectRenewOrder: (id: number, reason = '') =>
+    request<{ ok: boolean }>(`/renew-orders/${id}/reject`, {
+      method: 'POST',
+      body: JSON.stringify({ reason }),
+    }),
+
+  // P0-1 设备恢复（E2 误操作恢复）
+  restoreDevice: (hotelId: string, deviceId: string) =>
+    request<{ ok: boolean }>(`/hotels/${hotelId}/devices/${deviceId}/restore`, { method: 'POST' }),
 }

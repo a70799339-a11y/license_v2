@@ -41,8 +41,8 @@ def norm_hhmm(v: str) -> str:
     return f"{int(hh):02d}:{int(mm):02d}"
 
 
-def _enabled(db: Session, prefix: str) -> bool:
-    return get_setting(db, f"{prefix}_enabled", "off") == "on"
+def _enabled(db: Session, prefix: str, default: str = "off") -> bool:
+    return get_setting(db, f"{prefix}_enabled", default) == "on"
 
 
 def _time(db: Session, prefix: str, default: str = "09:00") -> str:
@@ -213,19 +213,24 @@ def run_due_pushes(db: Session, now: datetime = None, force: bool = False) -> li
     day = t.strftime("%Y-%m-%d")
     pushed = []
 
-    scopes = [("server", "push_server", "")]
+    scopes = [("server", "push_server", ""), ("risk_weekly", "push_risk_weekly", "")]
     for g in db.query(Group).all():
         scopes.append(("group", f"push_group_{g.id}", g.id))
     for h in db.query(Hotel).filter(Hotel.status != "已停用").all():
         scopes.append(("hotel", f"push_hotel_{h.id}", h.id))
 
     for scope, prefix, eid in scopes:
-        if not _enabled(db, prefix):
+        if not _enabled(db, prefix, default="on" if scope == "risk_weekly" else "off"):
+            continue
+        # 周度流失周报仅周一到点（force 可任意日补推）
+        if scope == "risk_weekly" and not force and t.weekday() != 0:
             continue
         if _time(db, prefix) != hhmm or (not force and _last(db, prefix) == day):
             continue
         if scope == "server":
             content = content_server(db)
+        elif scope == "risk_weekly":
+            content = content_risk_weekly(db)
         elif scope == "group":
             content = content_group(db, eid)
         else:
@@ -261,3 +266,21 @@ def push_scheduler_loop(interval: int = 30) -> None:
         except Exception:
             pass
         _time.sleep(interval)
+
+
+def content_risk_weekly(db: Session) -> str:
+    """P2-2 周度流失预警（每周一推服务商）：高/紧急风险门店清单（数据直出）"""
+    from .renewal_risk import ranked_risks
+
+    rows = [r for r in ranked_risks(db) if r["risk"] in ("高", "紧急")]
+    if not rows:
+        return ""
+    lines = [f"**📋 续期流失周报**（{_today_bj()}）", f"高/紧急风险门店 **{len(rows)}** 家：", ""]
+    for r in rows[:15]:
+        marks = "；".join(r["factors"]) or "-"
+        lines.append(f"- **{r['hotel_name']}**（{r['code']}）[{r['risk']}] 到期 {r['expire_at']}｜{marks}")
+    if len(rows) > 15:
+        lines.append(f"- …另 {len(rows) - 15} 家见后台「到期续期工作台」")
+    lines.append("")
+    lines.append("建议本周内优先跟进高风险门店续期。")
+    return "\n".join(lines)

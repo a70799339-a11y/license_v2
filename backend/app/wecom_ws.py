@@ -23,6 +23,8 @@ _STATUS = {
     "last_error": "",
     "started_at": "",
     "msg_count": 0,
+    "last_frame_at": "",
+    "last_frame_cmd": "",
 }
 _thread: threading.Thread | None = None
 _stop_event = threading.Event()
@@ -56,24 +58,42 @@ def ws_status() -> dict:
     return dict(_STATUS)
 
 
-def _record_chat(body: dict) -> None:
-    """记录最近收到消息的会话信息（供后台一键捕获推送目标 chatid）"""
+def _record_chat(body: dict) -> bool:
+    """记录最近收到消息的会话信息（供后台一键捕获推送目标 chatid）。
+    心跳/认证回执等非会话帧不落库。返回是否成功记录。"""
     try:
         import json
 
         from .wecom import set_setting
 
+        chat = body.get("chat") if isinstance(body.get("chat"), dict) else {}
+        frm = body.get("from") if isinstance(body.get("from"), dict) else {}
+        chatid = (
+            body.get("chatid") or body.get("chat_id")
+            or (chat or {}).get("chatid") or (chat or {}).get("id") or ""
+        )
+        userid = frm.get("userid") or body.get("userid") or body.get("user_id") or ""
+        if not chatid and not userid:
+            return False  # 非会话帧（心跳 ack / 认证 ack 等），不覆盖已有捕获
+        text = (((body.get("text") or {}) or {}).get("content") or "")[:50]
         info = {
-            "chatid": body.get("chatid") or body.get("chat_id") or "",
-            "userid": ((body.get("from") or {}) or {}).get("userid", ""),
-            "chat_type": body.get("chat_type", ""),
+            "chatid": str(chatid),
+            "userid": str(userid),
+            "chat_type": body.get("chattype") or body.get("chat_type") or (chat or {}).get("chat_type") or "",
             "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-            "text": (((body.get("text") or {}) or {}).get("content") or "")[:50],
+            "text": text,
+            "msgtype": str(body.get("msgtype") or ""),
             "bodyKeys": ",".join(list((body or {}).keys())[:12]),
         }
-        set_setting(SessionLocal(), "wecom_last_chat", json.dumps(info, ensure_ascii=False))
+        db = SessionLocal()
+        try:
+            set_setting(db, "wecom_last_chat", json.dumps(info, ensure_ascii=False))
+            db.commit()  # set_setting 不自带提交，必须显式 commit 才落库
+        finally:
+            db.close()
+        return True
     except Exception:
-        pass
+        return False
 
 
 def ws_send_markdown(chatid: str, content: str, timeout: int = 10) -> dict:
@@ -152,6 +172,29 @@ def _run(bot_id: str, secret: str) -> None:
                 max_reconnect_attempts=-1,  # 无限重连（服务常驻）
             )
         )
+
+        # 原始帧钩子：任何入站帧都先记录诊断信息 + 捕获会话（消息/事件均覆盖，
+        # 避免 SDK 分发层丢帧导致后台「捕获最近会话」拿不到数据）
+        orig_on_message = client._ws_manager.on_message
+
+        def _on_raw_frame(frame):
+            try:
+                body = (frame or {}).get("body", {}) or {}
+                _STATUS["last_frame_at"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                _STATUS["last_frame_cmd"] = str((frame or {}).get("cmd") or "")
+                recorded = _record_chat(body)
+                print(
+                    f"[wecom] 帧 cmd={_STATUS['last_frame_cmd']} "
+                    f"msgtype={body.get('msgtype')} keys={list(body.keys())[:10]} "
+                    f"捕获={'是' if recorded else '否'}",
+                    flush=True,
+                )
+            except Exception as e:
+                print(f"[wecom] 帧记录失败：{e}", flush=True)
+            if orig_on_message:
+                orig_on_message(frame)
+
+        client._ws_manager.on_message = _on_raw_frame
 
         @client.on("authenticated")
         def on_auth():

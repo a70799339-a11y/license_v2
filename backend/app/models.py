@@ -81,6 +81,9 @@ class License(Base):
     status = Column(String(16), default="生效中")
     devices = Column(Integer, default=0)
     max_devices = Column(Integer, default=30)
+    # P1-3 模块/配额位：功能模块 JSON（空=随 Plan.features）+ 按房量计价（0=不限）
+    features = Column(Text, default="")
+    max_rooms = Column(Integer, default=0)
 
 
 class Alert(Base):
@@ -118,7 +121,36 @@ class Device(Base):
     os = Column(String(128), default="")
     fingerprint = Column(String(128), default="")
     last_active = Column(String(32), default="")
-    status = Column(String(16), default="在线")
+    status = Column(String(16), default="在线")  # 在线/离线/已禁用/已解绑/已迁移（软删保留痕迹）
+    created_at = Column(String(32), default="")  # 首次激活时间（P1-2 激活速度检测用）
+    # P0-1 自助换机/解绑：解绑痕迹（软删，可后台恢复）
+    unbound_at = Column(String(32), default="")
+    unbound_by = Column(String(16), default="")  # self=客户自助 / admin=服务商 / migration=同名迁移
+
+
+class RenewOrder(Base):
+    """P0-2 续期自助化订单（状态机：待支付→已支付→已生效；待支付→已关闭/待确认→已生效/已驳回）"""
+
+    __tablename__ = "renew_orders"
+    id = Column(Integer, primary_key=True, index=True)
+    order_no = Column(String(32), unique=True, nullable=False, index=True)  # RO-YYYYMMDD-xxxxxx
+    target_type = Column(String(8), default="hotel")  # hotel / group
+    target_id = Column(String(16), index=True, nullable=False)
+    target_ids = Column(Text, default="")  # 集团批量单：门店 ID 逗号分隔；单店单同 target_id
+    target_name = Column(String(128), default="")
+    plan = Column(String(16), default="")  # 续期套餐（升级时为目标套餐）
+    months = Column(Integer, default=12)
+    amount = Column(Float, default=0)  # 服务端计算，客户端只展示
+    channel = Column(String(16), default="transfer")  # transfer=对公凭证 / wxpay=微信支付（预留）
+    status = Column(String(16), default="待支付")  # 待支付/已支付/已生效/待确认/已驳回/已关闭
+    proof_no = Column(String(64), default="")  # 对公汇款回单号
+    proof_note = Column(String(256), default="")
+    proof_file = Column(String(256), default="")  # 回单图片落盘路径（uploads/renew_proof/）
+    paid_at = Column(String(32), default="")
+    confirmed_by = Column(String(64), default="")  # 后台确认人（对公）
+    reject_reason = Column(String(256), default="")
+    created_at = Column(String(32), default="")
+    closed_at = Column(String(32), default="")
 
 
 class Setting(Base):

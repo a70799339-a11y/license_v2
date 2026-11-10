@@ -356,9 +356,14 @@ def main():
     # 恢复默认 72
     req("POST", "/api/settings", {"key": "heartbeat_timeout_hours", "value": "72"}, token=token)
 
+    # 激活响应含宽限时长（自建店自足：HT-0002 等演示店授权会被 UI 吊销流程动到，不作依赖）
+    st, hp13 = req("POST", "/api/hotels",
+                   {"name": f"测试店宽限{ts}", "code": f"HT-P13{ts}", "plan": "基础版"}, token)
+    st, lc13 = req("POST", "/api/licenses",
+                   {"hotelId": (hp13 or {}).get("id"), "plan": "基础版", "months": 12}, token)
     st, p = req("POST", "/api/client/activate",
-                {"licenseCode": "HT-0002", "deviceName": "宽限激活测试", "clientVersion": "0.1.0"},
-                headers={"X-Device-Fingerprint": "c3" * 32})
+                {"licenseCode": (lc13 or {}).get("code"), "deviceName": "宽限激活测试", "clientVersion": "0.1.0"},
+                headers={"X-Device-Fingerprint": (f"{ts:08x}" + "c3" * 28)[:64]})
     check("T13.3", "离线宽限", "激活响应含宽限时长", st == 200
           and (p or {}).get("offline_grace_hours") == 72, f"grace={(p or {}).get('offline_grace_hours')}")
 
@@ -1142,6 +1147,210 @@ def main():
     check("T23.3", "检索中提示", "未绑定用户快速提示（不进慢路径）",
           (p or {}).get("ackSent") is False and "尚未绑定" in (p or {}).get("reply", ""),
           f"ackSent={(p or {}).get('ackSent')}")
+
+    # ---------------- 30. 自助换机/解绑（P0-1） ----------------
+    print("【30. 自助换机/解绑】")
+    p0_code = f"HT-P0A{ts}"
+    st, p = req("POST", "/api/hotels",
+                {"name": f"测试店换机{ts}", "code": p0_code, "group": "测试集团", "city": "测试市", "plan": "专业版"},
+                token)
+    p0_id = (p or {}).get("id")
+    st, lic = req("POST", "/api/licenses", {"hotelId": p0_id, "plan": "专业版", "months": 12}, token)
+    p0_lic = (lic or {}).get("code")
+
+    # 先复位离线阈值（防上一轮残留污染），再测默认 30 分钟行为
+    req("POST", "/api/settings", {"key": "unbind_offline_minutes", "value": "30"}, token=token)
+
+    # 激活 5 台设备（A=本机视角，B/C/D/E 其他机器）；指纹随 ts 唯一防跨轮撞车
+    u6 = f"{ts:08x}"
+    fpA, fpB, fpC, fpD, fpE, fpG = (
+        "a1" * 28 + u6, "b2" * 28 + u6, "c7" * 28 + u6,
+        "d4" * 28 + u6, "e5" * 28 + u6, "g7" * 28 + u6,
+    )
+    devs = {}
+    for fpx, dname in ((fpA, "前台-01"), (fpB, "前台-02"), (fpC, "前台-03"), (fpD, "前台-04"), (fpE, "前台-05")):
+        st, ap = req("POST", "/api/client/activate",
+                     {"licenseCode": p0_lic, "deviceName": dname, "os_name": "testos"},
+                     headers={"X-Device-Fingerprint": fpx})
+        devs[fpx] = ((ap or {}).get("token") or "", (ap or {}).get("migrate_target") or {})
+    tokA = devs[fpA][0]
+
+    st, dl = req("GET", "/api/client/devices", token=tokA, headers={"X-Device-Fingerprint": fpA})
+    n_dev = len((dl or {}).get("devices") or [])
+    check("T30.1", "自助换机", "设备清单含 5 台且今日配额=3",
+          st == 200 and n_dev == 5 and (dl or {}).get("quota_left_today") == 3,
+          f"devices={n_dev} quota={(dl or {}).get('quota_left_today')}")
+
+    def _dev_id(fp):
+        return next((d["id"] for d in (dl or {}).get("devices") or [] if d["fingerprint"] == fp), "")
+
+    # 默认阈值 30 分钟：刚激活的 B 在线 → 解绑拒绝
+    bid = _dev_id(fpB)
+    st, up = req("POST", "/api/client/devices/unbind", {"device_id": bid},
+                 token=tokA, headers={"X-Device-Fingerprint": fpA})
+    check("T30.2", "自助换机", "在线设备解绑被拒（防误拆在用机器）",
+          st == 409, f"HTTP {st} {(up or {}).get('detail', '')[:30]}")
+
+    # 测试把离线阈值调 0（settings 可配），验证成功路径
+    req("POST", "/api/settings", {"key": "unbind_offline_minutes", "value": "0"}, token=token)
+
+    st, up = req("POST", "/api/client/devices/unbind", {"device_id": bid},
+                 token=tokA, headers={"X-Device-Fingerprint": fpA})
+    check("T30.3", "自助换机", "自助解绑成功并释放配额",
+          st == 200 and (up or {}).get("ok") is True and (up or {}).get("quota_left_today") == 2,
+          f"HTTP {st} quota={(up or {}).get('quota_left_today')}")
+
+    st, up = req("POST", "/api/client/devices/unbind", {"device_id": _dev_id(fpA)},
+                 token=tokA, headers={"X-Device-Fingerprint": fpA})
+    check("T30.4", "自助换机", "解绑本机被拒", st == 400, f"HTTP {st}")
+
+    # 同名迁移（重装系统）：新机 G 与 E 同名 → 激活返回迁移提示 → 迁移接管
+    st, ap = req("POST", "/api/client/activate",
+                 {"licenseCode": p0_lic, "deviceName": "前台-05", "os_name": "testos"},
+                 headers={"X-Device-Fingerprint": fpG})
+    tokG = (ap or {}).get("token") or ""
+    hint = (ap or {}).get("migration_hint") is True
+    tgt = ((ap or {}).get("migrate_target") or {}).get("id", "")
+    check("T30.5", "自助换机", "同名离线设备激活返回迁移提示", hint and bool(tgt), f"hint={hint} tgt={tgt}")
+
+    if tgt:
+        st, mg = req("POST", "/api/client/devices/migrate", {"old_device_id": tgt},
+                     token=tokG, headers={"X-Device-Fingerprint": fpG})
+        check("T30.6", "自助换机", "同名迁移成功（旧设备置已迁移）",
+              st == 200 and (mg or {}).get("ok") is True, f"HTTP {st}")
+    else:
+        check("T30.6", "自助换机", "同名迁移成功（旧设备置已迁移）", False, "无迁移目标")
+
+    # 日限 3 次：解绑 C（第 3 次）成功，解绑 D（第 4 次）429
+    cid, did = _dev_id(fpC), _dev_id(fpD)
+    st3, _ = req("POST", "/api/client/devices/unbind", {"device_id": cid},
+                 token=tokA, headers={"X-Device-Fingerprint": fpA})
+    st4, p4 = req("POST", "/api/client/devices/unbind", {"device_id": did},
+                  token=tokA, headers={"X-Device-Fingerprint": fpA})
+    check("T30.7", "自助换机", "每日 3 次上限，第 4 次 429",
+          st3 == 200 and st4 == 429, f"3rd={st3} 4th={st4}")
+
+    # 后台恢复（E2）：把已解绑的 B 恢复
+    st, rr = req("POST", f"/api/hotels/{p0_id}/devices/{bid}/restore", {}, token=token)
+    st2, dl2 = req("GET", "/api/client/devices", token=tokA, headers={"X-Device-Fingerprint": fpA})
+    b_status = next((d["status"] for d in (dl2 or {}).get("devices") or [] if d["id"] == bid), "")
+    check("T30.8", "自助换机", "后台恢复设备（E2 误操作恢复）",
+          st == 200 and b_status == "离线", f"HTTP {st} status={b_status}")
+
+    # 还原阈值
+    req("POST", "/api/settings", {"key": "unbind_offline_minutes", "value": "30"}, token=token)
+
+    # ---------------- 31. 续期自助化订单（P0-2） ----------------
+    print("【31. 续期自助化订单】")
+    st, od = req("POST", "/api/client/renew/order", {"months": 12, "plan": "", "channel": "transfer"},
+                 token=tokA, headers={"X-Device-Fingerprint": fpA})
+    o_no = (od or {}).get("order_no", "")
+    check("T31.1", "续期订单", "创建续期订单（金额服务端计算）",
+          st == 200 and o_no.startswith("RO-") and (od or {}).get("amount", 0) > 0,
+          f"no={o_no} amount={(od or {}).get('amount')}")
+
+    st, _ = req("POST", "/api/client/renew/order", {"months": 6},
+                token=tokA, headers={"X-Device-Fingerprint": fpA})
+    check("T31.2", "续期订单", "非法时长拒绝（仅 12/24 个月）", st == 400, f"HTTP {st}")
+
+    st, od2 = req("POST", "/api/client/renew/order", {"months": 12, "plan": "旗舰版"},
+                  token=tokA, headers={"X-Device-Fingerprint": fpA})
+    up_amount = (od2 or {}).get("amount", 0)
+    base_amount = (od or {}).get("amount", 0)
+    check("T31.3", "续期订单", "升级套餐按目标套餐计价（升级价 ≥ 同档价）",
+          st == 200 and up_amount >= base_amount, f"base={base_amount} upgrade={up_amount}")
+
+    st, pf = req("POST", f"/api/client/renew/order/{o_no}/proof", {"proof_no": ""},
+                 token=tokA, headers={"X-Device-Fingerprint": fpA})
+    check("T31.4", "续期订单", "空回单号提交凭证拒绝", st == 400, f"HTTP {st}")
+
+    st, pf = req("POST", f"/api/client/renew/order/{o_no}/proof",
+                 {"proof_no": f"BK{ts}", "note": "回归测试汇款"},
+                 token=tokA, headers={"X-Device-Fingerprint": fpA})
+    st2, os_ = req("GET", f"/api/client/renew/order/{o_no}",
+                   token=tokA, headers={"X-Device-Fingerprint": fpA})
+    check("T31.5", "续期订单", "提交凭证进入待确认",
+          st == 200 and (os_ or {}).get("status") == "待确认", f"status={(os_ or {}).get('status')}")
+
+    # 后台确认到账 → 生效并顺延到期日（列表不过滤状态，避免中文查询参数编码问题）
+    st, ros = req("GET", "/api/renew-orders", token=token)
+    target = next((o for o in (ros or []) if isinstance(o, dict) and o.get("orderNo") == o_no), None)
+    st, cf = req("POST", f"/api/renew-orders/{(target or {}).get('id')}/confirm", {}, token=token)
+    st2, os2 = req("GET", f"/api/client/renew/order/{o_no}",
+                   token=tokA, headers={"X-Device-Fingerprint": fpA})
+    check("T31.6", "续期订单", "后台确认到账后订单生效",
+          st == 200 and (os2 or {}).get("status") == "已生效" and len((cf or {}).get("renewed") or []) == 1,
+          f"status={(os2 or {}).get('status')} renewed={(cf or {}).get('renewed')}")
+
+    # 驳回路径
+    o2_no = (od2 or {}).get("order_no", "")
+    req("POST", f"/api/client/renew/order/{o2_no}/proof", {"proof_no": f"BK2{ts}"},
+        token=tokA, headers={"X-Device-Fingerprint": fpA})
+    st, ros2 = req("GET", "/api/renew-orders", token=token)
+    t2 = next((o for o in (ros2 or []) if isinstance(o, dict) and o.get("orderNo") == o2_no), None)
+    st, _ = req("POST", f"/api/renew-orders/{(t2 or {}).get('id')}/reject", {"reason": "凭证未核实"}, token=token)
+    st2, os3 = req("GET", f"/api/client/renew/order/{o2_no}",
+                   token=tokA, headers={"X-Device-Fingerprint": fpA})
+    check("T31.7", "续期订单", "凭证不实订单可驳回（含原因）",
+          st == 200 and (os3 or {}).get("status") == "已驳回", f"status={(os3 or {}).get('status')}")
+
+    # ---------------- 32. 模块/配额位（P1-3） ----------------
+    print("【32. 模块/配额位】")
+    st, lic3 = req("POST", "/api/licenses",
+                   {"hotelId": p0_id, "plan": "旗舰版", "months": 12,
+                    "features": ["ai_risk", "group_portal"], "maxRooms": 120}, token)
+    f3 = (lic3 or {}).get("features") or []
+    check("T32.1", "模块配额", "发放授权携带模块位与房量配额",
+          st == 200 and set(f3) == {"ai_risk", "group_portal"} and (lic3 or {}).get("maxRooms") == 120,
+          f"features={f3} rooms={(lic3 or {}).get('maxRooms')}")
+
+    # 激活拿到签名 License 载荷（客户端据此开关功能）
+    fpH = "h8" * 28 + u6
+    st, ap3 = req("POST", "/api/client/activate",
+                  {"licenseCode": (lic3 or {}).get("code"), "deviceName": "模块测试机", "os_name": "testos"},
+                  headers={"X-Device-Fingerprint": fpH})
+    payload = ((ap3 or {}).get("signed_license") or {}).get("payload") or {}
+    feats = payload.get("features") or []
+    quotas = payload.get("quotas") or {}
+    check("T32.2", "模块配额", "License 签名载荷下发模块位与配额",
+          set(feats) == {"ai_risk", "group_portal"} and quotas.get("max_rooms") == 120,
+          f"features={feats} quotas={quotas}")
+
+    # 未配置模块位 = 全开（兼容存量）
+    st, lic4 = req("POST", "/api/licenses", {"hotelId": p0_id, "plan": "基础版", "months": 1}, token)
+    fpI = "i9" * 28 + u6
+    st, ap4 = req("POST", "/api/client/activate",
+                  {"licenseCode": (lic4 or {}).get("code"), "deviceName": "全开测试机", "os_name": "testos"},
+                  headers={"X-Device-Fingerprint": fpI})
+    feats4 = (((ap4 or {}).get("signed_license") or {}).get("payload") or {}).get("features") or []
+    check("T32.3", "模块配额", "未配置模块位默认全开（存量兼容）",
+          set(feats4) == {"ai_risk", "group_portal", "report", "api", "push"}, f"features={feats4}")
+
+    # ---------------- 33. 流失预测与授权盘点（P2） ----------------
+    print("【33. 流失预测与授权盘点】")
+    st, rk = req("GET", "/api/renewal-risks", token=token)
+    ok_risk = st == 200 and isinstance(rk, list) and len(rk) > 0 and all(
+        "risk" in x and "factors" in x for x in (rk or [])[:5])
+    check("T33.1", "流失预测", "流失风险排行返回风险档与因子", ok_risk, f"HTTP {st} n={len(rk or [])}")
+
+    st, ad = req("GET", "/api/renewal-audit", token=token)
+    ok_audit = st == 200 and all(k in ((ad or {}).get("summary") or {}) for k in ("idle", "underused", "suspect", "empty"))
+    check("T33.2", "授权盘点", "授权盘点聚合（闲置/半闲置/超装/空壳）", ok_audit, f"HTTP {st}")
+
+    st, sc = req("POST", "/api/ai/renew-script", {"hotelId": p0_id}, token=token)
+    ok_script = st == 200 and len((sc or {}).get("script") or "") > 20
+    check("T33.3", "流失预测", "续期跟进话术生成（模型失败降级模板）",
+          ok_script and bool((sc or {}).get("facts", "")), (sc or {}).get("script", "")[:30])
+
+    # 周度流失周报：造一家明日到期酒店（days<=7 → 高风险）→ force 推送命中 risk_weekly
+    tmr = (datetime.utcnow() + timedelta(days=1)).strftime("%Y-%m-%d")
+    req("PATCH", f"/api/hotels/{p0_id}", {"expireAt": tmr}, token=token)
+    req("POST", "/api/settings", {"key": "push_risk_weekly_time", "value": "03:07"}, token=token)
+    st, pr = req("POST", "/api/push/run", {"time": "03:07", "force": True}, token=token)
+    weekly = [x for x in ((pr or {}).get("pushed") or []) if x.get("scope") == "risk_weekly"]
+    check("T33.4", "流失预测", "周度流失周报到点推送（含高风险门店）",
+          st == 200 and len(weekly) >= 1, f"weekly={len(weekly)}")
+    req("POST", "/api/settings", {"key": "push_risk_weekly_time", "value": "09:00"}, token=token)
 
     # 还原模型配置（测试改动不污染环境；apiKey 空串=不修改已有 Key）
     req("POST", "/api/ai/config", llm_snapshot, token=token)

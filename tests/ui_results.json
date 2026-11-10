@@ -1,8 +1,8 @@
 {
   "target": "http://localhost",
-  "time": "2026/11/3 13:38:10",
-  "total": 38,
-  "passed": 38,
+  "time": "2026/11/10 09:06:25",
+  "total": 43,
+  "passed": 43,
   "failed": 0,
   "pass_rate": "100.0%",
   "results": [
@@ -46,14 +46,14 @@
       "module": "经营总览",
       "name": "到期风险提醒列表",
       "pass": true,
-      "actual": "16 行"
+      "actual": "12 行"
     },
     {
       "id": "U3.1",
       "module": "客户管理",
       "name": "客户表格渲染",
       "pass": true,
-      "actual": "5 行"
+      "actual": "12 行"
     },
     {
       "id": "U3.2",
@@ -73,13 +73,6 @@
       "id": "U3.4",
       "module": "客户管理",
       "name": "新增客户提交反馈",
-      "pass": true,
-      "actual": ""
-    },
-    {
-      "id": "U3.5",
-      "module": "客户管理",
-      "name": "勾选行出现批量操作栏",
       "pass": true,
       "actual": ""
     },
@@ -163,7 +156,14 @@
     {
       "id": "U7.2",
       "module": "AI 智能风控",
-      "name": "告警表格渲染",
+      "name": "告警聚合表渲染",
+      "pass": true,
+      "actual": ""
+    },
+    {
+      "id": "U7.2b",
+      "module": "AI 智能风控",
+      "name": "明细视图切换",
       "pass": true,
       "actual": ""
     },
@@ -172,14 +172,7 @@
       "module": "AI 智能风控",
       "name": "等级筛选生效",
       "pass": true,
-      "actual": "紧急 2 行"
-    },
-    {
-      "id": "U7.4",
-      "module": "AI 智能风控",
-      "name": "告警处置反馈",
-      "pass": true,
-      "actual": ""
+      "actual": "紧急 77 行"
     },
     {
       "id": "U8.1",
@@ -234,6 +227,48 @@
       "id": "U9.4",
       "module": "安全设计",
       "name": "吊销提交反馈",
+      "pass": true,
+      "actual": ""
+    },
+    {
+      "id": "U9.5a",
+      "module": "每日推送",
+      "name": "推送卡片存在",
+      "pass": true,
+      "actual": ""
+    },
+    {
+      "id": "U9.5b",
+      "module": "汇报机器人",
+      "name": "机器人在线标识",
+      "pass": true,
+      "actual": ""
+    },
+    {
+      "id": "U9.5c",
+      "module": "汇报机器人",
+      "name": "捕获操作有反馈",
+      "pass": true,
+      "actual": "已捕获最近会话：wrfUQmZQAAkI…（来自 wofUQmZQAAxbpGZmCZ8jO29OIHOdx4sw，20"
+    },
+    {
+      "id": "U9.5d",
+      "module": "汇报机器人",
+      "name": "绑定提交反馈",
+      "pass": true,
+      "actual": "推送目标已绑定：服务端每日汇报将发送到该会话"
+    },
+    {
+      "id": "U9.5e",
+      "module": "汇报机器人",
+      "name": "测试发送有反馈",
+      "pass": true,
+      "actual": "推送目标已绑定：服务端每日汇报将发送到该会话"
+    },
+    {
+      "id": "U9.5f",
+      "module": "汇报机器人",
+      "name": "测试绑定已还原",
       "pass": true,
       "actual": ""
     },

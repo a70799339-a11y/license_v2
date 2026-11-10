@@ -31,6 +31,13 @@ async def lifespan(app: FastAPI):
             "ALTER TABLE alerts ADD COLUMN IF NOT EXISTS handled_by VARCHAR(64) DEFAULT ''",
             "ALTER TABLE alerts ADD COLUMN IF NOT EXISTS handle_note VARCHAR(256) DEFAULT ''",
             "ALTER TABLE alerts ADD COLUMN IF NOT EXISTS handled_at VARCHAR(32) DEFAULT ''",
+            # P0-1/P1-2 设备自助换机痕迹 + 激活速度检测
+            "ALTER TABLE devices ADD COLUMN IF NOT EXISTS created_at VARCHAR(32) DEFAULT ''",
+            "ALTER TABLE devices ADD COLUMN IF NOT EXISTS unbound_at VARCHAR(32) DEFAULT ''",
+            "ALTER TABLE devices ADD COLUMN IF NOT EXISTS unbound_by VARCHAR(16) DEFAULT ''",
+            # P1-3 模块/配额位
+            "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS features TEXT DEFAULT ''",
+            "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS max_rooms INTEGER DEFAULT 0",
         ):
             db.execute(__import__("sqlalchemy").text(ddl))
         db.commit()
@@ -248,6 +255,9 @@ def create_license(req: LicenseCreate, db: Session = Depends(get_db), user: User
         plan=req.plan, type=req.type, issued_at=issued.strftime("%Y-%m-%d"),
         expire_at=expire.strftime("%Y-%m-%d"), status="生效中",
         devices=0, max_devices=PLAN_MAXDEV.get(req.plan, 30),
+        # P1-3 模块/配额位（features 空=全开）
+        features=__import__("json").dumps([f for f in (req.features or [])]) if req.features else "",
+        max_rooms=req.maxRooms or 0,
     )
     db.add(lic)
     h.expire_at = lic.expire_at
@@ -1093,6 +1103,271 @@ app.include_router(client_router)
 # ---------- 静态资源（前端构建产物） ----------
 import os
 from fastapi.responses import FileResponse
+# ---------- P0-2 续期订单（后台确认/驳回）+ P0-1 设备恢复（E2） ----------
+class RenewOrderConfirmReq(BaseModel):
+    note: str = ""
+
+
+class RenewOrderRejectReq(BaseModel):
+    reason: str = ""
+
+
+@app.get("/api/renew-orders")
+def list_renew_orders(
+    status: str = "",
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("admin", "operator")),
+):
+    from .models import RenewOrder
+
+    q = db.query(RenewOrder).order_by(RenewOrder.id.desc())
+    if status:
+        q = q.filter(RenewOrder.status == status)
+    return [
+        {
+            "id": o.id,
+            "orderNo": o.order_no,
+            "targetType": o.target_type,
+            "targetId": o.target_id,
+            "targetIds": o.target_ids,
+            "targetName": o.target_name,
+            "plan": o.plan,
+            "months": o.months,
+            "amount": o.amount,
+            "channel": o.channel,
+            "status": o.status,
+            "proofNo": o.proof_no,
+            "proofNote": o.proof_note,
+            "proofFile": o.proof_file,
+            "confirmedBy": o.confirmed_by,
+            "rejectReason": o.reject_reason,
+            "createdAt": o.created_at,
+            "paidAt": o.paid_at,
+        }
+        for o in q.limit(200).all()
+    ]
+
+
+@app.post("/api/renew-orders/{order_id}/confirm")
+def confirm_renew_order(
+    order_id: int,
+    req: RenewOrderConfirmReq = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("admin", "operator")),
+):
+    """确认到账并生效：目标门店（target_ids）续期 months 个月（自 max(今天,原到期日) 顺延）"""
+    from datetime import datetime as _dt
+    from datetime import timedelta as _td
+
+    from .models import RenewOrder
+
+    o = db.query(RenewOrder).filter(RenewOrder.id == order_id).first()
+    if o is None:
+        raise HTTPException(status_code=404, detail="订单不存在")
+    if o.status not in ("待确认", "待支付", "已支付"):
+        raise HTTPException(status_code=409, detail=f"订单状态为「{o.status}」，不可确认生效")
+
+    ids = [x for x in (o.target_ids or "").split(",") if x]
+    today = _dt.utcnow().date()
+    renewed = []
+    for h in db.query(Hotel).filter(Hotel.id.in_(ids or [""])).all():
+        try:
+            old = _dt.strptime(h.expire_at, "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            old = today
+        base = old if old > today else today
+        new_expire = (base + _td(days=30 * o.months)).strftime("%Y-%m-%d")
+        h.expire_at = new_expire
+        if h.status in ("即将到期", "已过期"):
+            h.status = "正常"
+        # 同步本店生效中授权的到期日
+        from .client_api import find_active_license
+
+        lic = find_active_license(db, h)
+        if lic is not None and lic.status != "已吊销":
+            lic.expire_at = new_expire
+            if o.plan:
+                lic.plan = o.plan
+        renewed.append(f"{h.name}→{new_expire}")
+
+    o.status = "已生效"
+    o.paid_at = o.paid_at or datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    o.confirmed_by = user.username
+    write_log(db, user, "续期订单确认", o.order_no, f"{o.months} 个月 · ¥{o.amount:.2f} · {'；'.join(renewed) or '无门店'}")
+    db.commit()
+    return {"ok": True, "renewed": renewed}
+
+
+@app.post("/api/renew-orders/{order_id}/reject")
+def reject_renew_order(
+    order_id: int,
+    req: RenewOrderRejectReq = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("admin", "operator")),
+):
+    from .models import RenewOrder
+
+    o = db.query(RenewOrder).filter(RenewOrder.id == order_id).first()
+    if o is None:
+        raise HTTPException(status_code=404, detail="订单不存在")
+    if o.status not in ("待确认", "待支付"):
+        raise HTTPException(status_code=409, detail=f"订单状态为「{o.status}」，不可驳回")
+    o.status = "已驳回"
+    o.reject_reason = (req.reason if req else "") or "凭证未核实"
+    write_log(db, user, "续期订单驳回", o.order_no, o.reject_reason)
+    db.commit()
+    return {"ok": True}
+
+
+@app.post("/api/hotels/{hotel_id}/devices/{device_id}/restore")
+def restore_device(
+    hotel_id: str,
+    device_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("admin", "operator")),
+):
+    """误操作恢复（E2）：把「已解绑/已迁移」设备恢复为离线状态并归还配额"""
+    d = (
+        db.query(Device)
+        .filter(Device.id == device_id, Device.hotel_id == hotel_id)
+        .first()
+    )
+    if d is None:
+        raise HTTPException(status_code=404, detail="设备不存在")
+    if d.status not in ("已解绑", "已迁移"):
+        raise HTTPException(status_code=409, detail=f"设备状态为「{d.status}」，无需恢复")
+    h = db.query(Hotel).filter(Hotel.id == hotel_id).first()
+    d.status = "离线"
+    d.unbound_at = ""
+    d.unbound_by = ""
+    if h is not None:
+        h.devices = (h.devices or 0) + 1
+    write_log(db, user, "恢复设备", f"{h.name if h else hotel_id}/{d.name}", f"设备 {d.id} 恢复绑定")
+    db.commit()
+    return {"ok": True}
+
+
+# ---------- P2-1 授权盘点 + P2-2 续期流失预测 ----------
+@app.get("/api/renewal-risks")
+def renewal_risks(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("admin", "operator")),
+):
+    """流失风险排行（低/中/高/紧急 + 因子），续期工作台按此排序置顶高风险"""
+    from .renewal_risk import ranked_risks
+
+    return ranked_risks(db)
+
+
+@app.get("/api/renewal-audit")
+def renewal_audit(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("admin", "operator")),
+):
+    """P2-1 授权盘点：闲置/半闲置/超装嫌疑/空壳门店（全部既有数据聚合）"""
+    from .renewal_risk import _active_ratio, _idle_days
+
+    hotels = db.query(Hotel).filter(Hotel.status != "已停用").all()
+    idle_list, underused_list, empty_list = [], [], []
+    for h in hotels:
+        active_devices = (
+            db.query(Device)
+            .filter(Device.hotel_id == h.id, Device.status.in_(["在线", "离线"]))
+            .count()
+        )
+        if active_devices == 0:
+            empty_list.append({"hotel": h.name, "code": h.code, "group": h.group})
+            continue
+        idle = _idle_days(db, h)
+        if idle >= 30:
+            idle_list.append({"hotel": h.name, "code": h.code, "idleDays": idle, "expireAt": h.expire_at})
+        ratio = _active_ratio(db, h)
+        if ratio < 0.3:
+            underused_list.append(
+                {"hotel": h.name, "code": h.code, "activeRatio": round(ratio, 2), "devices": h.devices}
+            )
+    # 超装嫌疑：未处置的共享/激活速度/并发激活告警
+    suspect_rows = (
+        db.query(Alert)
+        .filter(
+            Alert.rule.in_(["License 共享检测", "激活速度异常", "多设备并发激活", "频繁自助换机"]),
+            Alert.status != "已处置",
+        )
+        .all()
+    )
+    suspects = {}
+    for a in suspect_rows:
+        suspects.setdefault(a.hotel_name, []).append({"rule": a.rule, "detail": a.detail, "level": a.level})
+    return {
+        "summary": {
+            "total": len(hotels),
+            "idle": len(idle_list),
+            "underused": len(underused_list),
+            "suspect": len(suspects),
+            "empty": len(empty_list),
+        },
+        "idle": idle_list[:50],
+        "underused": underused_list[:50],
+        "suspects": [{"hotel": k, "alerts": v} for k, v in list(suspects.items())[:50]],
+        "empty": empty_list[:50],
+    }
+
+
+class RenewScriptReq(BaseModel):
+    hotelId: str
+
+
+@app.post("/api/ai/renew-script")
+def ai_renew_script(
+    req: RenewScriptReq,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("admin", "operator")),
+):
+    """P2-2 续期跟进话术生成：数据接地（数字来自 risk_score），模型只管表述；失败降级模板"""
+    from .llm_audit import llm_call
+    from .renewal_risk import risk_score
+
+    h = db.query(Hotel).filter(Hotel.id == req.hotelId).first()
+    if h is None:
+        raise HTTPException(status_code=404, detail="客户不存在")
+    r = risk_score(db, h)
+    facts = (
+        f"酒店 {h.name}（{h.code}，套餐 {h.plan}），到期日 {h.expire_at}（剩余 {r['days_left']} 天），"
+        f"近 30 天设备使用率 {r['active_ratio']:.0%}，最近心跳距今 {r['idle_days']} 天，"
+        f"风险档 {r['risk']}，因子：{'；'.join(r['factors']) or '无'}。"
+    )
+    template = (
+        f"{h.name} 您好，贵店授权将于 {h.expire_at} 到期（剩余 {r['days_left']} 天）。"
+        f"为避免影响前台正常使用，建议尽快办理续期。"
+        + ("近期贵店使用活跃，续期后可无缝衔接。" if r["active_ratio"] >= 0.5 else "如近期使用较少，也可沟通调整套餐。")
+        + "需要我发送续期办理方式吗？"
+    )
+    out = template
+    audit_status = "template"
+    model = "template"
+    try:
+        res = llm_call(
+            db,
+            source_type="admin",
+            source_id=user.username,
+            source_name="管理后台",
+            user_id=user.username,
+            scene="续期话术",
+            user_input=facts,
+            prompt=(
+                "你是酒店授权管理系统的续期顾问。基于以下事实数据写一段 80~120 字的企微续期跟进话术，"
+                "语气礼貌、给出明确行动建议；严禁编造数据之外的数字或承诺。\n" + facts
+            ),
+        )
+        if res.get("status") == "ok" and res.get("output"):
+            out = res["output"].strip()
+            audit_status = "ok"
+            model = res.get("model", "")
+    except Exception:
+        pass  # 模型失败降级模板（数据仍真实）
+    return {"ok": True, "script": out, "facts": facts, "audit": {"status": audit_status, "model": model}}
+
+
 static_dir = os.path.join(os.path.dirname(__file__), "..", "static")
 if os.path.isdir(static_dir):
     index_file = os.path.join(static_dir, "index.html")

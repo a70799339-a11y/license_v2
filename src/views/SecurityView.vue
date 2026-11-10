@@ -142,11 +142,12 @@ async function loadWsTarget() {
 async function captureWsTarget() {
   await loadWsTarget()
   const lc = wsTarget.value.lastChat
-  if (lc && lc.chatid) {
-    wsTarget.value.chatid = lc.chatid
-    ElMessage.success(`已捕获最近会话：${lc.chatid.slice(0, 12)}…（来自 ${lc.userid || '未知用户'}，${lc.time || ''}）`)
+  const id = (lc && (lc.chatid || lc.userid)) || ''
+  if (id) {
+    wsTarget.value.chatid = id
+    ElMessage.success(`已捕获最近会话：${id.slice(0, 12)}…（来自 ${lc.userid || '未知用户'}，${lc.time || ''}）`)
   } else {
-    ElMessage.warning('尚未捕获到会话：请在目标群里 @机器人 发一条消息后重试')
+    ElMessage.warning('尚未捕获到会话：请在目标群里 @机器人 发一条消息后重试（若已 @ 仍无数据，确认机器人已加入该群）')
   }
 }
 
@@ -277,6 +278,7 @@ const steps = [
 // 风控告警规则（与实时告警管道一一对应：检测点命中自动写入风控告警）
 const rules = [
   { rule: '多设备并发激活', level: '高', action: '实时告警 + 人工核查', on: true },
+  { rule: '激活速度异常', level: '高', action: '24h 内新建激活 ≥5 台 → 实时告警', on: true },
   { rule: '时间回滚', level: '高', action: '实时告警（客户端上报时钟异常）', on: true },
   { rule: '设备指纹变更', level: '高', action: '拒绝心跳 + 实时告警', on: true },
   { rule: '心跳中断', level: '中', action: '离线宽限超时锁定 + 告警', on: true },
@@ -284,6 +286,9 @@ const rules = [
   { rule: '吊销后使用', level: '紧急', action: '拒绝请求 + 实时告警', on: true },
   { rule: '无效激活尝试', level: '中', action: '实时告警', on: true },
   { rule: '设备数超限', level: '中', action: '拒绝激活 + 实时告警', on: true },
+  { rule: '自助换机', level: '中', action: '客户自助解绑/迁移 → 告警留痕（可后台恢复）', on: true },
+  { rule: '频繁自助换机', level: '高', action: '7 天 ≥3 次 → 升「高」+ 企微推送', on: true },
+  { rule: '僵尸复活', level: '中', action: '离线 ≥90 天设备突然心跳 → 实时告警', on: true },
   { rule: '异地 IP 聚集', level: '中', action: '规则预留（下版本）', on: false },
   { rule: '客户端完整性校验', level: '紧急', action: '反调试门禁拒绝启动（已实现）', on: true },
 ]

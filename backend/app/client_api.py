@@ -25,7 +25,7 @@ router = APIRouter(prefix="/api/client", tags=["client"])
 client_security = HTTPBearer(auto_error=False)
 
 CLIENT_TOKEN_DAYS = 90
-CLIENT_VERSION = "0.2.1"  # 当前打包客户端版本；settings.client_version 为服务端要求的最新版
+CLIENT_VERSION = "1.2.2"  # 当前打包客户端版本；settings.client_version 为服务端要求的最新版
 
 
 # ---------- schemas ----------
@@ -311,6 +311,17 @@ def activate(
                 break
 
     if device is None:
+        # T38.1 并发防超卖：行锁串行化同店激活；populate_existing 强制刷新，
+        # 防 SQLAlchemy 身份映射返回旧 devices 值（check-then-act 失效根因）
+        locked = (
+            db.query(Hotel)
+            .filter(Hotel.id == hotel.id)
+            .with_for_update()
+            .populate_existing()
+            .first()
+        )
+        if locked is not None:
+            hotel = locked
         if hotel.devices >= hotel.max_devices and migrate_target is None:
             raise_alert(
                 db, level="中", rule="设备数超限", hotel_name=hotel.name,
@@ -508,7 +519,7 @@ def heartbeat(
     return {
         "scope": "hotel",
         "status": status,  # valid / expiring / revoked / expired / disabled
-        "plan": hotel.plan,
+        "plan": (lic.plan if lic and lic.plan else hotel.plan),  # F5：授权级套餐优先
         "expire_at": lic.expire_at if lic else "",
         "auto_renew": bool(hotel.auto_renew),
         "server_time": now_str,
@@ -1023,11 +1034,21 @@ def unbind_device(
         )
     _check_unbind_limits(db, hotel.id if hotel else d.hotel_id)
 
-    d.status = "已解绑"
-    d.unbound_at = _now_str()
-    d.unbound_by = "self"
-    if hotel and (hotel.devices or 0) > 0:
-        hotel.devices = hotel.devices - 1
+    # T38.2 并发防双解绑：条件更新（仅 在线/离线 → 已解绑）保证只有一个请求能改到行
+    won = (
+        db.query(Device)
+        .filter(Device.id == d.id, Device.status.in_(["在线", "离线"]))
+        .update(
+            {"status": "已解绑", "unbound_at": _now_str(), "unbound_by": "self"},
+            synchronize_session=False,
+        )
+    )
+    if not won:
+        raise HTTPException(status_code=409, detail=f"设备状态为「{d.status}」，不可解绑")
+    if hotel:
+        db.query(Hotel).filter(Hotel.id == hotel.id, Hotel.devices > 0).update(
+            {"devices": Hotel.devices - 1}, synchronize_session=False
+        )
     raise_alert(
         db, level="中", rule="自助换机", hotel_name=hotel.name if hotel else d.hotel_id,
         detail=f"客户自助解绑设备「{d.name}」（{d.id}），配额已释放",
@@ -1083,11 +1104,21 @@ def migrate_device(
         raise HTTPException(status_code=409, detail="旧设备仍在线活跃，暂不可迁移")
     _check_unbind_limits(db, hotel.id if hotel else d.hotel_id)
 
-    d.status = "已迁移"
-    d.unbound_at = _now_str()
-    d.unbound_by = "migration"
-    if hotel and (hotel.devices or 0) > 0:
-        hotel.devices = hotel.devices - 1
+    # T38.2 并发防重复迁移：条件更新（仅 在线/离线 → 已迁移）保证只有一个请求能改到行
+    won = (
+        db.query(Device)
+        .filter(Device.id == d.id, Device.status.in_(["在线", "离线"]))
+        .update(
+            {"status": "已迁移", "unbound_at": _now_str(), "unbound_by": "migration"},
+            synchronize_session=False,
+        )
+    )
+    if not won:
+        raise HTTPException(status_code=409, detail=f"设备状态为「{d.status}」，不可迁移")
+    if hotel:
+        db.query(Hotel).filter(Hotel.id == hotel.id, Hotel.devices > 0).update(
+            {"devices": Hotel.devices - 1}, synchronize_session=False
+        )
     raise_alert(
         db, level="中", rule="自助换机", hotel_name=hotel.name if hotel else d.hotel_id,
         detail=f"同名迁移：旧设备「{d.name}」({d.id}) 已由新机 {me.id} 接管",
@@ -1112,9 +1143,19 @@ def _plan_price(db: Session, plan_name: str, months: int) -> float:
     return round(yearly * months / 12.0, 2)
 
 
+def _order_ttl_hours(db: Session) -> float:
+    """待支付订单超时时长（小时），settings 可配（测试/运营调优用），默认 2"""
+    from .wecom import get_setting
+
+    try:
+        return max(0.0, float(get_setting(db, "renew_order_ttl_hours", str(RENEW_ORDER_TTL_HOURS))))
+    except (TypeError, ValueError):
+        return RENEW_ORDER_TTL_HOURS
+
+
 def _close_stale_orders(db: Session) -> None:
-    """惰性关单：待支付超 2 小时自动关闭"""
-    deadline = (datetime.utcnow() - timedelta(hours=RENEW_ORDER_TTL_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
+    """惰性关单：待支付超 TTL（默认 2 小时）自动关闭"""
+    deadline = (datetime.utcnow() - timedelta(hours=_order_ttl_hours(db))).strftime("%Y-%m-%d %H:%M:%S")
     stale = (
         db.query(RenewOrder)
         .filter(RenewOrder.status == "待支付", RenewOrder.created_at < deadline)

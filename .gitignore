@@ -26,3 +26,9 @@ tools/
 Thumbs.db
 .workbuddy/
 backend/wecom-ws.lock
+
+# 测试验收临时产物（含客户端 token/日志，不入库）
+tests/client-accept/_online_dev.json
+tests/client-accept/_realtime.txt
+tests/client-accept/client-stderr.log
+tests/client-accept/state.bin.bak

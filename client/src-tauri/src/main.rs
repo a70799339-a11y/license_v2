@@ -7,13 +7,13 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use license_core::{
-    anti_debug::is_debugger_present, device_fingerprint, is_time_rollback, offline_lock_state,
+    anti_debug::is_debugger_present, device_fingerprint, offline_lock_state,
     verify_license, ClientState,
 };
 use serde_json::{json, Value};
 use tauri::State;
 
-const CLIENT_VERSION: &str = "0.2.1";
+const CLIENT_VERSION: &str = "1.2.2";
 
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
@@ -197,11 +197,19 @@ fn activate_core(
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    st.plan = hotel
+    // F5 修复：套餐以授权级 plan 为准（酒店表 plan 与授权 plan 不一致时不再误导）
+    st.plan = lic
         .get("plan")
         .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            hotel
+                .get("plan")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        });
     st.expire_at = lic
         .get("expire_at")
         .and_then(|v| v.as_str())
@@ -243,6 +251,10 @@ fn activate_core(
 /// 心跳核心流程（界面按钮与 --selftest 共用）
 /// 网络失败不报错：返回 offline=true 并按宽限期给出锁定状态（超时禁用，联网恢复）
 fn heartbeat_core(fp: &str, st: &mut ClientState) -> Result<Value, String> {
+    heartbeat_core_inner(fp, st, true)
+}
+
+fn heartbeat_core_inner(fp: &str, st: &mut ClientState, allow_reauth: bool) -> Result<Value, String> {
     if st.token.is_empty() {
         return Err("尚未激活".into());
     }
@@ -262,7 +274,27 @@ fn heartbeat_core(fp: &str, st: &mut ClientState) -> Result<Value, String> {
     let resp = match resp {
         Ok(v) => v,
         Err(e) => {
-            // 离线宽限：以最后一次成功同步为基准
+            if license_core::classify_api_error(&e) == license_core::ApiErrorKind::Auth {
+                // 凭证失效（签名/过期）：点「重新连接」无济于事——用存储的授权码静默重激活后重试一次
+                diag_log(&format!("heartbeat auth invalid: {e}"));
+                if allow_reauth && !st.license_code.is_empty() {
+                    let (url, code, name) = (st.server_url.clone(), st.license_code.clone(), st.hotel_name.clone());
+                    if activate_core(fp, &url, &code, &name, st).is_ok() {
+                        diag_log("heartbeat: silent reauth ok, retrying heartbeat");
+                        return heartbeat_core_inner(fp, st, false);
+                    }
+                    diag_log("heartbeat: silent reauth failed");
+                }
+                // 鉴权失效 ≠ 离线：不要套离线锁误导用户
+                return Ok(json!({
+                    "offline": false,
+                    "auth_invalid": true,
+                    "locked": false,
+                    "grace_hours": st.offline_grace_hours,
+                    "error": e,
+                }));
+            }
+            // 真离线/网络故障：以最后一次成功同步为基准
             let (locked, remaining) = lock_state(st);
             diag_log(&format!(
                 "heartbeat offline: locked={locked} remaining={remaining:.1}h ({e})"
@@ -283,19 +315,18 @@ fn heartbeat_core(fp: &str, st: &mut ClientState) -> Result<Value, String> {
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    let time_anomaly = is_time_rollback(&st.last_server_time, &server_time);
-    if !time_anomaly {
-        st.last_server_time = server_time.clone();
-    }
-    // P1-1 分级防护：回拨 >24h → 只读锁定（联网心跳恢复正常即解除）
-    let time_locked = match (
-        license_core::parse_utc(&st.last_server_time),
-        license_core::parse_utc(&server_time),
-    ) {
-        (Some(prev), Some(cur)) => prev > cur && (prev - cur) as f64 > 24.0 * 3600.0,
-        _ => false,
-    };
+    // F2 修复：锚点始终前移（不因时间异常卡死，校正后自然恢复）
+    st.last_server_time = server_time.clone();
+    // F3 修复：以服务端时间为基准判定本机时钟偏差——改快/回拨 >24h 只读锁定，≤24h 仅提示
+    let (time_locked, time_anomaly) =
+        license_core::time_deviation_state(now_unix(), &server_time);
     st.last_sync = server_time.clone();
+    // F5 修复：随心跳刷新套餐（续期升级套餐后自动更新显示）
+    if let Some(p) = resp.get("plan").and_then(|v| v.as_str()) {
+        if !p.is_empty() {
+            st.plan = p.to_string();
+        }
+    }
     if let Some(g) = resp.get("offline_grace_hours").and_then(|v| v.as_u64()) {
         st.offline_grace_hours = g as u32;
     }
@@ -478,7 +509,7 @@ fn test_push_daily(state: State<AppState>) -> Result<Value, String> {
 fn group_renew(state: State<AppState>, hotel_ids: Vec<String>) -> Result<Value, String> {
     let fp = state.fingerprint.clone();
     let (token, server) = {
-        let mut s = state.inner.lock().unwrap();
+        let s = state.inner.lock().unwrap();
         // 离线锁定时禁用业务操作（超时禁用）
         let (locked, remaining) = lock_state(&s);
         if locked {

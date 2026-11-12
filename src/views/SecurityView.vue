@@ -308,6 +308,20 @@ async function revokeWithReason(row: License) {
     ElMessage.success('已吊销')
   } catch { /* 用户取消 */ }
 }
+
+// 误操作恢复（对称设备 E2）：已吊销授权恢复为生效中
+async function restoreLicense(row: License) {
+  try {
+    await ElMessageBox.confirm(
+      `恢复授权 ${row.code}（${row.hotelName}）？恢复后客户端可重新通过心跳校验。`,
+      '恢复确认',
+      { confirmButtonText: '确认恢复', cancelButtonText: '取消' }
+    )
+    await api.restoreLicense(row.id)
+    licenses.value = await api.listLicenses()
+    ElMessage.success('已恢复')
+  } catch { /* 用户取消 */ }
+}
 </script>
 
 <template>
@@ -556,7 +570,7 @@ async function revokeWithReason(row: License) {
           <span class="td" style="width: 70px"><span class="status-off">已吊销</span></span>
           <span class="td mono text-3" style="width: 100px; font-size: 11px">{{ l.expireAt }}</span>
           <span class="td" style="width: 70px">
-            <el-button link type="primary" size="small" @click="revokeWithReason(l)">恢复</el-button>
+            <el-button link type="primary" size="small" @click="restoreLicense(l)">恢复</el-button>
           </span>
         </div>
 

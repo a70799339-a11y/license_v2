@@ -227,6 +227,36 @@ pub fn offline_lock_state(last_sync_utc: &str, grace_hours: u32, now_unix: i64) 
     (remaining <= 0.0, remaining.clamp(0.0, f64::MAX))
 }
 
+/// 接口错误分类：鉴权失效（重连无用，需重激活）vs 网络/离线（重连可恢复）
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum ApiErrorKind {
+    Auth,
+    Network,
+}
+
+pub fn classify_api_error(err: &str) -> ApiErrorKind {
+    if err.contains("HTTP 401") || err.contains("HTTP 403") {
+        ApiErrorKind::Auth
+    } else {
+        ApiErrorKind::Network
+    }
+}
+
+/// P1-1 时间偏差判定（纯函数，F3 口径修正 2026-11-11）：
+/// 以服务端时间为可信基准，检测本机时钟被调整：
+/// - |本机 - 服务端| > 24h（改快或回拨）→ 只读锁定（locked=true）
+/// - 回拨 >5 分钟 或 改快 >30 分钟（≤24h）→ 仅提示（anomaly=true）
+/// - 每次心跳用当前偏差重新判定，无历史锚点 → 校正回正常即自动解锁（F2 根治锚点粘连）
+pub fn time_deviation_state(local_now_unix: i64, server_time: &str) -> (bool, bool) {
+    let Some(server) = parse_utc(server_time) else {
+        return (false, false);
+    };
+    let dev = local_now_unix - server;
+    let locked = dev.abs() > 24 * 3600;
+    let anomaly = dev < -300 || dev > 30 * 60;
+    (locked, anomaly)
+}
+
 #[cfg(test)]
 mod offline_tests {
     use super::*;
@@ -246,5 +276,69 @@ mod offline_tests {
         // 自定义时限（后台可配，如 24 小时）
         let (locked, _) = offline_lock_state("2026-11-05 00:00:00", 24, t0 + 25 * 3600);
         assert!(locked);
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    #[test]
+    fn classify_auth_vs_network() {
+        // 鉴权失效：重连无用，必须走重激活
+        assert_eq!(
+            classify_api_error("HTTP 401（{\"detail\":\"无效客户端凭证\"}）"),
+            ApiErrorKind::Auth
+        );
+        assert_eq!(
+            classify_api_error("HTTP 401（{\"detail\":\"客户端凭证已过期，请重新激活\"}）"),
+            ApiErrorKind::Auth
+        );
+        assert_eq!(classify_api_error("HTTP 403（禁止访问）"), ApiErrorKind::Auth);
+        // 网络/离线：重连可恢复
+        assert_eq!(
+            classify_api_error("网络请求失败: Connection refused"),
+            ApiErrorKind::Network
+        );
+        assert_eq!(classify_api_error("HTTP 500（内部错误）"), ApiErrorKind::Network);
+        assert_eq!(classify_api_error("响应解析失败: eof"), ApiErrorKind::Network);
+    }
+
+    #[test]
+    fn time_deviation_thresholds() {
+        // F3 口径：本机 vs 服务端偏差判定（服务端时间为基准）
+        let s = "2026-11-10 12:00:00";
+        let server = parse_utc(s).unwrap();
+        // 正常同步偏差（±5 分钟容差内）→ 不提示不锁
+        assert_eq!(time_deviation_state(server + 60, s), (false, false));
+        assert_eq!(time_deviation_state(server - 60, s), (false, false));
+        // 改快 ≤24h（2h）→ 仅提示不锁（清单 #14）
+        assert_eq!(time_deviation_state(server + 2 * 3600, s), (false, true));
+        // 回拨 ≤24h（2h）→ 仅提示不锁
+        assert_eq!(time_deviation_state(server - 2 * 3600, s), (false, true));
+        // 改快刚好不足 24h（23:59:59）→ 不锁
+        assert_eq!(time_deviation_state(server + 24 * 3600 - 1, s), (false, true));
+        // 改快超过 24h → 锁定（清单 #12）
+        assert_eq!(time_deviation_state(server + 24 * 3600 + 1, s), (true, true));
+        // 回拨超过 24h → 锁定
+        assert_eq!(time_deviation_state(server - 24 * 3600 - 1, s), (true, true));
+        // 校正回正常 → 不锁（F2：无锚点，自动解锁）
+        assert_eq!(time_deviation_state(server, s), (false, false));
+        // 解析失败 → 不误伤
+        assert_eq!(time_deviation_state(server, "bad"), (false, false));
+    }
+
+    #[test]
+    fn parse_utc_edges() {
+        assert!(parse_utc("2026-11-05").is_none()); // 缺时间部分
+        assert_eq!(
+            parse_utc("2026-01-01 00:00:00").unwrap() + 86400 * 31,
+            parse_utc("2026-02-01 00:00:00").unwrap()
+        );
+        // 闰日
+        assert_eq!(
+            parse_utc("2028-02-28 00:00:00").unwrap() + 86400,
+            parse_utc("2028-02-29 00:00:00").unwrap()
+        );
     }
 }

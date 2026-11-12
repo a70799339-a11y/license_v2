@@ -279,6 +279,20 @@ def revoke_license(license_id: str, req: RevokeRequest | None = None, db: Sessio
     return {"ok": True, "status": lic.status, "reason": reason}
 
 
+@app.post("/api/licenses/{license_id}/restore")
+def restore_license(license_id: str, db: Session = Depends(get_db), user: User = Depends(require_roles("admin", "operator"))):
+    """误操作恢复：已吊销授权恢复为生效中（过期授权恢复为已过期），对称设备 E2 恢复"""
+    lic = db.query(License).filter(License.id == license_id).first()
+    if lic is None:
+        raise HTTPException(status_code=404, detail="授权不存在")
+    if lic.status != "已吊销":
+        raise HTTPException(status_code=409, detail=f"授权状态为「{lic.status}」，无需恢复")
+    lic.status = "生效中" if (lic.expire_at or "") >= datetime.utcnow().strftime("%Y-%m-%d") else "已过期"
+    write_log(db, user, "恢复授权", lic.hotel_name, f"授权 {lic.code} 恢复为「{lic.status}」（误操作恢复）")
+    db.commit()
+    return {"ok": True, "status": lic.status}
+
+
 # ---------- 告警 ----------
 @app.get("/api/alerts")
 def list_alerts(db: Session = Depends(get_db), _: User = Depends(get_current_user)):

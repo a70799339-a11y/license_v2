@@ -134,6 +134,8 @@ function check(cid, module, name, cond, actual = '') {
   await page.getByText('授权管理', { exact: true }).first().click();
   await page.waitForURL('**/licenses', { timeout: 5000 });
   await page.waitForLoadState('networkidle');
+  // 防加载竞态假告警：等表格行渲染出来再断言（空库时限时兜底不阻塞）
+  await page.waitForSelector('.el-table__row', { timeout: 8000 }).catch(() => {});
   await page.screenshot({ path: path.join(SHOTS, '05-licenses.png') });
   check('U5.1', '授权管理', '授权表格渲染', (await page.locator('.el-table__row').count()) >= 1);
 
@@ -228,20 +230,62 @@ function check(cid, module, name, cond, actual = '') {
   check('U9.1', '安全设计', '签发流程 6 步', (await page.locator('.step').count()) === 6, `${await page.locator('.step').count()} 步`);
   check('U9.2', '安全设计', '风控规则表', (await page.locator('.table-row').count()) >= 8);
 
-  // 吊销（含原因输入）
-  const revokeBtn = page.getByRole('button', { name: '吊销', exact: true }).first();
-  if (await revokeBtn.count()) {
-    await revokeBtn.click();
+  // 吊销（含原因输入）——P-3：自建专用测试授权再吊销，不触碰 HT-0002 等演示数据
+  const adminToken = await page.evaluate(() => localStorage.getItem('license_token') || '');
+  const ts = Date.now() % 1000000;
+  const hRes = await page.request.post(`${BASE}/api/hotels`, {
+    headers: { Authorization: `Bearer ${adminToken}` },
+    data: { name: `UI测试店吊销${ts}`, code: `HT-UIR${ts}`, group: '测试集团', city: '测试市', plan: '基础版' },
+  });
+  const hJson = await hRes.json().catch(() => ({}));
+  const lRes = await page.request.post(`${BASE}/api/licenses`, {
+    headers: { Authorization: `Bearer ${adminToken}` },
+    data: { hotelId: hJson.id, plan: '基础版', months: 1 },
+  });
+  const licJson = await lRes.json().catch(() => ({}));
+  const testLicCode = licJson.code || '';
+  check('U9.3a', '安全设计', '自建吊销测试授权就绪', !!testLicCode, `code=${testLicCode}`);
+  // 安全页吊销列表只显示前 5 条生效授权（slice(0,5)），自建新授权排在末尾 → 走授权管理页搜索定位
+  if (testLicCode) {
+    await page.getByText('授权管理', { exact: true }).first().click();
+    await page.waitForURL('**/licenses', { timeout: 5000 });
+    await page.waitForLoadState('networkidle');
+    await page.locator('input[placeholder*="搜索授权码"]').fill(testLicCode);
     await page.waitForTimeout(600);
-    const promptVisible = await page.locator('.el-message-box').isVisible().catch(() => false);
-    check('U9.3', '安全设计', '吊销弹窗（含原因）打开', promptVisible);
-    if (promptVisible) {
-      await page.screenshot({ path: path.join(SHOTS, '09-revoke-dialog.png') });
-      await page.locator('.el-message-box input').fill('UI自动化测试吊销');
-      await page.locator('.el-message-box').getByRole('button', { name: '确认吊销' }).click();
-      await page.waitForTimeout(800);
-      check('U9.4', '安全设计', '吊销提交反馈', await page.locator('.el-message').first().isVisible().catch(() => false));
+    await page.waitForSelector('.el-table__row', { timeout: 8000 }).catch(() => {});
+    const licRow = page.locator('.el-table__row', { hasText: testLicCode }).first();
+    const licRevokeBtn = licRow.getByRole('button', { name: '吊销', exact: true });
+    if (await licRevokeBtn.count()) {
+      await licRevokeBtn.click();
+      await page.waitForTimeout(600);
+      const promptVisible = await page.locator('.el-message-box').isVisible().catch(() => false);
+      check('U9.3', '安全设计', '吊销弹窗（含原因）打开', promptVisible);
+      if (promptVisible) {
+        await page.screenshot({ path: path.join(SHOTS, '09-revoke-dialog.png') });
+        await page.locator('.el-message-box input').fill('UI自动化测试吊销');
+        await page.locator('.el-message-box').getByRole('button', { name: '确认吊销' }).click();
+        await page.waitForTimeout(800);
+        check('U9.4', '安全设计', '吊销提交反馈', await page.locator('.el-message').first().isVisible().catch(() => false));
+      } else {
+        check('U9.4', '安全设计', '吊销提交反馈', false, '弹窗未打开');
+      }
+    } else {
+      check('U9.3', '安全设计', '吊销弹窗（含原因）打开', false, '搜索后未找到自建授权吊销按钮');
+      check('U9.4', '安全设计', '吊销提交反馈', false, '前置失败');
     }
+    // 验证真的吊销了自建授权（而非演示数据）
+    const stRes = await page.request.get(`${BASE}/api/licenses`, { headers: { Authorization: `Bearer ${adminToken}` } });
+    const all = await stRes.json().catch(() => []);
+    const mine = all.find(l => l.code === testLicCode);
+    check('U9.4b', '安全设计', '被吊销的是自建授权', mine && mine.status === '已吊销', `status=${mine && mine.status}`);
+    // 回安全设计页继续 9.5 推送配置验证
+    await page.getByText('安全设计', { exact: true }).first().click();
+    await page.waitForURL('**/security', { timeout: 5000 });
+    await page.waitForLoadState('networkidle');
+  } else {
+    check('U9.3', '安全设计', '吊销弹窗（含原因）打开', false, '自建授权创建失败');
+    check('U9.4', '安全设计', '吊销提交反馈', false, '前置失败');
+    check('U9.4b', '安全设计', '被吊销的是自建授权', false, '前置失败');
   }
 
   // ========== 9.5 每日定时推送 + 汇报机器人（长连接） ==========

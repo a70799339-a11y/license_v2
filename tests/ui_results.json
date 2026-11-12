@@ -1,8 +1,8 @@
 {
   "target": "http://localhost",
-  "time": "2026/11/10 09:06:25",
-  "total": 43,
-  "passed": 43,
+  "time": "2026/11/12 15:57:04",
+  "total": 45,
+  "passed": 45,
   "failed": 0,
   "pass_rate": "100.0%",
   "results": [
@@ -46,7 +46,7 @@
       "module": "经营总览",
       "name": "到期风险提醒列表",
       "pass": true,
-      "actual": "12 行"
+      "actual": "10 行"
     },
     {
       "id": "U3.1",
@@ -172,7 +172,7 @@
       "module": "AI 智能风控",
       "name": "等级筛选生效",
       "pass": true,
-      "actual": "紧急 77 行"
+      "actual": "紧急 90 行"
     },
     {
       "id": "U8.1",
@@ -217,6 +217,13 @@
       "actual": ""
     },
     {
+      "id": "U9.3a",
+      "module": "安全设计",
+      "name": "自建吊销测试授权就绪",
+      "pass": true,
+      "actual": "code=LIC-2026-0973"
+    },
+    {
       "id": "U9.3",
       "module": "安全设计",
       "name": "吊销弹窗（含原因）打开",
@@ -229,6 +236,13 @@
       "name": "吊销提交反馈",
       "pass": true,
       "actual": ""
+    },
+    {
+      "id": "U9.4b",
+      "module": "安全设计",
+      "name": "被吊销的是自建授权",
+      "pass": true,
+      "actual": "status=已吊销"
     },
     {
       "id": "U9.5a",

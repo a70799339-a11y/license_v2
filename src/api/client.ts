@@ -216,6 +216,8 @@ export const api = {
   }) => request<License>('/licenses', { method: 'POST', body: JSON.stringify(data) }),
   revokeLicense: (id: string, reason = '手动吊销') =>
     request<{ ok: boolean }>(`/licenses/${id}/revoke`, { method: 'POST', body: JSON.stringify({ reason }) }),
+  restoreLicense: (id: string) =>
+    request<{ ok: boolean; status: string }>(`/licenses/${id}/restore`, { method: 'POST' }),
 
   // alerts
   listAlerts: () => request<Alert[]>('/alerts'),

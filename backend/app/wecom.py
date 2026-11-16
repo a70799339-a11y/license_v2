@@ -108,7 +108,9 @@ def send_webhook(webhook_url: str, content: str) -> tuple:
 
 
 def push_message(db: Session, content: str, *, group_id: str = "", hotel_id: str = "") -> dict:
-    """路由推送：运营群（全量）+ 集团群 + 门店群（各自实体配置）。返回路由结果。"""
+    """路由推送：运营群（全量）+ 集团群 + 门店群（各自实体配置）。返回路由结果。
+    WS 兜底：实体 webhook 未配置时发到绑定的汇报会话（wecom_ws_push_chatid），
+    防止「内容生成了但没人收到」（2026-11-16 每日推送事故根因之一）。"""
     masked = mask_text(content)
     record = {
         "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
@@ -124,19 +126,22 @@ def push_message(db: Session, content: str, *, group_id: str = "", hotel_id: str
         record["sent"] = ["dry-run"]
         return record
 
-    # 服务端推送目标走长连接机器人主动发送（chatid 在后台绑定，无需群 webhook）
-    if not group_id and not hotel_id:
-        ws_chat = get_setting(db, "wecom_ws_push_chatid")
-        if ws_chat:
-            try:
-                from .wecom_ws import ws_send_markdown
+    ws_chat = get_setting(db, "wecom_ws_push_chatid")
+    sent_via_ws = False
 
-                r = ws_send_markdown(ws_chat, masked)
-                record["sent"].append(
-                    f"ws:{'ok' if r.get('ok') else 'fail ' + (r.get('error') or '')[:60]}"
-                )
-            except Exception as e:
-                record["sent"].append(f"ws:fail {str(e)[:60]}")
+    # 服务端推送目标走长连接机器人主动发送（chatid 在后台绑定，无需群 webhook）
+    if not group_id and not hotel_id and ws_chat:
+        try:
+            from .wecom_ws import ws_send_markdown
+
+            r = ws_send_markdown(ws_chat, masked)
+            record["sent"].append(
+                f"ws:{'ok' if r.get('ok') else 'fail ' + (r.get('error') or '')[:60]}"
+            )
+            sent_via_ws = bool(r.get("ok"))
+        except Exception as e:
+            record["sent"].append(f"ws:fail {str(e)[:60]}")
+        if sent_via_ws:
             set_setting(db, "wecom_last_push", json.dumps(record, ensure_ascii=False)[:2000])
             db.commit()
             return record
@@ -156,6 +161,19 @@ def push_message(db: Session, content: str, *, group_id: str = "", hotel_id: str
     for name, url in targets:
         ok, err = send_webhook(url, masked)
         record["sent"].append(f"{name}:{'ok' if ok else 'fail ' + err}")
+
+    # WS 兜底：实体 webhook 一个都没配时，发到绑定的汇报会话
+    if not targets and ws_chat and not sent_via_ws and push_enabled(db):
+        try:
+            from .wecom_ws import ws_send_markdown
+
+            r = ws_send_markdown(ws_chat, masked)
+            record["sent"].append(
+                f"ws-fallback:{'ok' if r.get('ok') else 'fail ' + (r.get('error') or '')[:60]}"
+            )
+        except Exception as e:
+            record["sent"].append(f"ws-fallback:fail {str(e)[:60]}")
+
     set_setting(db, "wecom_last_push", json.dumps(record, ensure_ascii=False)[:2000])
     db.commit()
     return record

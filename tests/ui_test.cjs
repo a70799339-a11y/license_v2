@@ -307,8 +307,15 @@ function check(cid, module, name, cond, actual = '') {
   check('U9.5c', '汇报机器人', '捕获操作有反馈', captureVisible, captureText.slice(0, 60));
   await page.screenshot({ path: path.join(SHOTS, '095-capture.png') });
 
-  // 绑定流程（测试会话 ID，结束后还原）
+  // 绑定流程（测试会话 ID，结束后还原原值）
   const chatInput = page.locator('input[placeholder*="会话 ID"]').first();
+  // 先记原值，测完按原值还原（清空会误伤真实绑定；token 键名是 license_token，写错会静默 401 还原失败）
+  const origChatid = await page.evaluate(async () => {
+    const token = localStorage.getItem('license_token') || '';
+    const r = await fetch('/api/settings', { headers: { Authorization: `Bearer ${token}` } });
+    const s = await r.json().catch(() => ({}));
+    return s.wecom_ws_push_chatid || '';
+  });
   await chatInput.fill('UITEST-CHATID-0001');
   await page.getByRole('button', { name: '绑定' }).click();
   const bindToast = page.locator('.el-message', { hasText: /已绑定|绑定失败/ }).last();
@@ -324,16 +331,23 @@ function check(cid, module, name, cond, actual = '') {
   check('U9.5e', '汇报机器人', '测试发送有反馈', sendVisible, sendText.slice(0, 60));
   await page.screenshot({ path: path.join(SHOTS, '095-test-send.png') });
 
-  // 还原测试绑定（清空 chatid，避免污染真实配置）
-  await page.evaluate(async () => {
-    const token = localStorage.getItem('token') || '';
+  // 还原测试绑定（按原值还原，避免污染真实配置）
+  await page.evaluate(async (orig) => {
+    const token = localStorage.getItem('license_token') || '';
     await fetch('/api/settings', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ key: 'wecom_ws_push_chatid', value: '' }),
+      body: JSON.stringify({ key: 'wecom_ws_push_chatid', value: orig }),
     });
+  }, origChatid);
+  // 验证还原真的生效（token 键名错误会导致静默 401 还原失败 → 污染真实推送目标）
+  const restoredChatid = await page.evaluate(async () => {
+    const token = localStorage.getItem('license_token') || '';
+    const r = await fetch('/api/settings', { headers: { Authorization: `Bearer ${token}` } });
+    const s = await r.json().catch(() => ({}));
+    return s.wecom_ws_push_chatid || '';
   });
-  check('U9.5f', '汇报机器人', '测试绑定已还原', true);
+  check('U9.5f', '汇报机器人', '测试绑定已还原', restoredChatid === origChatid, `now=${restoredChatid || '(空)'} orig=${origChatid || '(空)'}`);
 
   // ========== 10. 全局 ==========
   console.log('【10. 全局】');

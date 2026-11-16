@@ -87,6 +87,17 @@ def _record_chat(body: dict) -> bool:
         }
         db = SessionLocal()
         try:
+            # 事件帧（enter_chat 等）常无 chatid：不得覆盖已捕获的群 chatid，
+            # 否则「捕获最近会话」拿到空 chatid 无法绑定推送目标（2026-11-16 事故根因之一）
+            if not chatid:
+                from .wecom import get_setting
+
+                try:
+                    prev = json.loads(get_setting(db, "wecom_last_chat", "") or "{}")
+                except Exception:
+                    prev = {}
+                if (prev or {}).get("chatid"):
+                    return False
             set_setting(db, "wecom_last_chat", json.dumps(info, ensure_ascii=False))
             db.commit()  # set_setting 不自带提交，必须显式 commit 才落库
         finally:

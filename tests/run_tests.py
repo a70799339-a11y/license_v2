@@ -87,6 +87,8 @@ def main():
 
     token = None
     llm_snapshot = {}
+    wecom_snapshot = {}  # wecom_*/push_* 配置快照（finally 还原，防测试污染真实推送配置）
+    group_hooks_snapshot = {}  # 集团 webhook 快照（独立表，T16.7 会清空它）
     try:
         # ---------------- 1. 认证模块 ----------------
         try:
@@ -94,6 +96,12 @@ def main():
             st, p = req("POST", "/api/auth/login", {"username": "admin", "password": "admin123"})
             token = (p or {}).get("token")
             check("T1.1", "认证", "管理员登录成功并签发 JWT", st == 200 and bool(token), f"HTTP {st}")
+            # 快照企微/推送配置（T16~T17 会写 dry-run/假 webhook/假 chatid，结束必须还原）
+            st, s0 = req("GET", "/api/settings", token=token)
+            wecom_snapshot = {k: v for k, v in (s0 or {}).items()
+                              if k.startswith(("wecom_", "push_")) and k != "wecom_last_push"}
+            st, wc0 = req("GET", "/api/wecom/config", token=token)
+            group_hooks_snapshot = dict((wc0 or {}).get("groupHooks") or {})
             st, _ = req("POST", "/api/auth/login", {"username": "admin", "password": "wrong"})
             check("T1.2", "认证", "错误密码返回 401", st == 401, f"HTTP {st}")
             st, _ = req("POST", "/api/auth/login", {"username": "ghost", "password": "x"})
@@ -140,7 +148,8 @@ def main():
             check("T2.7", "客户管理", "客户详情聚合（酒店+设备+授权+告警）", st == 200 and {"hotel", "devices", "licenses", "alerts"} <= keys,
                   f"devices={len((p or {}).get('devices', []))}")
 
-            st, _ = req("GET", "/api/hotels/h999/detail", token=token)
+            # 用永不生成的 id 形态（自增数字 id 已逼近 h999，硬编码会撞真实店）
+            st, _ = req("GET", "/api/hotels/h-no-such-hotel-zzz/detail", token=token)
             check("T2.8", "客户管理", "不存在客户返回 404", st == 404, f"HTTP {st}")
 
         except Exception as _e:
@@ -1838,6 +1847,21 @@ def main():
             if token:
                 if llm_snapshot:
                     req("POST", "/api/ai/config", llm_snapshot, token=token)
+                # 还原企微/推送配置（dry-run/假 webhook/假 chatid/推送时间等，防污染真实推送）
+                if wecom_snapshot:
+                    st, s9 = req("GET", "/api/settings", token=token)
+                    now_map = s9 or {}
+                    for k in list(now_map.keys()):
+                        if k.startswith(("wecom_", "push_")) and k != "wecom_last_push" and k not in wecom_snapshot:
+                            req("POST", "/api/settings", {"key": k, "value": ""}, token=token)  # 清测试新增键
+                    for k, v in wecom_snapshot.items():
+                        if str(now_map.get(k, "")) != str(v):
+                            req("POST", "/api/settings", {"key": k, "value": v}, token=token)
+                    # 还原集团 webhook（T16.7 会清空它们）
+                    if group_hooks_snapshot:
+                        for gid, url in group_hooks_snapshot.items():
+                            req("POST", "/api/wecom/group-hook", {"groupId": gid, "webhookUrl": url}, token=token)
+                    print(f"[cleanup] 企微/推送配置已还原 {len(wecom_snapshot)} 键 + {len(group_hooks_snapshot)} 集团 hook")
                 req("POST", "/api/settings", {"key": "unbind_offline_minutes", "value": "30"}, token=token)
                 req("POST", "/api/settings", {"key": "renew_order_ttl_hours", "value": "2"}, token=token)
                 st, hs = req("GET", "/api/hotels", token=token)

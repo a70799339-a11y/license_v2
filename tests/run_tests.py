@@ -584,16 +584,16 @@ def main():
                 if l.get("target") == f"脱敏测试店{ts}" and l.get("action") == "吊销授权"
             )
             masked_ok = (
-                "138****5678" in log_text
+                "138＊＊＊＊5678" in log_text
                 and "330106199001011234" not in log_text
                 and "song.xk@example.com" not in log_text
                 and "6222021234567890" not in log_text
             )
             check("T15.1", "日志脱敏", "审计详情掩码（手机/身份证/邮箱/卡号）", masked_ok,
-                  "含138****5678" if "138****5678" in log_text else "掩码缺失")
+                  "含138＊＊＊＊5678" if "138＊＊＊＊5678" in log_text else "掩码缺失")
 
-            check("T15.2", "日志脱敏", "授权码部分掩码保留可追溯（LIC-****23）",
-                  "LIC-****" in my_logs and "LIC-2026-0123" not in my_logs,
+            check("T15.2", "日志脱敏", "授权码部分掩码保留可追溯（LIC-＊＊＊＊23）",
+                  "LIC-＊＊＊＊" in my_logs and "LIC-2026-0123" not in my_logs,
                   my_logs[:60])
 
             st, p = req("GET", "/api/alerts", token=token)
@@ -609,7 +609,7 @@ def main():
             st, p = req("GET", "/api/logs", token=token)
             log_text2 = " ".join((l.get("detail") or "") for l in (p or []))
             check("T15.4", "日志脱敏", "设置修改日志掩码手机号",
-                  "139****4321" in log_text2 and "13987654321" not in log_text2)
+                  "139＊＊＊＊4321" in log_text2 and "13987654321" not in log_text2)
 
         except Exception as _e:
             check("S15", "异常隔离", "第 15 段未捕获异常（后续段继续）", False,
@@ -748,7 +748,7 @@ def main():
             # 审计留痕（脱敏：key= 掩码）
             st, p = req("GET", "/api/logs", token=token)
             cfg_logs = [l for l in (p or []) if l.get("action") == "配置企微通知"]
-            log_ok = any("key=***" in (l.get("detail") or "") for l in cfg_logs)
+            log_ok = any("key=＊＊＊" in (l.get("detail") or "") for l in cfg_logs)
             check("T17.6", "客户端企微配置", "配置变更审计留痕且 webhook key 脱敏", log_ok,
                   f"{len(cfg_logs)} 条配置日志")
 
@@ -771,7 +771,7 @@ def main():
             st, logs = req("GET", "/api/llm-logs?sourceType=group&limit=10", token=token)
             rec = next((l for l in (logs or []) if "审计测试集团" in (l.get("sourceName") or "")), {})
             masked_ok = (
-                "138****5678" in (rec.get("userInput") or "")
+                "138＊＊＊＊5678" in (rec.get("userInput") or "")
                 and "13812345678" not in (rec.get("userInput") or "")
                 and "13812345678" not in (rec.get("modelInput") or "")
                 and bool(rec.get("modelOutput"))
@@ -1868,7 +1868,7 @@ def main():
                 swept = 0
                 for h in (hs or []):
                     name = h.get("name") or ""
-                    if any(k in name for k in ("测试店", "复现", "核对", "清点", "防撞", "调试", "调一店", "调二店")) and h.get("status") != "已停用":
+                    if any(k in name for k in ("测试店", "测试酒", "复现", "核对", "清点", "防撞", "调试", "调一店", "调二店", "撞测", "冒烟", "拉黑", "竞态", "NOPE")) and h.get("status") != "已停用":
                         req("PATCH", f"/api/hotels/{h.get('id')}", {"status": "已停用"}, token=token)
                         swept += 1
                 print(f"[cleanup] 测试店清扫：停用 {swept} 家")

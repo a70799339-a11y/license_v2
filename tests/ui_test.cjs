@@ -370,6 +370,35 @@ function check(cid, module, name, cond, actual = '') {
   // 控制台错误
   check('U10.5', '全局', '页面无 JS 报错', errors.length === 0, errors.length ? errors[0] : '0 个');
 
+  // 清理本脚本建的测试店（UI测试酒店/自建吊销店），避免污染客户列表与每日巡检统计
+  try {
+    const cleanupToken = await page.evaluate(() => localStorage.getItem('license_token') || '');
+    // 已退出登录 → 重新登录拿 token
+    const loginRes = await page.request.post(`${BASE}/api/auth/login`, {
+      data: { username: 'admin', password: 'admin123' },
+    });
+    const loginJson = await loginRes.json().catch(() => ({}));
+    const tok = loginJson.token || cleanupToken;
+    const listRes = await page.request.get(`${BASE}/api/hotels`, {
+      headers: { Authorization: `Bearer ${tok}` },
+    });
+    const list = await listRes.json().catch(() => []);
+    let swept = 0;
+    for (const h of (Array.isArray(list) ? list : [])) {
+      const n = h.name || '';
+      if ((n.includes('UI测试') || n.includes('测试店吊销')) && h.status !== '已停用') {
+        await page.request.patch(`${BASE}/api/hotels/${h.id}`, {
+          headers: { Authorization: `Bearer ${tok}` },
+          data: { status: '已停用' },
+        });
+        swept++;
+      }
+    }
+    console.log(`[cleanup] UI 测试店清扫：停用 ${swept} 家`);
+  } catch (e) {
+    console.log(`[warn] UI 测试店清扫异常（不影响结果汇总）: ${e.message}`);
+  }
+
   await browser.close();
 
   // 汇总

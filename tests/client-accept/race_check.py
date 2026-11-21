@@ -33,6 +33,11 @@ def req(method, path, body=None, token=None, headers=None):
 st, login = req("POST", "/api/auth/login", {"username": "admin", "password": "admin123"})
 token = (login or {}).get("token")
 
+# 测试期强制 dry-run 并记原值（并发激活会触发高危告警即时推送，不许外发真实企微群）
+st, s0 = req("GET", "/api/settings", token=token)
+orig_dry = (s0 or {}).get("wecom_dry_run", "on")
+req("POST", "/api/settings", {"key": "wecom_dry_run", "value": "on"}, token=token)
+
 fails = 0
 for round_no in range(5):
     ts = uuid.uuid4().hex[:8]
@@ -69,3 +74,7 @@ for round_no in range(5):
     print(f"round {round_no + 1}: sts={sts} devices={dev} {'OK' if ok else 'FAIL'}")
 
 print(f"\n===== 竞态复现: {5 - fails}/5 =====")
+
+# 还原 dry-run 原值（快照还原三件套之「finally 还原」）
+req("POST", "/api/settings", {"key": "wecom_dry_run", "value": orig_dry}, token=token)
+print(f"[restore] wecom_dry_run -> {orig_dry}")

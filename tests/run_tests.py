@@ -97,9 +97,14 @@ def main():
             token = (p or {}).get("token")
             check("T1.1", "认证", "管理员登录成功并签发 JWT", st == 200 and bool(token), f"HTTP {st}")
             # 快照企微/推送配置（T16~T17 会写 dry-run/假 webhook/假 chatid，结束必须还原）
+            # 含 alert_push_agg（告警聚合窗口）：测试造的告警绝不能攒进真实聚合缓冲
             st, s0 = req("GET", "/api/settings", token=token)
             wecom_snapshot = {k: v for k, v in (s0 or {}).items()
-                              if k.startswith(("wecom_", "push_")) and k != "wecom_last_push"}
+                              if (k.startswith(("wecom_", "push_")) or k == "alert_push_agg")
+                              and k != "wecom_last_push"}
+            # 套件级 dry-run 硬开：T14 等前段会触发高危告警即时推送（notify_alert），
+            # 若等 T16 才开 dry-run，测试告警会被真实推到企微群（2026-11-21 事故）
+            req("POST", "/api/settings", {"key": "wecom_dry_run", "value": "on"}, token=token)
             st, wc0 = req("GET", "/api/wecom/config", token=token)
             group_hooks_snapshot = dict((wc0 or {}).get("groupHooks") or {})
             st, _ = req("POST", "/api/auth/login", {"username": "admin", "password": "wrong"})

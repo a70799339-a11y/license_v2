@@ -858,6 +858,7 @@ def process_command(db: Session, text: str, sender: str = "unknown", on_slow=Non
             "指令列表：\n"
             "· 状态 HT-0001 —— 查授权状态\n"
             "· 告警 HT-0001 —— 查最近告警\n"
+            "· 处置 HT-0001 —— 处置该店全部未处置告警（需回复『确认处置 HT-0001 备注』）\n"
             "· 续期 HT-0001 —— 续期一年（需回复『确认续期 HT-0001』）\n"
             "· 停用 HT-0001 —— 停用/拉黑该客户（需回复『确认停用 HT-0001』）\n"
             "· 其他问题直接发 —— AI 为你解答\n"
@@ -873,7 +874,8 @@ def process_command(db: Session, text: str, sender: str = "unknown", on_slow=Non
     # 指令解析：不依赖空格。「状态HT-0004」「状态ht-888」等无空格写法
     # 必须同样进入确定性通道，否则会绕过全部防瞎答保护掉进 LLM 编造。
     _KNOWN_CMDS = (
-        "确认续期", "确认停用", "确认拉黑", "状态", "告警", "续期", "停用", "拉黑",
+        "确认续期", "确认停用", "确认拉黑", "确认处置",
+        "状态", "告警", "续期", "停用", "拉黑", "处置",
     )
     first_tok = text.split()[0] if text.split() else ""
     cmd, code = first_tok, ""
@@ -906,18 +908,20 @@ def process_command(db: Session, text: str, sender: str = "unknown", on_slow=Non
         )
 
     # 确定性指令缺编码 → 用法提示（不进 AI）
-    if not code and cmd in ("状态", "告警", "续期", "停用", "拉黑"):
+    if not code and cmd in ("状态", "告警", "续期", "停用", "拉黑", "处置", "确认处置"):
         return f"用法：{cmd} HT-0001（请带上客户编码）。回复『帮助』看全部指令。"
 
     # 确定性指令带未知编码/名称 → 直接明确拒绝（不进 AI，防瞎答）
     if hotel is None and code and cmd in (
-        "状态", "告警", "续期", "确认续期", "停用", "确认停用", "拉黑", "确认拉黑"
+        "状态", "告警", "续期", "确认续期", "停用", "确认停用", "拉黑", "确认拉黑",
+        "处置", "确认处置",
     ):
         return f"未找到编号/名称为「{code}」的客户。请核对编码（如 HT-0001），或回复『帮助』看指令列表。"
 
     # 确定性指令目标存在但无权限（如只读角色/非本集团）→ 明确拒绝（不进 AI）
     if hotel is not None and not allowed(hotel) and cmd in (
-        "状态", "告警", "续期", "确认续期", "停用", "确认停用", "拉黑", "确认拉黑"
+        "状态", "告警", "续期", "确认续期", "停用", "确认停用", "拉黑", "确认拉黑",
+        "处置", "确认处置",
     ):
         return f"你没有操作「{hotel.name}（{hotel.code}）」的权限，请联系管理员。"
 
@@ -966,6 +970,46 @@ def process_command(db: Session, text: str, sender: str = "unknown", on_slow=Non
         except Exception:
             pass
         return f"✅ {hotel.name}（{hotel.code}）已停用（拉黑），不再计入统计；如需恢复请到后台启用"
+
+    # 处置告警（v1.2.3）：按店批量处置全部未处置告警，二次确认 + 审计留痕。
+    # 处置发生在企微对话内，回复本身就是通知，不再走 notify_alert_handled 避免重复刷屏。
+    if cmd in ("处置", "确认处置") and hotel is not None and allowed(hotel):
+        pending = (
+            db.query(Alert)
+            .filter(Alert.hotel_name == hotel.name, Alert.status != "已处置")
+            .order_by(Alert.time.desc())
+            .all()
+        )
+        if cmd == "处置":
+            if not pending:
+                return f"{hotel.name}（{hotel.code}）暂无未处置告警。"
+            by_rule: dict = {}
+            for a in pending:
+                key = f"[{a.level}] {a.rule}"
+                by_rule[key] = by_rule.get(key, 0) + 1
+            lines = "\n".join(f"· {k} ×{v}" for k, v in sorted(by_rule.items()))
+            return (
+                f"{hotel.name}（{hotel.code}）未处置告警 {len(pending)} 条：\n{lines}\n"
+                f"回复「确认处置 {hotel.code}」全部处置（备注默认：企微处置），\n"
+                f"或「确认处置 {hotel.code} 误报」附带处置备注。"
+            )
+        # 确认处置：备注 = 去掉指令与编码后的剩余文本（无备注时默认「企微处置」）
+        note = " ".join(text.split()[2:]).strip() if len(text.split()) > 2 else ""
+        if not pending:
+            return f"{hotel.name}（{hotel.code}）暂无未处置告警（可能刚被处置过）。"
+        now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        for a in pending:
+            a.status = "已处置"
+            a.handled_by = operator
+            a.handle_note = (note or "企微处置")[:250]
+            a.handled_at = now_str
+        _audit(db, operator, "企微处置告警", hotel.name,
+               f"批量处置 {len(pending)} 条｜备注：{note or '企微处置'}")
+        db.commit()
+        return (
+            f"✅ {hotel.name}（{hotel.code}）已处置 {len(pending)} 条告警"
+            f"（备注：{note or '企微处置'}）\n操作人：{operator} 已留审计"
+        )
 
     # AI 前置接地门：消息里出现的酒店编码逐一查库，任一查无此店 → 确定性拒绝。
     # 否则「ht9999的状态详情」这类编码开头的提问会掉进 LLM，

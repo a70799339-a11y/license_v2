@@ -1842,6 +1842,71 @@ def main():
         except Exception as _e:
             check("S38", "异常隔离", "第 38 段未捕获异常（后续段继续）", False,
                      f"{type(_e).__name__}: {_e}")
+
+        # ---------------- 39. 企微指令·批量处置告警（T39） ----------------
+        try:
+            print("【39. 企微指令·批量处置告警】")
+            import subprocess
+            ts = str(int(time.time() * 1000))[-8:]
+            code = f"HT-CZ{ts[-6:]}"
+            name = f"测试店处置{ts}"
+            st, p = req("POST", "/api/hotels",
+                        {"name": name, "code": code, "group": "测试集团", "city": "测试市", "plan": "专业版"},
+                        token)
+            hid = (p or {}).get("id")
+            sender_a, sender_v = f"t39u{ts}", f"t39v{ts}"
+            sql_exec(f"INSERT INTO wecom_bindings (userid,name,role,group_id) VALUES "
+                     f"('{sender_a}','T39admin','admin',''),('{sender_v}','T39viewer','viewer','') "
+                     f"ON CONFLICT (userid) DO NOTHING")
+            sql_exec(f"INSERT INTO alerts (id,level,rule,hotel_name,detail,time,status) VALUES "
+                     f"('a39{ts[-6:]}','高','T39共享检测','{name}','t39','2026-11-23 08:00:00','待处理'),"
+                     f"('a39b{ts[-6:]}','中','T39指纹变更','{name}','t39','2026-11-23 08:01:00','待处理')")
+
+            def iz(text: str, sender: str) -> str:
+                py = "/opt/license/.venv/bin/python3"
+                if not os.path.exists(py):
+                    py = "python3"
+                r = subprocess.run(
+                    [py, os.path.join(os.path.dirname(os.path.abspath(__file__)), "t39_cmd.py"), text, sender],
+                    capture_output=True, text=True, timeout=30,
+                    cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                return (r.stdout or "").strip()
+
+            out1 = iz(f"处置 {code}", sender_a)
+            check("T39.1", "企微指令", "处置预览：条数与规则聚合正确",
+                  hid and "未处置告警 2 条" in out1 and "T39共享检测" in out1 and "T39指纹变更" in out1,
+                  out1[:120].replace("\n", " "))
+
+            out2 = iz(f"确认处置 {code} 误报测试", sender_a)
+            check("T39.2", "企微指令", "确认处置：批量置已处置并回报条数",
+                  "已处置 2 条" in out2 and "误报测试" in out2, out2[:120].replace("\n", " "))
+
+            st, al = req("GET", "/api/alerts", token=token)
+            mine = [a for a in (al or []) if a.get("hotelName") == name]
+            check("T39.3", "企微指令", "处置落库：状态/备注/处置人三字段正确",
+                  len(mine) == 2 and all(a["status"] == "已处置" and a["handleNote"] == "误报测试"
+                                         and "企微" in (a.get("handledBy") or "") for a in mine),
+                  f"n={len(mine)} " + ";".join(f"{a.get('status')}/{a.get('handleNote')}" for a in mine[:2]))
+
+            out3 = iz(f"处置 {code}", sender_a)
+            check("T39.4", "企微指令", "空态：无未处置告警时明确回报",
+                  "暂无未处置告警" in out3, out3[:80])
+
+            out4 = iz(f"确认处置 {code}", sender_v)
+            check("T39.5", "企微指令", "viewer 角色处置被拒（权限校验）",
+                  "权限" in out4, out4[:80])
+
+            out5 = iz(f"处置 {code}", sender_a)  # 预览入口复用；另测无空格写法
+            out5b = iz(f"处置{code}", sender_a)
+            check("T39.6", "企微指令", "无空格写法「处置HT-xxx」同样命中指令（不进 AI）",
+                  "暂无未处置告警" in out5b or "未处置告警" in out5b, out5b[:80])
+
+            # 清扫：停用测试店（店名含"测试店"也被套件清扫关键词兜底覆盖）
+            if hid:
+                req("PATCH", f"/api/hotels/{hid}", {"status": "已停用"}, token=token)
+        except Exception as _e:
+            check("S39", "异常隔离", "第 39 段未捕获异常（后续段继续）", False,
+                     f"{type(_e).__name__}: {_e}")
     except Exception as _e:
         import traceback
         traceback.print_exc()

@@ -164,3 +164,53 @@ MSYS→Windows exe 的参数转义会吃掉/提前展开 `$?`，凡是「命令�
 - Recurrence-Count: 1
 
 ---
+
+## [LRN-20261124-003] insight
+
+**Logged**: 2026-11-24T16:10:00+08:00
+**Priority**: high
+**Status**: resolved
+**Area**: security
+
+### Summary
+外部安全审计 9 条 issue 核实 8 实 1 部分实。根因复盘结论：功能测试全绿挡不住安全漏洞——所有问题长在「攻击者视角缺席」的盲区：验签回环测了原语没测信任链、指纹校验宽容写法复制 13 处、settings 黑名单让新密钥键静默暴露、新功能（续期订单）不回头审旧路径（group_renew 免付款）、安全债写在注释不进任务。
+
+### Details
+五个系统性病根：①验收标准没有攻击者（只测「能跑通」不测「滥用被挡」）②加新不审旧 ③fail-open 宽容默认带进生产 ④安全债无任务位 ⑤信任链（公钥分发/token 边界）当实现细节。典型案例：Ed25519 用得对但公钥随签名一起下发=签名白签；llm_config 自己脱敏而通用 get_settings 明文泄同一把 key——安全意识要制度化不能靠自觉。
+
+### Suggested Action
+防再发五机制：威胁三问（设计期）、攻击者回归段（测试期，本次 9 条固化 T40+）、发版安全五问闸门、新功能回头审旧路径、敏感输出白名单制。详见 docs/11-安全复盘与根因分析.md。
+
+### Metadata
+- Source: external-audit
+- Related Files: docs/11-安全复盘与根因分析.md
+- Tags: security, root-cause, threat-modeling
+- Pattern-Key: insight.attacker_perspective_absent
+- Recurrence-Count: 1
+
+---
+
+## [LRN-20261124-004] best_practice
+
+**Logged**: 2026-11-24T16:10:00+08:00
+**Priority**: medium
+**Status**: resolved
+**Area**: development-process
+
+### Summary
+「加新不审旧」是本项目反复踩坑的单一最大来源（group_renew 免付款、恢复按钮误绑、指纹校验半边落地、settings 新密钥暴露均为同型）。任何新增「写敏感字段/校验敏感头」的能力，上线前必须列出所有同类旧路径并纳入测试。
+
+### Details
+三步固化：①新功能设计时问「这个字段/动作还有哪些入口」；②把旧入口列进该模块开发记录的「旧路径复核」栏；③回归加断言（旧入口要么同等校验要么明确封禁）。类似地，安全校验抽公共依赖（Depends）单点实现，禁止复制粘贴校验代码——13 处同款 `if fingerprint and ...` 即教训。
+
+### Suggested Action
+模块开发记录模板加「旧路径复核」必填栏；安全校验一律走公共依赖。
+
+### Metadata
+- Source: conversation
+- Related Files: docs/09-开发记录.md
+- Tags: process, regression, refactoring
+- Pattern-Key: best_practice.review_old_paths
+- Recurrence-Count: 4
+
+---

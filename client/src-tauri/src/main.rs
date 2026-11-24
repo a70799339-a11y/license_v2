@@ -13,7 +13,7 @@ use license_core::{
 use serde_json::{json, Value};
 use tauri::State;
 
-const CLIENT_VERSION: &str = "1.2.2";
+const CLIENT_VERSION: &str = "1.2.3";
 
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
@@ -37,6 +37,82 @@ fn state_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."));
     base.join("hotel-client")
+}
+
+/// 第三方校验状态文件目录：优先机器级 ProgramData（第三方服务可跨用户读取），否则回落 APPDATA
+fn license_status_dir() -> PathBuf {
+    if let Some(pd) = std::env::var_os("ProgramData") {
+        let p = PathBuf::from(pd).join("hotel-client");
+        if std::fs::create_dir_all(&p).is_ok() {
+            return p;
+        }
+    }
+    state_dir()
+}
+
+/// Unix 秒 → "YYYY-MM-DD HH:MM:SS"（UTC；Howard Hinnant 日历算法，无第三方时间库）
+fn fmt_utc(unix: i64) -> String {
+    let (days, secs) = (unix.div_euclid(86400), unix.rem_euclid(86400));
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mth = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if mth <= 2 { 1 } else { 0 };
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, mth, d, h, m, s)
+}
+
+/// 推导第三方可见的状态字段（授权级事实 > 客户端锁定）
+/// 锁定优先级：离线锁先于时间锁——离线过久时 serverTime 锚点已陈旧，
+/// 用陈旧锚点判时间偏差会误报「时间锁定」（锚点新鲜时两路互斥，顺序无影响）。
+fn derive_status_state(st: &ClientState) -> &'static str {
+    let (offline_locked, _) = lock_state(st);
+    let time_locked = license_core::time_deviation_state(now_unix(), &st.last_server_time).0;
+    if st.status == "revoked" {
+        "已吊销"
+    } else if st.status == "expired" {
+        "已过期"
+    } else if st.status == "disabled" {
+        "已停用"
+    } else if offline_locked {
+        "离线锁定"
+    } else if time_locked {
+        "时间锁定"
+    } else {
+        "正常" // valid / expiring
+    }
+}
+
+/// 写第三方校验状态文件（Ed25519 签名载荷 + 推导状态），供同机第三方软件离线验签。
+/// 信任模型：payload/signature 为服务端签发（不可伪造）；state 为客户端推导，
+/// 与客户端自身感知同权（吊销感知滞后 = 心跳同步周期）。
+fn write_license_status_file(st: &ClientState) {
+    let signed = match &st.signed_license {
+        Some(v) => v,
+        None => return,
+    };
+    let out = json!({
+        "payload": signed.get("payload").cloned().unwrap_or(Value::Null),
+        "signature": signed.get("signature").cloned().unwrap_or(Value::Null),
+        "public_key": signed.get("public_key").cloned().unwrap_or(Value::Null),
+        "state": derive_status_state(st),
+        "serverTime": st.last_server_time,
+        "updatedAt": fmt_utc(now_unix()),
+    });
+    let path = license_status_dir().join("license_status.json");
+    match std::fs::write(&path, serde_json::to_vec_pretty(&out).unwrap_or_default()) {
+        Ok(_) => diag_log(&format!("status file written: {}", path.display())),
+        Err(e) => diag_log(&format!("status file write fail: {e}")),
+    }
+}
+
+/// 注销/清空状态时同步移除第三方校验文件（无文件 = 无授权，第三方按无效处理）
+fn remove_license_status_file() {
+    let _ = std::fs::remove_file(license_status_dir().join("license_status.json"));
 }
 
 /// 诊断日志：panic / 关键启动节点写入 crash.log（release 版无控制台，排查静默退出）
@@ -236,6 +312,7 @@ fn activate_core(
     }
     st.signed_license = Some(signed.clone());
     let _ = st.save(fp, &state_dir());
+    write_license_status_file(st);
 
     Ok(json!({
         "ok": true,
@@ -299,6 +376,7 @@ fn heartbeat_core_inner(fp: &str, st: &mut ClientState, allow_reauth: bool) -> R
             diag_log(&format!(
                 "heartbeat offline: locked={locked} remaining={remaining:.1}h ({e})"
             ));
+            write_license_status_file(st); // 离线锁状态变化也要让第三方看得见
             return Ok(json!({
                 "offline": true,
                 "locked": locked,
@@ -339,6 +417,7 @@ fn heartbeat_core_inner(fp: &str, st: &mut ClientState, allow_reauth: bool) -> R
         st.expire_at = exp.to_string();
     }
     let _ = st.save(fp, &state_dir());
+    write_license_status_file(st);
 
     let mut out = resp.clone();
     out["offline"] = json!(false);
@@ -665,6 +744,7 @@ fn logout(state: State<AppState>) {
         ..Default::default()
     };
     let _ = s.save(&fp, &state_dir());
+    remove_license_status_file(); // 注销后第三方校验文件同步消失
 }
 
 /// 自检模式：与界面按钮同一代码路径，跑完整激活 + 心跳 + 自助数据流程
@@ -864,6 +944,9 @@ fn main() {
     ));
     let loaded = ClientState::load(&fingerprint, &state_dir()).unwrap_or_default();
     diag_log("main: state loaded");
+    if !loaded.token.is_empty() {
+        write_license_status_file(&loaded); // 开机即提供第三方校验文件（不等首次心跳）
+    }
 
     let run_result = tauri::Builder::default()
         .manage(AppState {
@@ -907,5 +990,57 @@ fn main() {
             diag_log(&format!("main: build error: {e}"));
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_state() -> ClientState {
+        let now = fmt_utc(now_unix());
+        ClientState {
+            token: "t".into(),
+            status: "valid".into(),
+            last_sync: now.clone(),
+            last_server_time: now,
+            offline_grace_hours: 72,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn fmt_utc_known_values() {
+        assert_eq!(fmt_utc(0), "1970-01-01 00:00:00");
+        assert_eq!(fmt_utc(1700000000), "2023-11-14 22:13:20");
+    }
+
+    #[test]
+    fn status_state_license_facts_override_locks() {
+        // 授权级事实（吊销/过期/停用）优先于客户端锁定
+        let mut st = base_state();
+        st.status = "revoked".into();
+        assert_eq!(derive_status_state(&st), "已吊销");
+        st.status = "expired".into();
+        assert_eq!(derive_status_state(&st), "已过期");
+        st.status = "disabled".into();
+        assert_eq!(derive_status_state(&st), "已停用");
+    }
+
+    #[test]
+    fn status_state_time_lock() {
+        let mut st = base_state();
+        st.last_server_time = "2099-01-01 00:00:00".into(); // 服务端时间被改快超 24h
+        assert_eq!(derive_status_state(&st), "时间锁定");
+    }
+
+    #[test]
+    fn status_state_offline_lock_and_normal() {
+        let mut st = base_state();
+        st.last_sync = fmt_utc(now_unix() - 86400 * 30); // 30 天前同步，远超宽限期
+        st.last_server_time = st.last_sync.clone();
+        assert_eq!(derive_status_state(&st), "离线锁定");
+        let st2 = base_state(); // 刚同步 → 正常
+        assert_eq!(derive_status_state(&st2), "正常");
     }
 }

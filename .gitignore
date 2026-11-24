@@ -19,7 +19,9 @@ tests/last_results.json
 tests/*.png
 output/
 release/
-tools/
+# tools/ 下为本地杂项；verify_sample 是第三方交付物须入库
+tools/*
+!tools/verify_sample/
 
 # 系统文件
 .DS_Store

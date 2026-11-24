@@ -190,6 +190,41 @@ mod tests {
         let enc = encrypt_blob(fp, data).unwrap();
         assert_eq!(decrypt_blob(fp, &enc).unwrap(), data);
     }
+
+    /// 第三方校验状态文件契约：payload/signature/public_key 三元组离线验签回环。
+    /// state/serverTime/updatedAt 为客户端推导字段，不参与签名（篡改不影响验签，
+    /// 第三方判「授权真伪」只看 payload 签名，判「可用性」结合 state 与到期时间）。
+    #[test]
+    fn status_file_contract_roundtrip() {
+        let sk = SigningKey::from_bytes(&[9u8; 32]);
+        let vk = sk.verifying_key();
+        let payload: Value = serde_json::json!({
+            "code": "HT-0001", "plan": "旗舰版", "expire_at": "2027-12-31",
+            "hotel_id": "h1", "features": ["ai_risk"], "max_devices": 150
+        });
+        let sig_hex = hex::encode(sk.sign(&canonical_json(&payload)).to_bytes());
+        let pub_hex = hex::encode(vk.to_bytes());
+        // 模拟客户端写出的状态文件结构（与 main.rs write_license_status_file 一致）
+        let status_file: Value = serde_json::json!({
+            "payload": payload,
+            "signature": sig_hex,
+            "public_key": pub_hex,
+            "state": "正常",
+            "serverTime": "2026-11-23 10:00:00",
+            "updatedAt": "2026-11-23 10:00:05",
+        });
+        // 第三方按文档三步校验：取三元组 → 验签
+        let p = status_file.get("payload").unwrap();
+        let s = status_file.get("signature").and_then(|v| v.as_str()).unwrap();
+        let k = status_file.get("public_key").and_then(|v| v.as_str()).unwrap();
+        assert!(verify_license(p, s, k), "状态文件 payload 应验签通过");
+        // 载荷篡改（改到期日）→ 验签失败
+        let tampered: Value = serde_json::json!({
+            "code": "HT-0001", "plan": "旗舰版", "expire_at": "2099-12-31",
+            "hotel_id": "h1", "features": ["ai_risk"], "max_devices": 150
+        });
+        assert!(!verify_license(&tampered, s, k), "篡改 payload 必须验签失败");
+    }
 }
 
 /// 解析 "YYYY-MM-DD HH:MM:SS"（UTC）为 unix 秒

@@ -108,3 +108,59 @@ CLIENT_VERSION 常量是 0.2.1 而 tauri.conf 是 1.2.x、settings 是 1.1.0：u
 - Recurrence-Count: 1
 
 ---
+
+## [LRN-20261124-001] correction
+
+**Logged**: 2026-11-24T10:05:00+08:00
+**Priority**: high
+**Status**: resolved
+**Area**: git
+
+### Summary
+.gitignore **不支持行尾注释**——`!tools/verify_sample/  # 注释` 会把注释算进模式，否定规则静默失效；且 git add 对被忽略路径只给 warning 继续跑，暂存清单里没有目标文件却没被发现，多绕了一轮。
+
+### Details
+gitignore 每一整行就是一个 pattern，`#` 只有在行首才是注释。改正模式应写成：
+```
+# 注释独立成行
+tools/*
+!tools/verify_sample/
+```
+（用 `tools/*` 而非 `tools/`，否则父目录被排除后无法再纳入子项。）另外 git add 目标被忽略时返回 warning 而非失败——**add 之后必须用 `git diff --cached --name-only` 核实目标真的进暂存了**，不能只看命令没报错。
+
+### Suggested Action
+改 .gitignore 后立即 `git check-ignore -v <目标文件>` 验证规则生效；git add 后查暂存清单核对目标文件在列。
+
+### Metadata
+- Source: conversation
+- Related Files: .gitignore
+- Tags: git, gitignore, silent-failure
+- Pattern-Key: correction.gitignore_no_inline_comments
+- Recurrence-Count: 1
+
+---
+
+## [LRN-20261124-002] correction
+
+**Logged**: 2026-11-24T10:05:00+08:00
+**Priority**: high
+**Status**: resolved
+**Area**: testing
+
+### Summary
+Git Bash→wsl.exe 链路里 `echo $?` 捕获的退出码失真（`python -c "sys.exit(1)"` 都显示 0）——连续 4 轮误信 shell 输出去「排查」一个不存在的产品 bug，正确做法是断言退出码必须在 Python/进程层捕获。
+
+### Details
+MSYS→Windows exe 的参数转义会吃掉/提前展开 `$?`，凡是「命令退出码」类断言穿过多层 shell（Git Bash→wsl→bash -c）都不可信。同理，管道 `| tail` 后的 `$?` 是 tail 的退出码。现象与根因之间隔了两层转义时，先怀疑捕获链再怀疑被测对象——用 subprocess.run().returncode 或直接把断言写进 Python 脚本一次性收口。
+
+### Suggested Action
+测试脚本里的退出码/输出断言一律 Python 进程层捕获（subprocess returncode）；shell 里的 `echo $?` 仅作人工参考，不作断言依据。
+
+### Metadata
+- Source: conversation
+- Related Files: tools/verify_sample/verify_license_status.py, tests/client-accept/verify_sample_selftest.py
+- Tags: testing, wsl, shell-escaping, verification
+- Pattern-Key: correction.cross_shell_exit_code
+- Recurrence-Count: 1
+
+---

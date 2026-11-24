@@ -13,7 +13,7 @@ use license_core::{
 use serde_json::{json, Value};
 use tauri::State;
 
-const CLIENT_VERSION: &str = "1.2.4";
+const CLIENT_VERSION: &str = "1.2.5";
 
 /// S1：出厂固化 Ed25519 验签公钥——信任锚，禁止使用服务端响应携带的公钥验签
 /// （响应公钥仅供比对告警；密钥轮换需随客户端版本更新本常量）

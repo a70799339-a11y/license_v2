@@ -154,8 +154,11 @@ class DeviceOut(BaseModel):
 
     @classmethod
     def from_orm_model(cls, d):
+        # N4：管理端也只回打码指纹（前 6 + 后 4），完整指纹是激活凭据
+        fp = d.fingerprint or ""
+        masked_fp = f"{fp[:6]}…{fp[-4:]}" if len(fp) > 12 else "…"
         return cls(
-            id=d.id, name=d.name, os=d.os, fingerprint=d.fingerprint,
+            id=d.id, name=d.name, os=d.os, fingerprint=masked_fp,
             lastActive=d.last_active, status=d.status,
             unboundAt=d.unbound_at or "", unboundBy=d.unbound_by or "",
         )

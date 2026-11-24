@@ -949,14 +949,52 @@ def process_command(db: Session, text: str, sender: str = "unknown", on_slow=Non
         return "\n".join(f"· [{a.level}] {a.rule}（{a.status}）{_fmt_bj(a.time)}" for a in alerts)
 
     if cmd in ("续期", "确认续期") and hotel is not None and allowed(hotel):
+        # N5：①去掉写死到期日，按当前到期日顺延 ②集团角色免付款直续堵死——
+        # 内部角色（admin/operator）直续（与后台批量续期同权）；集团/其他角色创建续期订单，运营确认到账后生效
         if cmd == "续期":
-            return f"确认执行？回复：确认续期 {hotel.code}"
-        hotel.expire_at = "2027-12-31"
-        if hotel.status in ("即将到期", "已过期"):
-            hotel.status = "正常"
-        _audit(db, operator, "企微续期", hotel.name, "续期一年至 2027-12-31")
+            if binding.role in ("admin", "operator"):
+                return f"确认执行？回复：确认续期 {hotel.code}（续期一年，自当前到期日顺延）"
+            return f"确认执行？回复：确认续期 {hotel.code}（将创建续期订单，运营确认到账后生效）"
+        if binding.role in ("admin", "operator"):
+            try:
+                cur = datetime.strptime(hotel.expire_at or "", "%Y-%m-%d")
+            except ValueError:
+                cur = datetime.utcnow()
+            base = cur if cur > datetime.utcnow() else datetime.utcnow()
+            new_expire = (base + timedelta(days=365)).strftime("%Y-%m-%d")
+            hotel.expire_at = new_expire
+            if hotel.status in ("即将到期", "已过期"):
+                hotel.status = "正常"
+            _audit(db, operator, "企微续期", hotel.name, f"续期一年至 {new_expire}")
+            db.commit()
+            return f"✅ {hotel.name} 已续期至 {new_expire}"
+        # 集团/只读等非内部角色：创建续期订单（与客户端自助续期同轨，防免付款续期）
+        import uuid as _uuid
+
+        from .client_api import _plan_price
+        from .models import RenewOrder
+
+        amount = _plan_price(db, hotel.plan or "专业版", 12)
+        order = RenewOrder(
+            order_no=f"RO-{datetime.utcnow().strftime('%Y%m%d')}-{_uuid.uuid4().hex[:6]}",
+            target_type="hotel",
+            target_id=hotel.id,
+            target_ids=hotel.id,
+            target_name=hotel.name,
+            plan=hotel.plan,
+            months=12,
+            amount=amount,
+            channel="transfer",
+            status="待支付",
+            created_at=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        db.add(order)
+        _audit(db, operator, "企微续期下单", hotel.name, f"续期订单 {order.order_no}（12 个月 · ¥{amount:.2f}）")
         db.commit()
-        return f"✅ {hotel.name} 已续期至 2027-12-31"
+        return (
+            f"✅ 已创建续期订单 {order.order_no}（12 个月 · ¥{amount:.2f}）。\n"
+            f"对公付款后将回单提交运营，确认到账即自动续期。"
+        )
 
     # 停用（拉黑）：v1.1.1 二次确认后停用客户（等效拉黑，剔除统计与查询）
     if cmd in ("停用", "确认停用", "拉黑", "确认拉黑") and hotel is not None and allowed(hotel):

@@ -19,7 +19,8 @@ class Group(Base):
     __tablename__ = "groups"
     id = Column(String(16), primary_key=True, index=True)
     name = Column(String(64), unique=True, nullable=False, index=True)
-    code = Column(String(32), unique=True, nullable=False, index=True)  # 集团码 GP-xxxx，总端激活用
+    code = Column(String(32), unique=True, nullable=False, index=True)  # 集团展示编号 GP-xxxx（不可作激活凭据）
+    activation_key = Column(String(32), default="")  # N1：高熵集团激活码 GPK-xxxx，总端激活凭据
     contact = Column(String(64), default="")
     phone = Column(String(32), default="")
     status = Column(String(16), default="正常")

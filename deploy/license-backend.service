@@ -5,9 +5,9 @@ After=network.target postgresql.service
 [Service]
 User=__USER__
 WorkingDirectory=/opt/license/backend
-Environment=DATABASE_URL=postgresql+psycopg2://postgres:license123@127.0.0.1:5432/license
-Environment=JWT_SECRET=change-me-in-production
-ExecStart=/opt/license/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+# N10：密钥走 EnvironmentFile（600），服务文件不放任何口令（部署脚本生成 /opt/license/env.file）
+EnvironmentFile=/opt/license/env.file
+ExecStart=/opt/license/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --proxy-headers --forwarded-allow-ips=127.0.0.1
 Restart=always
 RestartSec=3
 

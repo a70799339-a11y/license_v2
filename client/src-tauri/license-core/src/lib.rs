@@ -7,7 +7,7 @@
 //! 4. 时钟回滚检测（对比历史服务端时间）
 pub mod anti_debug;
 
-use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use obfstr::obfstr;
@@ -83,24 +83,36 @@ fn derive_key(fingerprint: &str) -> [u8; 32] {
 }
 
 /// 加密本地许可证/令牌存储
+/// N8：随机 nonce（每次保存不同），格式 [b"LN2" + nonce(12) + 密文]，杜绝 nonce 复用
 pub fn encrypt_blob(fingerprint: &str, plaintext: &[u8]) -> Result<Vec<u8>, String> {
     let key = derive_key(fingerprint);
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
-    // v0.x：nonce 为密钥派生常量（同机解密场景）；商业化前换随机 nonce + 文件头存储
-    let mut nonce_bytes = [0u8; 12];
-    nonce_bytes.copy_from_slice(&key[..12]);
-    cipher
-        .encrypt(Nonce::from_slice(&nonce_bytes), plaintext)
-        .map_err(|e| format!("加密失败: {e}"))
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let ct = cipher
+        .encrypt(&nonce, plaintext)
+        .map_err(|e| format!("加密失败: {e}"))?;
+    let mut out = Vec::with_capacity(4 + 12 + ct.len());
+    out.extend_from_slice(b"LN2");
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct);
+    Ok(out)
 }
 
-pub fn decrypt_blob(fingerprint: &str, ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+pub fn decrypt_blob(fingerprint: &str, data: &[u8]) -> Result<Vec<u8>, String> {
     let key = derive_key(fingerprint);
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+    if data.len() > 15 && &data[..3] == b"LN2" {
+        // 新格式：magic + 随机 nonce + 密文
+        let nonce_bytes = &data[3..15];
+        return cipher
+            .decrypt(Nonce::from_slice(nonce_bytes), &data[15..])
+            .map_err(|e| format!("解密失败: {e}"));
+    }
+    // 兼容旧格式（固定 nonce=key[:12]，历史 state.bin 仍可读）
     let mut nonce_bytes = [0u8; 12];
     nonce_bytes.copy_from_slice(&key[..12]);
     cipher
-        .decrypt(Nonce::from_slice(&nonce_bytes), ciphertext)
+        .decrypt(Nonce::from_slice(&nonce_bytes), data)
         .map_err(|e| format!("解密失败: {e}"))
 }
 
@@ -189,6 +201,36 @@ mod tests {
         let data = b"hello license";
         let enc = encrypt_blob(fp, data).unwrap();
         assert_eq!(decrypt_blob(fp, &enc).unwrap(), data);
+        // N8：新格式带 LN2 魔数头 + 随机 nonce
+        assert_eq!(&enc[..3], b"LN2");
+    }
+
+    #[test]
+    fn encrypt_uses_unique_nonce() {
+        // N8：两次加密同一明文必须得到不同密文（随机 nonce 生效）
+        let fp = "abc123";
+        let data = b"same plaintext";
+        let a = encrypt_blob(fp, data).unwrap();
+        let b = encrypt_blob(fp, data).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(decrypt_blob(fp, &a).unwrap(), data);
+        assert_eq!(decrypt_blob(fp, &b).unwrap(), data);
+    }
+
+    #[test]
+    fn decrypt_legacy_fixed_nonce_format() {
+        // 兼容旧格式（固定 nonce=key[:12]，历史 state.bin 仍可读）
+        use aes_gcm::aead::Aead;
+        use aes_gcm::{Aes256Gcm, Key, Nonce};
+        let fp = "abc123";
+        let key = derive_key(fp);
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+        let mut nonce_bytes = [0u8; 12];
+        nonce_bytes.copy_from_slice(&key[..12]);
+        let legacy = cipher
+            .encrypt(Nonce::from_slice(&nonce_bytes), &b"old state"[..])
+            .unwrap();
+        assert_eq!(decrypt_blob(fp, &legacy).unwrap(), b"old state");
     }
 
     /// 第三方校验状态文件契约：payload/signature/public_key 三元组离线验签回环。

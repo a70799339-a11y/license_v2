@@ -338,10 +338,11 @@ def main():
 
             st, p = req("GET", "/api/client/profile", token=ctoken, headers={"X-Device-Fingerprint": FP})
             devs = (p or {}).get("devices") or []
+            fpm = FP[:6] + "…" + FP[-4:]  # N4 后 profile 指纹为打码形式
             check("T10.9", "客户端同步", "自助数据仅含本酒店（设备/告警）", st == 200
                   and (p or {}).get("hotel", {}).get("id") == "h001"
-                  and any(d.get("fingerprint") == FP for d in devs),
-                  f"devices={len(devs)}，含本机={any(d.get('fingerprint') == FP for d in devs)}")
+                  and any(d.get("fingerprint") == fpm for d in devs),
+                  f"devices={len(devs)}，含本机={any(d.get('fingerprint') == fpm for d in devs)}")
 
         except Exception as _e:
             check("S10", "异常隔离", "第 10 段未捕获异常（后续段继续）", False,
@@ -406,8 +407,10 @@ def main():
                   f"{len(gs)} 个集团")
 
             g0 = gs[0] if gs else {}
+            check("T12.1b", "总/子管理", "集团激活码随列表下发（admin 可见）", bool(g0.get("activationKey")),
+                  f"activationKey={'有' if g0.get('activationKey') else '缺'}")
             st, p = req("POST", "/api/client/activate",
-                        {"licenseCode": g0.get("code", "GP-0001"), "deviceName": "集团总部测试"},
+                        {"licenseCode": g0.get("activationKey") or "GPK-NONE", "deviceName": "集团总部测试"},
                         headers={"X-Device-Fingerprint": GP_FP})
             gtok = (p or {}).get("token")
             signed = (p or {}).get("signed_license") or {}
@@ -728,8 +731,9 @@ def main():
 
             # 集团总端配置（走 wecom_group_hooks）
             gfp = t14fp("gc")
+            _gk = ((req("GET", "/api/groups", token=token)[1] or [{}])[0]).get("activationKey") or "GPK-NONE"
             st, p = req("POST", "/api/client/activate",
-                        {"licenseCode": "GP-0001", "deviceName": "配置测试总端"}, headers={"X-Device-Fingerprint": gfp})
+                        {"licenseCode": _gk, "deviceName": "配置测试总端"}, headers={"X-Device-Fingerprint": gfp})
             gtok2 = (p or {}).get("token")
             ghook = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=grouphook456"
             req("POST", "/api/client/notify/config", {"webhookUrl": ghook},
@@ -1361,7 +1365,9 @@ def main():
                   f"devices={n_dev} quota={(dl or {}).get('quota_left_today')}")
 
             def _dev_id(fp):
-                return next((d["id"] for d in (dl or {}).get("devices") or [] if d["fingerprint"] == fp), "")
+                # N4 后 devices 只回打码指纹——按设备名匹配
+                name_map = {fpA: "前台-01", fpB: "前台-02", fpC: "前台-03", fpD: "前台-04", fpE: "前台-05", fpG: "前台-06"}
+                return next((d["id"] for d in (dl or {}).get("devices") or [] if d["name"] == name_map.get(fp)), "")
 
             # 默认阈值 30 分钟：刚激活的 B 在线 → 解绑拒绝
             bid = _dev_id(fpB)
@@ -1688,7 +1694,9 @@ def main():
             st, dl = req("GET", "/api/client/devices", token=toks[fpQA], headers={"X-Device-Fingerprint": fpQA})
 
             def _qid(fpx):
-                return next((d["id"] for d in (dl or {}).get("devices") or [] if d["fingerprint"] == fpx), "")
+                # N4 后 devices 只回打码指纹——按设备名匹配（名称为测试自控）
+                name_map = {fpQA: "边界-01", fpQB: "边界-02", fpQC: "边界-03", fpQD: "边界-04"}
+                return next((d["id"] for d in (dl or {}).get("devices") or [] if d["name"] == name_map.get(fpx)), "")
 
             # T37.1 7 天内 3 次自助换机 → 第 3 次触发「频繁自助换机」高告警
             u_sts = []
@@ -1741,7 +1749,7 @@ def main():
                          {"licenseCode": (rlic or {}).get("code"), "deviceName": "阈值-02", "os_name": "testos"},
                          headers={"X-Device-Fingerprint": fpRE})
             st, dl2 = req("GET", "/api/client/devices", token=tokR, headers={"X-Device-Fingerprint": fpRA})
-            eid = next((d["id"] for d in (dl2 or {}).get("devices") or [] if d["fingerprint"] == fpRE), "")
+            eid = next((d["id"] for d in (dl2 or {}).get("devices") or [] if d["name"] == "阈值-02"), "")
             ok29 = sql_exec(
                 f"UPDATE devices SET last_active = to_char(now() at time zone 'utc' - interval '29 minutes', "
                 f"'YYYY-MM-DD HH24:MI:SS') WHERE id = '{eid}'")
@@ -1821,7 +1829,7 @@ def main():
                          headers={"X-Device-Fingerprint": fpC2})
             req("POST", "/api/settings", {"key": "unbind_offline_minutes", "value": "0"}, token=token)
             st, dl3 = req("GET", "/api/client/devices", token=tokC, headers={"X-Device-Fingerprint": fpC1})
-            tid = next((d["id"] for d in (dl3 or {}).get("devices") or [] if d["fingerprint"] == fpC2), "")
+            tid = next((d["id"] for d in (dl3 or {}).get("devices") or [] if d["name"] == "并发解绑-B"), "")
             st, hd_b = req("GET", f"/api/hotels/{c_id}/detail", token=token)  # 解绑前重取，勿用 T38.1 旧快照
             dev_before = ((hd_b or {}).get("hotel") or {}).get("devices", -1)
             barrier2 = threading.Barrier(2)
@@ -1993,6 +2001,164 @@ def main():
         except Exception as _e:
             check("S40", "异常隔离", "第 40 段未捕获异常（后续段继续）", False,
                      f"{type(_e).__name__}: {_e}")
+
+        # ---------------- 41. 复审回归（N1~N11 修复固化，2026-11-25） ----------------
+        try:
+            print("【41. 复审回归】")
+            import json as _json
+            import subprocess as _sp
+
+            # N2 限流键已改为 IP（全套件共用一个桶）：先抬阈值防 T40.5 残余失败误伤本段
+            req("POST", "/api/settings", {"key": "activate_fail_limit", "value": "999"}, token=token)
+            ts = str(int(time.time() * 1000))[-8:]
+            n_code = f"HT-N{ts[-6:]}"
+            n_name = f"复审店{ts}"
+            st, p = req("POST", "/api/hotels", {"name": n_name, "code": n_code, "plan": "专业版"}, token=token)
+            n_hid = (p or {}).get("id", "")
+            st, lic = req("POST", "/api/licenses",
+                          {"hotelId": n_hid, "plan": "专业版", "type": "新签", "months": 6}, token=token)
+            lic_code = (lic or {}).get("code", "")
+
+            # T41.1 N1：集团展示编号 GP- 不能激活
+            st, _ = req("POST", "/api/client/activate",
+                        {"licenseCode": "GP-0001", "deviceName": "x"},
+                        headers={"X-Device-Fingerprint": f"n1a{ts}"})
+            check("T41.1", "复审", "N1 集团展示编号 GP- 激活被拒", st == 403, f"HTTP {st}")
+
+            # T41.2 N1：伪造集团激活码无效
+            st, _ = req("POST", "/api/client/activate",
+                        {"licenseCode": "GPK-0000000000000000", "deviceName": "x"},
+                        headers={"X-Device-Fingerprint": f"n1b{ts}"})
+            check("T41.2", "复审", "N1 伪造 GPK 激活码无效", st in (403, 404), f"HTTP {st}")
+
+            # T41.3 N2：换指纹不能绕过激活限流（限流键=IP）
+            st, s0 = req("GET", "/api/settings", token=token)
+            prev_limit = (s0 or {}).get("activate_fail_limit", "")
+            req("POST", "/api/settings", {"key": "activate_fail_limit", "value": "3"}, token=token)
+            sts = []
+            for i in range(4):
+                st, _ = req("POST", "/api/client/activate",
+                            {"licenseCode": f"HT-NOPE{i}{ts}", "deviceName": "x"},
+                            headers={"X-Device-Fingerprint": f"fpv{i}{ts}"})
+                sts.append(st)
+            check("T41.3", "复审", "N2 每次换指纹仍被 IP 限流 429",
+                  429 in sts and sts[-1] == 429, f"sts={sts}")
+            req("POST", "/api/settings", {"key": "activate_fail_limit", "value": prev_limit or "10"}, token=token)
+
+            # T41.4 N3：已禁用设备重新激活被拒（SQL 造状态，产品暂无禁用入口）
+            fpA = f"n3a{ts}"
+            st, act = req("POST", "/api/client/activate",
+                          {"licenseCode": lic_code, "deviceName": f"复审机A{ts}"},
+                          headers={"X-Device-Fingerprint": fpA})
+            atok = (act or {}).get("token", "")
+            check("T41.4a", "复审", "基准：授权码激活成功", st == 200 and bool(atok), f"HTTP {st}")
+            sql_exec(f"UPDATE devices SET status='已禁用' WHERE fingerprint='{fpA}'")
+            st, _ = req("POST", "/api/client/activate",
+                        {"licenseCode": lic_code, "deviceName": f"复审机A{ts}"},
+                        headers={"X-Device-Fingerprint": fpA})
+            check("T41.4", "复审", "N3 已禁用设备重新激活被拒", st == 403, f"HTTP {st}")
+            sql_exec(f"UPDATE devices SET status='离线' WHERE fingerprint='{fpA}'")
+
+            # T41.5 N3：解绑态重激活回补配额；超限拒绝
+            sql_exec(f"UPDATE hotels SET max_devices=1 WHERE id='{n_hid}'")
+            sql_exec(f"UPDATE devices SET status='已解绑' WHERE fingerprint='{fpA}'")
+            sql_exec(f"UPDATE hotels SET devices=0 WHERE id='{n_hid}'")  # 模拟解绑后状态
+            st, act2 = req("POST", "/api/client/activate",
+                           {"licenseCode": lic_code, "deviceName": f"复审机A{ts}"},
+                           headers={"X-Device-Fingerprint": fpA})
+            st_d, hd = req("GET", f"/api/hotels/{n_hid}/detail", token=token)
+            now_dev = ((hd or {}).get("hotel") or {}).get("devices", -1)
+            check("T41.5a", "复审", "N3 解绑态重激活回补配额（devices 0→1）",
+                  st == 200 and now_dev == 1, f"HTTP {st} devices={now_dev}")
+            st, _ = req("POST", "/api/client/activate",
+                        {"licenseCode": lic_code, "deviceName": f"复审机B{ts}"},
+                        headers={"X-Device-Fingerprint": f"n3b{ts}"})
+            check("T41.5b", "复审", "N3 配额满后新设备激活拒绝", st == 403, f"HTTP {st}")
+
+            # T41.6 N4：设备清单指纹打码
+            st, dl = req("GET", "/api/client/devices", token=atok, headers={"X-Device-Fingerprint": fpA})
+            raw_dl = _json.dumps(dl or {}, ensure_ascii=False)
+            check("T41.6", "复审", "N4 设备指纹只回打码形式",
+                  st == 200 and "…" in raw_dl and fpA not in raw_dl, f"HTTP {st}")
+
+            # T41.7 N5：企微 group 角色确认续期 → 创建订单不直改到期日
+            st, gp = req("POST", "/api/groups", {"name": f"复审集团{ts}", "plan": "旗舰版",
+                                                 "expireAt": "2027-12-31"}, token=token)
+            g_hid = (gp or {}).get("id", "")
+            req("POST", "/api/groups/assign", {"groupId": g_hid, "hotelIds": [n_hid]}, token=token)
+            sender_g = f"t41g{ts}"
+            sql_exec(f"INSERT INTO wecom_bindings (userid,name,role,group_id) VALUES "
+                     f"('{sender_g}','T41group','group','{g_hid}') ON CONFLICT (userid) DO NOTHING")
+
+            def iz(text: str, sender: str) -> str:
+                py = "/opt/license/.venv/bin/python3"
+                if not os.path.exists(py):
+                    py = "python3"
+                r = _sp.run(
+                    [py, os.path.join(os.path.dirname(os.path.abspath(__file__)), "t39_cmd.py"), text, sender],
+                    capture_output=True, text=True, timeout=30,
+                    cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                return (r.stdout or "").strip()
+
+            st_h, hd0 = req("GET", f"/api/hotels/{n_hid}/detail", token=token)
+            exp_before = ((hd0 or {}).get("hotel") or {}).get("expireAt", "")
+            out_g = iz(f"确认续期 {n_code}", sender_g)
+            st_h, hd1 = req("GET", f"/api/hotels/{n_hid}/detail", token=token)
+            exp_after = ((hd1 or {}).get("hotel") or {}).get("expireAt", "")
+            check("T41.7", "复审", "N5 集团角色确认续期→创建订单而非直改",
+                  "已创建续期订单 RO-" in out_g and exp_after == exp_before,
+                  f"{out_g[:60]} | exp {exp_before}→{exp_after}")
+
+            # 内部角色直续：自当前到期日顺延（不再写死 2027-12-31）
+            sender_a2 = f"t41a{ts}"
+            sql_exec(f"INSERT INTO wecom_bindings (userid,name,role,group_id) VALUES "
+                     f"('{sender_a2}','T41admin','admin','') ON CONFLICT (userid) DO NOTHING")
+            out_a = iz(f"确认续期 {n_code}", sender_a2)
+            st_h, hd2 = req("GET", f"/api/hotels/{n_hid}/detail", token=token)
+            exp_admin = ((hd2 or {}).get("hotel") or {}).get("expireAt", "")
+            check("T41.7b", "复审", "N5 内部角色直续按到期日顺延（非写死日期）",
+                  "已续期至" in out_a and exp_admin > exp_before and exp_admin != "2027-12-31",
+                  f"{out_a[:50]} | exp={exp_before}→{exp_admin}")
+
+            # T41.8 N6：viewer 授权码打码
+            st, vlogin = req("POST", "/api/auth/login", {"username": "viewer", "password": "viewer123"})
+            vtok = (vlogin or {}).get("token", "")
+            st, vl = req("GET", "/api/licenses", token=vtok)
+            raw_v = _json.dumps(vl or [], ensure_ascii=False)
+            check("T41.8", "复审", "N6 viewer 授权码只见打码",
+                  st == 200 and lic_code not in raw_v and "＊" in raw_v, f"HTTP {st}")
+
+            # T41.9 N7：不存在套餐下单 400
+            st, _ = req("POST", "/api/client/renew/order",
+                        {"plan": f"不存在套餐{ts}", "months": 12},
+                        token=atok, headers={"X-Device-Fingerprint": fpA})
+            check("T41.9", "复审", "N7 不存在套餐创建订单 400", st == 400, f"HTTP {st}")
+
+            # T41.10 N11：银行卡脱敏保留后 4 位（审计管道实测）
+            req("POST", "/api/settings", {"key": "tmp_bank_probe", "value": "6222021234567890"}, token=token)
+            st, lg = req("GET", "/api/logs", token=token)
+            log_text = _json.dumps(lg or [], ensure_ascii=False)
+            check("T41.10", "复审", "N11 银行卡掩码保留后 4 位（无 \\x02）",
+                  "6222" in log_text and "7890" in log_text and "＊" in log_text
+                  and "\x02" not in log_text and "6222021234567890" not in log_text,
+                  f"mask={'ok' if '7890' in log_text else 'missing'}")
+
+            # 清扫
+            req("POST", "/api/settings", {"key": "tmp_bank_probe", "value": ""}, token=token)
+            sql_exec(f"DELETE FROM renew_orders WHERE target_id='{n_hid}'")
+            sql_exec(f"DELETE FROM wecom_bindings WHERE userid IN ('{sender_g}','{sender_a2}')")
+            if n_hid:
+                req("PATCH", f"/api/hotels/{n_hid}", {"status": "已停用"}, token=token)
+        except Exception as _e:
+            check("S41", "异常隔离", "第 41 段未捕获异常（后续段继续）", False,
+                     f"{type(_e).__name__}: {_e}")
+        finally:
+            # T41.3 的限流阈值无论如何还原（防 429 锁死后续激活）
+            try:
+                if token:
+                    req("POST", "/api/settings", {"key": "activate_fail_limit", "value": "10"}, token=token)
+            except Exception:
+                pass
     except Exception as _e:
         import traceback
         traceback.print_exc()
@@ -2020,11 +2186,12 @@ def main():
                     print(f"[cleanup] 企微/推送配置已还原 {len(wecom_snapshot)} 键 + {len(group_hooks_snapshot)} 集团 hook")
                 req("POST", "/api/settings", {"key": "unbind_offline_minutes", "value": "30"}, token=token)
                 req("POST", "/api/settings", {"key": "renew_order_ttl_hours", "value": "2"}, token=token)
+                req("POST", "/api/settings", {"key": "activate_fail_limit", "value": "10"}, token=token)
                 st, hs = req("GET", "/api/hotels", token=token)
                 swept = 0
                 for h in (hs or []):
                     name = h.get("name") or ""
-                    if any(k in name for k in ("测试店", "测试酒", "复现", "核对", "清点", "防撞", "调试", "调一店", "调二店", "撞测", "冒烟", "拉黑", "竞态", "NOPE")) and h.get("status") != "已停用":
+                    if any(k in name for k in ("测试店", "测试酒", "复现", "核对", "清点", "防撞", "调试", "调一店", "调二店", "撞测", "冒烟", "拉黑", "竞态", "NOPE", "复审")) and h.get("status") != "已停用":
                         req("PATCH", f"/api/hotels/{h.get('id')}", {"status": "已停用"}, token=token)
                         swept += 1
                 print(f"[cleanup] 测试店清扫：停用 {swept} 家")

@@ -39,7 +39,7 @@ def mask_text(text: str) -> str:
     s = _RE_ID15.sub(lambda m: f"{m.group(1)}{'＊' * 8}{m.group(2)[-2:]}", s)
     s = _RE_PHONE.sub(r"\1＊＊＊＊\3", s)
     s = _RE_EMAIL.sub(r"\1＊＊＊@\2", s)
-    s = _RE_BANK.sub("＊＊＊＊＊＊＊＊＊＊＊＊\2", s)
+    s = _RE_BANK.sub(r"\1＊＊＊＊＊＊＊＊＊＊＊＊\2", s)  # N11：raw 串 + 保留首 4 后 4（\2 否则变控制字符）
     s = _RE_FINGERPRINT.sub(r"\1…\2", s)
     s = _RE_WEBHOOK_KEY.sub(r"\1＊＊＊", s)
 

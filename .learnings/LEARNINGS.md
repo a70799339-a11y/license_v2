@@ -214,3 +214,28 @@ MSYS→Windows exe 的参数转义会吃掉/提前展开 `$?`，凡是「命令�
 - Recurrence-Count: 4
 
 ---
+
+## [LRN-20261125-001] insight
+
+**Logged**: 2026-11-25T07:55:00+08:00
+**Priority**: high
+**Status**: resolved
+**Area**: security
+
+### Summary
+二轮复审 N1~N13 全属实。核心病根是「修复只修报告点，不修攻击面」：S2 修了酒店编号枚举却漏了同类集团码 GP-0001（N1），S2 的限流键拼了客户端可控指纹头可换头绕过（N2），S3 堵了 API 却漏了企微同型入口（N5），S4 修了校验却让被校验凭据（指纹）在列表明文回显（N4）。
+
+### Details
+修复面完整性三步：①修一个凭据/字段漏洞时列出它的全部暴露面（谁能看到/谁能在哪用）②限流/审计等防护键禁止含客户端可控输入 ③状态枚举的每个值要有写入口与复活测试。注释里的「商业化前再改」（N8 nonce 固定）必须立任务，与 CORS 教训同型。
+
+### Suggested Action
+安全修复收尾 checklist 增加一项「攻击面盘点」：对被修凭据/字段穷举读写入口并逐一测试。
+
+### Metadata
+- Source: external-review
+- Related Files: docs/11-安全复盘与根因分析.md
+- Tags: security, attack-surface, rate-limit
+- Pattern-Key: insight.fix_surface_not_point
+- Recurrence-Count: 1
+
+---

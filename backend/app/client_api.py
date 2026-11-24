@@ -190,24 +190,46 @@ def offline_grace_hours(db: Session) -> int:
 
 
 # ---------- 接口 ----------
-# S2：激活防爆破——同 IP+指纹 15 分钟内失败 10 次 → 429（内存计数；失败=无效凭据探测）
+# S2/N2：激活防爆破——同 IP 15 分钟内失败 N 次 → 429（内存计数；失败=无效凭据探测）
+# N2：限流键只用 IP——指纹是客户端可控请求头，拼进键里换指纹即绕过
 _ACTIVATE_FAIL_WINDOW = 900
 _ACTIVATE_FAIL_LIMIT = 10
+_ACTIVATE_FAIL_MAX_KEYS = 10000  # N12：键数上限，防客户端乱填指纹撑爆内存
 _activate_failures: dict = {}
 _activate_lock = threading.Lock()
 
 
-def _activate_rate_key(request: Request, fingerprint: str) -> str:
+def _activate_rate_key(request: Request) -> str:
     ip = request.client.host if request.client else "?"
-    return f"{ip}|{fingerprint}"
+    return ip
 
 
-def _activate_too_often(key: str) -> bool:
+def _activate_fail_limit(db) -> int:
+    """失败限流阈值（settings activate_fail_limit 可调，测试/防护调优用），默认 10"""
+    from .wecom import get_setting
+
+    try:
+        return max(1, int(get_setting(db, "activate_fail_limit", str(_ACTIVATE_FAIL_LIMIT))))
+    except Exception:
+        return _ACTIVATE_FAIL_LIMIT
+
+
+def _activate_too_often(key: str, limit: int) -> bool:
     now = time.time()
     with _activate_lock:
+        # N12：过期键清理 + 键数封顶
+        if len(_activate_failures) > _ACTIVATE_FAIL_MAX_KEYS:
+            for k in list(_activate_failures):
+                arr = [t for t in _activate_failures[k] if now - t < _ACTIVATE_FAIL_WINDOW]
+                if arr:
+                    _activate_failures[k] = arr
+                else:
+                    _activate_failures.pop(k, None)
+            while len(_activate_failures) > _ACTIVATE_FAIL_MAX_KEYS:
+                _activate_failures.pop(next(iter(_activate_failures)), None)
         arr = [t for t in _activate_failures.get(key, []) if now - t < _ACTIVATE_FAIL_WINDOW]
         _activate_failures[key] = arr
-        return len(arr) >= _ACTIVATE_FAIL_LIMIT
+        return len(arr) >= limit
 
 
 def _activate_record_failure(key: str) -> None:
@@ -229,12 +251,13 @@ def activate(
 ):
     if not fingerprint:
         raise HTTPException(status_code=400, detail="缺少设备指纹（X-Device-Fingerprint）")
-    rate_key = _activate_rate_key(request, fingerprint)
-    if _activate_too_often(rate_key):
+    rate_key = _activate_rate_key(request)
+    if _activate_too_often(rate_key, _activate_fail_limit(db)):
         raise HTTPException(status_code=429, detail="激活尝试过于频繁，请稍后再试")
 
-    # 集团码（GP-xxxx）→ 总端激活
-    group = db.query(Group).filter(Group.code == req.licenseCode).first()
+    # 集团激活码（GPK-高熵）→ 总端激活。N1：GP-xxxx 展示编号不再作为激活凭据（防枚举）
+    code_in = (req.licenseCode or "").strip()
+    group = db.query(Group).filter(Group.activation_key == code_in).first() if code_in else None
     if group is not None:
         if group.status == "已停用":
             raise HTTPException(status_code=403, detail="该集团已停用，无法激活")
@@ -270,6 +293,14 @@ def activate(
             "client_version": version["latest"],
             "offline_grace_hours": offline_grace_hours(db),
         }
+
+    # N1：集团展示编号（GP-xxxx）不可作激活凭据
+    if code_in.startswith("GP-"):
+        _activate_record_failure(rate_key)
+        raise HTTPException(
+            status_code=403,
+            detail="集团编号不能作为激活凭据，请使用集团激活码（GPK-）激活",
+        )
 
     # 用授权码或客户编号定位（单店）
     lic = db.query(License).filter(License.code == req.licenseCode).first()
@@ -416,6 +447,27 @@ def activate(
                 detail=f"24 小时内新建激活设备达 {created_recent} 台，疑似批量滥用授权",
             )
     else:
+        # N3：复活必须看原状态——已禁用拒绝；已解绑/已迁移重新占配额（防解绑-激活循环超卖）
+        if device.status == "已禁用":
+            raise HTTPException(status_code=403, detail="该设备已被禁用，无法激活，请联系服务商")
+        if device.status in ("已解绑", "已迁移"):
+            locked = (
+                db.query(Hotel)
+                .filter(Hotel.id == hotel.id)
+                .with_for_update()
+                .populate_existing()
+                .first()
+            )
+            if locked is not None:
+                hotel = locked
+            if hotel.devices >= hotel.max_devices and migrate_target is None:
+                raise_alert(
+                    db, level="中", rule="设备数超限", hotel_name=hotel.name,
+                    detail=f"解绑设备重新激活时配额已满（{hotel.devices}/{hotel.max_devices}）",
+                )
+                db.commit()
+                raise HTTPException(status_code=403, detail="设备数已达套餐上限，请先解绑或升级套餐")
+            hotel.devices = (hotel.devices or 0) + 1
         device.last_active = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         device.status = "在线"
         if req.deviceName:
@@ -633,7 +685,7 @@ def profile(
                 "id": d.id,
                 "name": d.name,
                 "os": d.os,
-                "fingerprint": d.fingerprint,
+                "fingerprint": _mask_fp(d.fingerprint),
                 "last_active": d.last_active,
                 "status": d.status,
             }
@@ -933,6 +985,13 @@ UNBIND_WEEK_ALERT = 3        # 7 天内 ≥3 次 → 升「高」告警并企微
 RENEW_ORDER_TTL_HOURS = 2    # 待支付订单 2 小时自动关闭
 
 
+def _mask_fp(fp: str) -> str:
+    """N4：指纹只回打码形式（前 6 + 后 4）——完整指纹是「编号激活」的凭据，不能下发"""
+    if not fp:
+        return ""
+    return f"{fp[:6]}…{fp[-4:]}" if len(fp) > 12 else "…"
+
+
 def _offline_minutes(db: Session) -> int:
     from .wecom import get_setting
 
@@ -1071,7 +1130,7 @@ def list_devices(
                 "id": d.id,
                 "name": d.name,
                 "os": d.os,
-                "fingerprint": d.fingerprint,
+                "fingerprint": _mask_fp(d.fingerprint),
                 "last_active": d.last_active,
                 "status": d.status,
                 "unbound_at": d.unbound_at,
@@ -1254,6 +1313,9 @@ def create_renew_order(
         raise HTTPException(status_code=401, detail="设备指纹不一致")
     if req.months not in (12, 24):
         raise HTTPException(status_code=400, detail="仅支持续期 12 或 24 个月")
+    # N7：套餐必须真实存在（防未知套餐名产生 0 元订单/写入异常套餐）
+    if req.plan and not db.query(Plan).filter(Plan.name == req.plan).first():
+        raise HTTPException(status_code=400, detail="套餐不存在")
     _close_stale_orders(db)
 
     targets: list = []
@@ -1279,6 +1341,9 @@ def create_renew_order(
     for h in targets:
         plan_name = req.plan or h.plan
         amount += _plan_price(db, plan_name, req.months)
+    # N7：0 元订单直接拒绝（套餐未配置价格/异常组合），依赖人工审核兜底不可靠
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="订单金额无效（套餐未配置价格），请联系服务商")
 
     order = RenewOrder(
         order_no=f"RO-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6]}",

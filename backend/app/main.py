@@ -41,8 +41,15 @@ async def lifespan(app: FastAPI):
             # P1-3 模块/配额位
             "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS features TEXT DEFAULT ''",
             "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS max_rooms INTEGER DEFAULT 0",
+            # N1 集团高熵激活码（展示编号 GP-xxxx 与激活凭据分离）
+            "ALTER TABLE groups ADD COLUMN IF NOT EXISTS activation_key VARCHAR(32) DEFAULT ''",
         ):
             db.execute(__import__("sqlalchemy").text(ddl))
+        # N1 回填：存量集团生成高熵激活码（幂等，仅补空）
+        import secrets as _secrets
+
+        for g in db.query(Group).filter((Group.activation_key == "") | (Group.activation_key.is_(None))).all():
+            g.activation_key = f"GPK-{_secrets.token_hex(8)}"
         db.commit()
         seed(db)
     finally:
@@ -120,6 +127,7 @@ def new_license_code(db: Session, year: int) -> str:
 # S6：登录防爆破——同 账号+IP 15 分钟内失败 10 次 → 429（内存计数，单进程部署足够）
 _LOGIN_FAIL_WINDOW = 900
 _LOGIN_FAIL_LIMIT = 10
+_LOGIN_FAIL_MAX_KEYS = 10000  # N12：键数上限，防乱填用户名撑爆内存
 _login_failures: dict = {}
 _login_lock = threading.Lock()
 
@@ -132,6 +140,16 @@ def _login_rate_key(request: Request, username: str) -> str:
 def _login_too_often(key: str) -> bool:
     now = time.time()
     with _login_lock:
+        # N12：过期键清理 + 键数封顶
+        if len(_login_failures) > _LOGIN_FAIL_MAX_KEYS:
+            for k in list(_login_failures):
+                arr = [t for t in _login_failures[k] if now - t < _LOGIN_FAIL_WINDOW]
+                if arr:
+                    _login_failures[k] = arr
+                else:
+                    _login_failures.pop(k, None)
+            while len(_login_failures) > _LOGIN_FAIL_MAX_KEYS:
+                _login_failures.pop(next(iter(_login_failures)), None)
         arr = [t for t in _login_failures.get(key, []) if now - t < _LOGIN_FAIL_WINDOW]
         _login_failures[key] = arr
         return len(arr) >= _LOGIN_FAIL_LIMIT
@@ -272,22 +290,34 @@ def update_hotel(hotel_id: str, upd: HotelUpdate, db: Session = Depends(get_db),
 
 
 @app.get("/api/hotels/{hotel_id}/detail")
-def hotel_detail(hotel_id: str, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
+def hotel_detail(hotel_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     h = db.query(Hotel).filter(Hotel.id == hotel_id).first()
     if h is None:
         raise HTTPException(status_code=404, detail="客户不存在")
+    lics = [LicenseOut.from_orm_model(l) for l in db.query(License).filter(License.hotel_name == h.name).all()]
+    if user.role not in ("admin", "operator"):
+        from .masking import mask_text
+
+        for lo in lics:
+            lo.code = mask_text(lo.code)  # N6：授权码=激活凭据，只读角色只见打码
     return {
         "hotel": HotelOut.from_orm_model(h),
         "devices": [DeviceOut.from_orm_model(d) for d in db.query(Device).filter(Device.hotel_id == hotel_id).all()],
-        "licenses": [LicenseOut.from_orm_model(l) for l in db.query(License).filter(License.hotel_name == h.name).all()],
+        "licenses": lics,
         "alerts": [AlertOut.from_orm_model(a) for a in db.query(Alert).filter(Alert.hotel_name == h.name).all()],
     }
 
 
 # ---------- 授权 ----------
 @app.get("/api/licenses", response_model=list[LicenseOut])
-def list_licenses(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
-    return [LicenseOut.from_orm_model(l) for l in db.query(License).order_by(License.id).all()]
+def list_licenses(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    out = [LicenseOut.from_orm_model(l) for l in db.query(License).order_by(License.id).all()]
+    if user.role not in ("admin", "operator"):
+        from .masking import mask_text
+
+        for lo in out:
+            lo.code = mask_text(lo.code)  # N6：授权码=激活凭据，只读角色只见打码
+    return out
 
 
 @app.post("/api/licenses", response_model=LicenseOut)
@@ -559,9 +589,9 @@ class GroupAssignRequest(BaseModel):
     groupId: str
 
 
-def _group_out(db: Session, g) -> dict:
+def _group_out(db: Session, g, with_key: bool = False) -> dict:
     members = db.query(Hotel).filter(Hotel.group_id == g.id).all()
-    return {
+    out = {
         "id": g.id,
         "name": g.name,
         "code": g.code,
@@ -575,11 +605,15 @@ def _group_out(db: Session, g) -> dict:
         "deviceCount": sum(m.devices or 0 for m in members),
         "expiringSoon": sum(1 for m in members if m.status in ("即将到期", "已过期")),
     }
+    # N1/N6：激活码是凭据，只给 admin/operator 明文（viewer 不可见）
+    if with_key:
+        out["activationKey"] = g.activation_key
+    return out
 
 
 @app.get("/api/groups")
-def list_groups(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
-    return [_group_out(db, g) for g in db.query(Group).order_by(Group.id).all()]
+def list_groups(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    return [_group_out(db, g, with_key=user.role in ("admin", "operator")) for g in db.query(Group).order_by(Group.id).all()]
 
 
 @app.post("/api/groups")
@@ -600,19 +634,20 @@ def create_group(req: GroupCreate, db: Session = Depends(get_db), user: User = D
         created_at=datetime.utcnow().strftime("%Y-%m-%d"),
     )
     db.add(g)
+    g.activation_key = f"GPK-{__import__('secrets').token_hex(8)}"  # N1：高熵激活码，与展示编号分离
     write_log(db, user, "创建集团", req.name, f"集团码 {g.code}")
     db.commit()
-    return {"ok": True, "id": g.id, "code": g.code}
+    return {"ok": True, "id": g.id, "code": g.code, "activationKey": g.activation_key}
 
 
 @app.get("/api/groups/{group_id}")
-def group_detail(group_id: str, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
+def group_detail(group_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     g = db.query(Group).filter(Group.id == group_id).first()
     if g is None:
         raise HTTPException(status_code=404, detail="集团不存在")
     members = db.query(Hotel).filter(Hotel.group_id == group_id).order_by(Hotel.id).all()
     return {
-        "group": _group_out(db, g),
+        "group": _group_out(db, g, with_key=user.role in ("admin", "operator")),
         "members": [HotelOut.from_orm_model(h).model_dump() for h in members],
     }
 
@@ -890,7 +925,7 @@ def wecom_ws_status(_: User = Depends(require_roles("admin", "operator"))):
 
 
 @app.post("/api/wecom/flush-daily")
-def wecom_flush_daily(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
+def wecom_flush_daily(db: Session = Depends(get_db), _: User = Depends(require_roles("admin", "operator"))):
     from .wecom import flush_daily
 
     return flush_daily(db)

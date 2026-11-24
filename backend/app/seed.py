@@ -36,6 +36,9 @@ def ensure_users(db: Session) -> None:
         if db.query(User).filter(User.username == username).first() is None:
             db.add(User(username=username, password_hash=hash_password(pwd), name=name, role=role))
     db.commit()
+    # 原 6：仍在用默认口令时启动告警（生产必须设 ADMIN_PASSWORD/OPS_PASSWORD/VIEWER_PASSWORD 环境变量）
+    if not os.environ.get("ADMIN_PASSWORD"):
+        print("[security] ⚠️ 正在使用默认口令（admin123 等）！生产环境请设置 ADMIN_PASSWORD/OPS_PASSWORD/VIEWER_PASSWORD 环境变量后重启。")
 
 
 def ensure_groups(db: Session) -> None:

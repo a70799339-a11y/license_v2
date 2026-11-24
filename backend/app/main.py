@@ -1,10 +1,13 @@
 """License 授权管理系统 —— FastAPI 主入口
 自研后端，数据存自建 PostgreSQL，单进程同时托管前端构建产物与 API
 """
+import os
+import threading
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
-from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -65,10 +68,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="酒店AI管理 License 授权管理系统", version="1.1.0", lifespan=lifespan)
 
+# S8：CORS 白名单化——CORS_ORIGINS 环境变量（逗号分隔）；默认 * 时不带凭证（* + credentials 组合非法）
+_cors_origins = [o.strip() for o in os.environ.get("CORS_ORIGINS", "*").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 生产收敛为你们自己的域名
-    allow_credentials=True,
+    allow_origins=_cors_origins or ["*"],
+    allow_credentials=_cors_origins != ["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -99,12 +104,55 @@ def next_code(db: Session, model, prefix: str) -> str:
     return f"{prefix}{max_seq + 1:04d}"
 
 
+def new_license_code(db: Session, year: int) -> str:
+    """S2：高熵授权码——LIC-YYYY-<8 位随机 hex>（32bit+，防顺序枚举），
+    撞库重试 8 次；保留 LIC- 前缀供掩码与识别"""
+    import secrets
+
+    for _ in range(8):
+        code = f"LIC-{year}-{secrets.token_hex(4).upper()}"
+        if db.query(License).filter(License.code == code).first() is None:
+            return code
+    return f"LIC-{year}-{secrets.token_hex(8).upper()}"
+
+
 # ---------- 认证 ----------
+# S6：登录防爆破——同 账号+IP 15 分钟内失败 10 次 → 429（内存计数，单进程部署足够）
+_LOGIN_FAIL_WINDOW = 900
+_LOGIN_FAIL_LIMIT = 10
+_login_failures: dict = {}
+_login_lock = threading.Lock()
+
+
+def _login_rate_key(request: Request, username: str) -> str:
+    ip = request.client.host if request.client else "?"
+    return f"{ip}|{username}"
+
+
+def _login_too_often(key: str) -> bool:
+    now = time.time()
+    with _login_lock:
+        arr = [t for t in _login_failures.get(key, []) if now - t < _LOGIN_FAIL_WINDOW]
+        _login_failures[key] = arr
+        return len(arr) >= _LOGIN_FAIL_LIMIT
+
+
+def _login_record_failure(key: str) -> None:
+    with _login_lock:
+        _login_failures.setdefault(key, []).append(time.time())
+
+
 @app.post("/api/auth/login", response_model=TokenResponse)
-def login(req: LoginRequest, db: Session = Depends(get_db)):
+def login(req: LoginRequest, request: Request, db: Session = Depends(get_db)):
+    key = _login_rate_key(request, (req.username or "").strip())
+    if _login_too_often(key):
+        raise HTTPException(status_code=429, detail="登录尝试过于频繁，请 15 分钟后再试")
     user = db.query(User).filter(User.username == req.username).first()
     if user is None or not verify_password(req.password, user.password_hash):
+        _login_record_failure(key)
         raise HTTPException(status_code=401, detail="账号或密码错误")
+    with _login_lock:
+        _login_failures.pop(key, None)
     return TokenResponse(token=create_token(user.username, user.role), username=user.username, name=user.name, role=user.role)
 
 
@@ -251,7 +299,7 @@ def create_license(req: LicenseCreate, db: Session = Depends(get_db), user: User
     issued = datetime.utcnow()
     expire = issued + timedelta(days=30 * req.months)
     lic = License(
-        id=f"ln{seq:04d}", code=next_code(db, License, f"LIC-{issued.year}-"), hotel_name=h.name,
+        id=f"ln{seq:04d}", code=new_license_code(db, issued.year), hotel_name=h.name,
         plan=req.plan, type=req.type, issued_at=issued.strftime("%Y-%m-%d"),
         expire_at=expire.strftime("%Y-%m-%d"), status="生效中",
         devices=0, max_devices=PLAN_MAXDEV.get(req.plan, 30),
@@ -444,10 +492,27 @@ class SettingUpdate(BaseModel):
     value: str
 
 
+# S5：敏感配置键（值打码返回，禁止明文出接口）
+_SENSITIVE_KEY_MARKS = ("api_key", "secret", "token")
+
+
+def _mask_setting_value(key: str, value: str) -> str:
+    v = value or ""
+    if any(m in key for m in _SENSITIVE_KEY_MARKS):
+        if not v:
+            return ""
+        return (v[:2] + "…" + v[-4:]) if len(v) > 8 else "***"
+    return v
+
+
 @app.get("/api/settings")
-def get_settings(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
-    # 下划线前缀为敏感配置（如签名公钥指纹等），不对外返回
-    return {s.key: s.value for s in db.query(Setting).all() if not s.key.startswith("_")}
+def get_settings(db: Session = Depends(get_db), user: User = Depends(require_roles("admin", "operator"))):
+    # 下划线前缀为敏感配置（如签名公钥指纹等），不对外返回；S5：含密钥/令牌的键值打码
+    return {
+        s.key: _mask_setting_value(s.key, s.value)
+        for s in db.query(Setting).all()
+        if not s.key.startswith("_")
+    }
 
 
 # ---------- 用户与权限（admin） ----------

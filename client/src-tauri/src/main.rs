@@ -13,7 +13,12 @@ use license_core::{
 use serde_json::{json, Value};
 use tauri::State;
 
-const CLIENT_VERSION: &str = "1.2.3";
+const CLIENT_VERSION: &str = "1.2.4";
+
+/// S1：出厂固化 Ed25519 验签公钥——信任锚，禁止使用服务端响应携带的公钥验签
+/// （响应公钥仅供比对告警；密钥轮换需随客户端版本更新本常量）
+const PINNED_PUBKEY_HEX: &str =
+    "bc841feba67ab9a8f751d61775c0f8b6cfe6e11b4f9ef98e497c521e05f47ea9";
 
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
@@ -245,11 +250,12 @@ fn activate_core(
         .get("signature")
         .and_then(|v| v.as_str())
         .ok_or("License 签名缺失")?;
-    let pub_key = signed
-        .get("public_key")
-        .and_then(|v| v.as_str())
-        .ok_or("公钥缺失")?;
-    if !verify_license(payload, sig, pub_key) {
+    // S1：只认内置公钥验签；响应携带的公钥仅作比对告警（防中间人整套替换）
+    let resp_pub = signed.get("public_key").and_then(|v| v.as_str()).unwrap_or("");
+    if !resp_pub.is_empty() && !resp_pub.eq_ignore_ascii_case(PINNED_PUBKEY_HEX) {
+        diag_log("activate: 服务端公钥与内置公钥不一致，按内置公钥验签（密钥轮换需升级客户端）");
+    }
+    if !verify_license(payload, sig, PINNED_PUBKEY_HEX) {
         return Err("License 验签失败，拒绝激活".into());
     }
 

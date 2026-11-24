@@ -101,7 +101,8 @@ def main():
             st, s0 = req("GET", "/api/settings", token=token)
             wecom_snapshot = {k: v for k, v in (s0 or {}).items()
                               if (k.startswith(("wecom_", "push_")) or k == "alert_push_agg")
-                              and k != "wecom_last_push"}
+                              and k != "wecom_last_push"
+                              and not any(m in k for m in ("api_key", "secret", "token"))}  # S5 打码键不可还原
             # 套件级 dry-run 硬开：T14 等前段会触发高危告警即时推送（notify_alert），
             # 若等 T16 才开 dry-run，测试告警会被真实推到企微群（2026-11-21 事故）
             req("POST", "/api/settings", {"key": "wecom_dry_run", "value": "on"}, token=token)
@@ -300,8 +301,11 @@ def main():
             check("T10.2", "客户端同步", "Ed25519 公钥可获取", st == 200 and (p or {}).get("algorithm") == "ed25519"
                   and len((p or {}).get("public_key", "")) == 64)
 
+            # S2 后新指纹只能用授权码激活（编号仅限原设备重装）——取一条生效授权码
+            _lics = (req("GET", "/api/licenses", token=token)[1] or [])
+            _acode = next((l.get("code") for l in _lics if l.get("code")), "HT-0001")
             st, p = req("POST", "/api/client/activate",
-                        {"licenseCode": "HT-0001", "deviceName": "自动化测试客户端", "clientVersion": "0.1.0"},
+                        {"licenseCode": _acode, "deviceName": "自动化测试客户端", "clientVersion": "0.1.0"},
                         headers={"X-Device-Fingerprint": FP})
             signed = (p or {}).get("signed_license") or {}
             ctoken = (p or {}).get("token")
@@ -420,12 +424,16 @@ def main():
 
             st, p = req("POST", "/api/client/group/renew", {"hotelIds": []}, token=gtok,
                         headers={"X-Device-Fingerprint": GP_FP})
-            check("T12.4", "总/子管理", "集团总端批量续期生效", st == 200 and (p or {}).get("renewed", 0) > 0,
-                  f"renewed={(p or {}).get('renewed')}")
+            order_no = (p or {}).get("order_no", "")
+            check("T12.4", "总/子管理", "集团批量续期创建订单（S3：不再直改到期日）",
+                  st == 200 and bool(order_no) and (p or {}).get("renewed", 0) == 0,
+                  f"order={order_no} renewed={(p or {}).get('renewed')}")
 
-            st, p2 = req("GET", "/api/client/group/profile", token=gtok, headers={"X-Device-Fingerprint": GP_FP})
-            all_2027 = all((m.get("expire_at") or "").startswith("2027") for m in (p2 or {}).get("members", []))
-            check("T12.5", "总/子管理", "续期结果持久化（成员到期 2027）", st == 200 and all_2027)
+            st, orders = req("GET", "/api/renew-orders", token=token)
+            mine = [o for o in (orders or []) if (o.get("orderNo") or o.get("order_no")) == order_no]
+            check("T12.5", "总/子管理", "续期订单进入订单流（待支付，运营确认后才生效）",
+                  st == 200 and bool(mine) and mine[0].get("status") == "待支付",
+                  f"found={len(mine)}")
 
             st, _ = req("GET", "/api/client/group/profile", token=ctoken, headers={"X-Device-Fingerprint": FP})
             check("T12.6", "总/子管理", "单店 token 调集团接口被拒（400）", st == 400, f"HTTP {st}")
@@ -1906,6 +1914,84 @@ def main():
                 req("PATCH", f"/api/hotels/{hid}", {"status": "已停用"}, token=token)
         except Exception as _e:
             check("S39", "异常隔离", "第 39 段未捕获异常（后续段继续）", False,
+                     f"{type(_e).__name__}: {_e}")
+
+        # ---------------- 40. 攻击者视角回归（S1~S9 安全修复固化，2026-11-24） ----------------
+        try:
+            print("【40. 攻击者视角回归】")
+            ts = str(int(time.time() * 1000))[-8:]
+            hcode = f"HT-XA{ts[-6:]}"
+            name = f"测试店安审{ts}"
+            st, p = req("POST", "/api/hotels",
+                        {"name": name, "code": hcode, "group": "测试集团", "city": "测试市", "plan": "专业版"},
+                        token)
+            hid = p.get("id")
+            st, lc = req("POST", "/api/licenses", {"hotelId": hid, "plan": "专业版", "type": "新签", "months": 6}, token)
+            lcode = (lc or {}).get("code", "")
+
+            # S4：无指纹头一律 401（先激活拿 client token）
+            fpA = f"9a{ts}" + "a" * 20
+            st, act = req("POST", "/api/client/activate",
+                          {"licenseCode": lcode, "deviceName": "安审机", "clientVersion": "0.1.0"},
+                          headers={"X-Device-Fingerprint": fpA})
+            atok = (act or {}).get("token", "")
+            st1, _ = req("POST", "/api/client/heartbeat", {"clientVersion": "0.1.0"}, token=atok)
+            st2, _ = req("GET", "/api/client/profile", token=atok)
+            check("T40.1", "攻击者视角", "S4 无指纹头 heartbeat/profile 一律 401",
+                  bool(atok) and st1 == 401 and st2 == 401, f"hb={st1} profile={st2}")
+
+            st3, _ = req("POST", "/api/client/heartbeat", {"clientVersion": "0.1.0"}, token=atok,
+                         headers={"X-Device-Fingerprint": "wrong" + ts})
+            check("T40.2", "攻击者视角", "S4 错误指纹 401", st3 == 401, f"HTTP {st3}")
+
+            # S2：新指纹+客户编号（可枚举）→ 403；既有指纹+编号 → 200（重装便利保留）
+            fpB = f"9b{ts}" + "b" * 20
+            st4, _ = req("POST", "/api/client/activate",
+                         {"licenseCode": hcode, "deviceName": "枚举机", "clientVersion": "0.1.0"},
+                         headers={"X-Device-Fingerprint": fpB})
+            check("T40.3", "攻击者视角", "S2 新指纹+客户编号激活被拒（403）", st4 == 403, f"HTTP {st4}")
+            st5, _ = req("POST", "/api/client/activate",
+                         {"licenseCode": hcode, "deviceName": "安审机", "clientVersion": "0.1.0"},
+                         headers={"X-Device-Fingerprint": fpA})
+            check("T40.4", "攻击者视角", "S2 既有指纹+编号激活可用（重装便利）", st5 == 200, f"HTTP {st5}")
+
+            # S2：连败 12 次触发 429（独立指纹防污染）
+            fpC = f"9c{ts}" + "c" * 20
+            sts = []
+            for i in range(12):
+                s6, _ = req("POST", "/api/client/activate", {"licenseCode": f"NOPE-{ts}-{i}"},
+                            headers={"X-Device-Fingerprint": fpC})
+                sts.append(s6)
+            check("T40.5", "攻击者视角", "S2 激活连败触发 429 限流",
+                  sts[-1] == 429 and sts[0] == 404, f"sts={sts}")
+
+            # S5：viewer 403 + admin 视角密钥打码
+            st7, pv = req("POST", "/api/auth/login", {"username": "viewer", "password": "viewer123"})
+            vtok = (pv or {}).get("token")
+            st8, _ = req("GET", "/api/settings", token=vtok)
+            check("T40.6", "攻击者视角", "S5 viewer 无权读全量 settings（403）", st8 == 403, f"HTTP {st8}")
+            st9, sa = req("GET", "/api/settings", token=token)
+            kval = (sa or {}).get("llm_cloud_api_key", "")
+            check("T40.7", "攻击者视角", "S5 密钥类配置打码返回（无明文）",
+                  st9 == 200 and (not kval or "…" in kval or kval == "***"),
+                  f"val={kval[:12]!r}")
+
+            # S9：client token 进不了管理 API
+            st10, _ = req("GET", "/api/settings", token=atok)
+            check("T40.8", "攻击者视角", "S9 client token 调管理 API 被拒（401）", st10 == 401, f"HTTP {st10}")
+
+            # S6：登录连败 429（独立用户名防锁真账号）
+            st_login = []
+            for i in range(12):
+                s11, _ = req("POST", "/api/auth/login", {"username": f"nope{ts}", "password": f"bad{i}"})
+                st_login.append(s11)
+            check("T40.9", "攻击者视角", "S6 登录连败触发 429 限流",
+                  st_login[-1] == 429 and st_login[0] == 401, f"sts={st_login[-3:]}")
+
+            if hid:
+                req("PATCH", f"/api/hotels/{hid}", {"status": "已停用"}, token=token)
+        except Exception as _e:
+            check("S40", "异常隔离", "第 40 段未捕获异常（后续段继续）", False,
                      f"{type(_e).__name__}: {_e}")
     except Exception as _e:
         import traceback

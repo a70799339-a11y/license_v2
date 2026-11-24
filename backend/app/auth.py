@@ -1,4 +1,5 @@
 """JWT 认证 —— 自持密钥，部署时通过 JWT_SECRET 环境变量注入"""
+import hmac
 import os
 from datetime import datetime, timedelta
 from hashlib import pbkdf2_hmac
@@ -35,7 +36,8 @@ def hash_password(password: str, salt: Optional[bytes] = None) -> str:
 def verify_password(password: str, stored: str) -> bool:
     try:
         salt_hex, _ = stored.split(":", 1)
-        return hash_password(password, bytes.fromhex(salt_hex)) == stored
+        # S9：恒定时间比较，防时序侧信道
+        return hmac.compare_digest(hash_password(password, bytes.fromhex(salt_hex)), stored)
     except Exception:
         return False
 
@@ -62,6 +64,9 @@ def get_current_user(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="登录已过期")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="无效凭证")
+    # S9：客户端 token（typ=client）不得进管理端 API——边界显式校验，不依赖用户表碰巧挡回
+    if payload.get("typ") == "client":
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="凭证类型错误")
     user = db.query(User).filter(User.username == payload["sub"]).first()
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="用户不存在")

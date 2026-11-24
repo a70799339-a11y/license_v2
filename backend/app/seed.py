@@ -22,11 +22,15 @@ OS_LIST = ["Windows 11", "Windows 10", "Ubuntu 22.04", "macOS 15"]
 
 
 def ensure_users(db: Session) -> None:
-    """幂等补齐账号（升级旧库用）：admin / ops / viewer 三角色"""
+    """幂等补齐账号（升级旧库用）：admin / ops / viewer 三角色。
+    S6：初始口令支持环境变量覆盖（ADMIN_PASSWORD/OPS_PASSWORD/VIEWER_PASSWORD），
+    生产部署务必注入强口令——默认值仅用于演示/开发环境。"""
+    import os
+
     wanted = [
-        ("admin", "admin123", "运营管理员", "admin"),
-        ("ops", "ops123", "运营专员", "operator"),
-        ("viewer", "viewer123", "只读访客", "viewer"),
+        ("admin", os.environ.get("ADMIN_PASSWORD") or "admin123", "运营管理员", "admin"),
+        ("ops", os.environ.get("OPS_PASSWORD") or "ops123", "运营专员", "operator"),
+        ("viewer", os.environ.get("VIEWER_PASSWORD") or "viewer123", "只读访客", "viewer"),
     ]
     for username, pwd, name, role in wanted:
         if db.query(User).filter(User.username == username).first() is None:

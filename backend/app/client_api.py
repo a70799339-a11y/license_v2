@@ -5,12 +5,14 @@
 吊销、停用、到期、自动续期、新版本发布都会通过心跳即时下发。
 """
 import platform
+import threading
+import time
 import uuid
 from datetime import datetime, timedelta
 from typing import Optional
 
 import jwt
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -188,14 +190,48 @@ def offline_grace_hours(db: Session) -> int:
 
 
 # ---------- 接口 ----------
+# S2：激活防爆破——同 IP+指纹 15 分钟内失败 10 次 → 429（内存计数；失败=无效凭据探测）
+_ACTIVATE_FAIL_WINDOW = 900
+_ACTIVATE_FAIL_LIMIT = 10
+_activate_failures: dict = {}
+_activate_lock = threading.Lock()
+
+
+def _activate_rate_key(request: Request, fingerprint: str) -> str:
+    ip = request.client.host if request.client else "?"
+    return f"{ip}|{fingerprint}"
+
+
+def _activate_too_often(key: str) -> bool:
+    now = time.time()
+    with _activate_lock:
+        arr = [t for t in _activate_failures.get(key, []) if now - t < _ACTIVATE_FAIL_WINDOW]
+        _activate_failures[key] = arr
+        return len(arr) >= _ACTIVATE_FAIL_LIMIT
+
+
+def _activate_record_failure(key: str) -> None:
+    with _activate_lock:
+        _activate_failures.setdefault(key, []).append(time.time())
+
+
+def _activate_clear(key: str) -> None:
+    with _activate_lock:
+        _activate_failures.pop(key, None)
+
+
 @router.post("/activate")
 def activate(
     req: ActivateRequest,
+    request: Request,
     fingerprint: str = Depends(get_fingerprint_header),
     db: Session = Depends(get_db),
 ):
     if not fingerprint:
         raise HTTPException(status_code=400, detail="缺少设备指纹（X-Device-Fingerprint）")
+    rate_key = _activate_rate_key(request, fingerprint)
+    if _activate_too_often(rate_key):
+        raise HTTPException(status_code=429, detail="激活尝试过于频繁，请稍后再试")
 
     # 集团码（GP-xxxx）→ 总端激活
     group = db.query(Group).filter(Group.code == req.licenseCode).first()
@@ -217,6 +253,7 @@ def activate(
             },
         )
         version = latest_version_info(db)
+        _activate_clear(rate_key)  # 激活成功清除失败计数
         return {
             "token": create_client_token(group.id, fingerprint, scope="group"),
             "scope": "group",
@@ -242,8 +279,22 @@ def activate(
     if hotel is None:
         hotel = db.query(Hotel).filter(Hotel.code == req.licenseCode).first()
         if hotel is not None:
+            # S2：客户编号仅对本店既有指纹开放（重装/换系统便利）；
+            # 新指纹必须用授权码（LIC-）激活，堵住顺序编号枚举盗激活
+            known = (
+                db.query(Device.id)
+                .filter(Device.hotel_id == hotel.id, Device.fingerprint == fingerprint)
+                .first()
+            )
+            if known is None:
+                _activate_record_failure(rate_key)
+                raise HTTPException(
+                    status_code=403,
+                    detail="新设备请使用授权码（LIC- 开头）激活，客户编号仅限原设备重装使用",
+                )
             lic = find_active_license(db, hotel)
     if hotel is None:
+        _activate_record_failure(rate_key)
         raise_alert(
             db, level="中", rule="无效激活尝试", hotel_name=req.licenseCode or "未知",
             detail=f"无效授权码/客户编号激活尝试（指纹 {fingerprint[:12]}…）",
@@ -375,6 +426,7 @@ def activate(
 
     signed = sign_license(db, license_payload_for(hotel, lic))
     version = latest_version_info(db)
+    _activate_clear(rate_key)  # 激活成功清除失败计数
     return {
         "token": create_client_token(hotel.id, fingerprint),
         "scope": "hotel",
@@ -404,7 +456,7 @@ def heartbeat(
     db: Session = Depends(get_db),
 ):
     # 指纹一致性校验（防凭证拷贝到其他机器）
-    if fingerprint and fingerprint != ctx.fingerprint:
+    if not fingerprint or fingerprint != ctx.fingerprint:
         # 实时告警：凭证挪机/指纹变更
         owner = (
             db.query(Hotel).filter(Hotel.id == ctx.hotel_id).first()
@@ -537,7 +589,7 @@ def profile(
     fingerprint: str = Depends(get_fingerprint_header),
     db: Session = Depends(get_db),
 ):
-    if fingerprint and fingerprint != ctx.fingerprint:
+    if not fingerprint or fingerprint != ctx.fingerprint:
         raise HTTPException(status_code=401, detail="设备指纹不一致")
     hotel = db.query(Hotel).filter(Hotel.id == ctx.hotel_id).first()
     if hotel is None:
@@ -630,7 +682,7 @@ def group_profile(
     """集团总端自助数据：本集团旗下门店一览（数据隔离：只含本集团）"""
     if ctx.scope != "group":
         raise HTTPException(status_code=400, detail="该接口仅限集团总端调用")
-    if fingerprint and fingerprint != ctx.fingerprint:
+    if not fingerprint or fingerprint != ctx.fingerprint:
         raise HTTPException(status_code=401, detail="设备指纹不一致")
     g = db.query(Group).filter(Group.id == ctx.hotel_id).first()
     if g is None:
@@ -699,10 +751,11 @@ def group_renew(
     fingerprint: str = Depends(get_fingerprint_header),
     db: Session = Depends(get_db),
 ):
-    """集团总端批量续期（只作用于本集团门店）"""
+    """集团总端批量续期 → 创建续期订单（S3：不再直接改到期日）。
+    走 P0-2 订单流：对公转账→客户端提交回单→运营确认到账后 /api/renew-orders/{id}/confirm 生效"""
     if ctx.scope != "group":
         raise HTTPException(status_code=400, detail="该接口仅限集团总端调用")
-    if fingerprint and fingerprint != ctx.fingerprint:
+    if not fingerprint or fingerprint != ctx.fingerprint:
         raise HTTPException(status_code=401, detail="设备指纹不一致")
     g = db.query(Group).filter(Group.id == ctx.hotel_id).first()
     if g is None:
@@ -712,20 +765,41 @@ def group_renew(
     if req.hotelIds:
         q = q.filter(Hotel.id.in_(req.hotelIds))
     members = q.all()
-    for m in members:
-        m.expire_at = "2027-12-31"
-        if m.status in ("即将到期", "已过期"):
-            m.status = "正常"
+    if not members:
+        raise HTTPException(status_code=400, detail="没有可续期的门店")
+    _close_stale_orders(db)
+    amount = sum(_plan_price(db, m.plan, 12) for m in members)
+    order = RenewOrder(
+        order_no=f"RO-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6]}",
+        target_type="group",
+        target_id=g.id,
+        target_ids=",".join(m.id for m in members),
+        target_name=f"{g.name}（{len(members)} 家门店）",
+        plan="",
+        months=12,
+        amount=amount,
+        channel="transfer",
+        status="待支付",
+        created_at=_now_str(),
+    )
+    db.add(order)
     db.add(
         AuditLog(
             operator=f"集团端({g.name})",
             action="集团批量续期",
             target=g.name,
-            detail=f"{len(members)} 家门店续期至 2027-12-31",
+            detail=f"创建续期订单 {order.order_no}（{len(members)} 家门店 / {amount:.0f} 元），待支付确认后生效",
         )
     )
     db.commit()
-    return {"ok": True, "renewed": len(members)}
+    return {
+        "ok": True,
+        "order_no": order.order_no,
+        "amount": amount,
+        "renewed": 0,
+        "status": "待支付",
+        "note": "续期订单已创建，对公转账后到客户端提交回单，运营确认到账后生效",
+    }
 
 
 # ---------- 消息通知自助配置（门店/集团在客户端内配置自己的企微群 webhook） ----------
@@ -742,7 +816,7 @@ def notify_config_get(
     db: Session = Depends(get_db),
 ):
     """读取本实体的通知配置（scope 隔离：只见自己）"""
-    if fingerprint and fingerprint != ctx.fingerprint:
+    if not fingerprint or fingerprint != ctx.fingerprint:
         raise HTTPException(status_code=401, detail="设备指纹不一致")
     from .wecom import group_hooks, hotel_hook
     from .push_daily import get_push_config
@@ -771,7 +845,7 @@ def notify_config_set(
     db: Session = Depends(get_db),
 ):
     """保存本实体的通知 webhook + 每日推送设置（只写自己的配置；域名白名单防 SSRF）"""
-    if fingerprint and fingerprint != ctx.fingerprint:
+    if not fingerprint or fingerprint != ctx.fingerprint:
         raise HTTPException(status_code=401, detail="设备指纹不一致")
     from .wecom import set_group_hook, set_hotel_hook, validate_webhook_url
     from .masking import mask_text
@@ -812,7 +886,7 @@ def notify_push_test(
     db: Session = Depends(get_db),
 ):
     """立即生成并推送本实体今日日报（不影响每日定时；dry-run 时仅记录）"""
-    if fingerprint and fingerprint != ctx.fingerprint:
+    if not fingerprint or fingerprint != ctx.fingerprint:
         raise HTTPException(status_code=401, detail="设备指纹不一致")
     from .push_daily import content_group, content_hotel, _push_one
 
@@ -833,7 +907,7 @@ def notify_test(
     db: Session = Depends(get_db),
 ):
     """向本实体配置的 webhook 发测试消息（dry-run 时仅记录）"""
-    if fingerprint and fingerprint != ctx.fingerprint:
+    if not fingerprint or fingerprint != ctx.fingerprint:
         raise HTTPException(status_code=401, detail="设备指纹不一致")
     from .wecom import hotel_hook, group_hooks, push_message
 
@@ -972,7 +1046,7 @@ def list_devices(
     db: Session = Depends(get_db),
 ):
     """设备清单（含软删记录），当前设备标 is_self；集团总端返回全集团设备"""
-    if fingerprint and fingerprint != ctx.fingerprint:
+    if not fingerprint or fingerprint != ctx.fingerprint:
         raise HTTPException(status_code=401, detail="设备指纹不一致")
     q = db.query(Device)
     if ctx.scope == "hotel":
@@ -1019,7 +1093,7 @@ def unbind_device(
     db: Session = Depends(get_db),
 ):
     """自助解绑：非本机 + 离线 ≥30 分钟；日限 3 次；软删保留痕迹可后台恢复"""
-    if fingerprint and fingerprint != ctx.fingerprint:
+    if not fingerprint or fingerprint != ctx.fingerprint:
         raise HTTPException(status_code=401, detail="设备指纹不一致")
     d, hotel = _resolve_device_for_ctx(db, ctx, req.device_id)
     if d.fingerprint == ctx.fingerprint:
@@ -1083,7 +1157,7 @@ def migrate_device(
     db: Session = Depends(get_db),
 ):
     """同名迁移（重装系统场景）：把旧同名离线设备置「已迁移」，本机占用其配额"""
-    if fingerprint and fingerprint != ctx.fingerprint:
+    if not fingerprint or fingerprint != ctx.fingerprint:
         raise HTTPException(status_code=401, detail="设备指纹不一致")
     d, hotel = _resolve_device_for_ctx(db, ctx, req.old_device_id)
     me = (
@@ -1176,7 +1250,7 @@ def create_renew_order(
     db: Session = Depends(get_db),
 ):
     """创建续期订单（金额服务端计算）。单店=本店；集团=批量（hotel_ids 空=全部成员）"""
-    if fingerprint and fingerprint != ctx.fingerprint:
+    if not fingerprint or fingerprint != ctx.fingerprint:
         raise HTTPException(status_code=401, detail="设备指纹不一致")
     if req.months not in (12, 24):
         raise HTTPException(status_code=400, detail="仅支持续期 12 或 24 个月")
@@ -1256,7 +1330,7 @@ def get_renew_order(
     fingerprint: str = Depends(get_fingerprint_header),
     db: Session = Depends(get_db),
 ):
-    if fingerprint and fingerprint != ctx.fingerprint:
+    if not fingerprint or fingerprint != ctx.fingerprint:
         raise HTTPException(status_code=401, detail="设备指纹不一致")
     o = _my_order(db, ctx, order_no)
     return {
@@ -1280,7 +1354,7 @@ def submit_renew_proof(
     db: Session = Depends(get_db),
 ):
     """对公转账：上传回单号/备注/可选图片 → 订单进入「待确认」，服务商确认到账后生效"""
-    if fingerprint and fingerprint != ctx.fingerprint:
+    if not fingerprint or fingerprint != ctx.fingerprint:
         raise HTTPException(status_code=401, detail="设备指纹不一致")
     o = _my_order(db, ctx, order_no)
     if o.status != "待支付":

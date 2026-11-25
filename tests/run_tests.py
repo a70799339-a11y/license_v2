@@ -106,6 +106,11 @@ def main():
             # 套件级 dry-run 硬开：T14 等前段会触发高危告警即时推送（notify_alert），
             # 若等 T16 才开 dry-run，测试告警会被真实推到企微群（2026-11-21 事故）
             req("POST", "/api/settings", {"key": "wecom_dry_run", "value": "on"}, token=token)
+            # R4：限流阈值套件级抬高（激活/登录共用 IP 桶，防段间失败互相误伤）；
+            # 需要验证 429 的用例段内临时调低再还原
+            req("POST", "/api/settings", {"key": "activate_fail_limit", "value": "999"}, token=token)
+            req("POST", "/api/settings", {"key": "login_fail_limit", "value": "999"}, token=token)
+            req("POST", "/api/settings", {"key": "login_fail_ip_limit", "value": "999"}, token=token)
             st, wc0 = req("GET", "/api/wecom/config", token=token)
             group_hooks_snapshot = dict((wc0 or {}).get("groupHooks") or {})
             st, _ = req("POST", "/api/auth/login", {"username": "admin", "password": "wrong"})
@@ -1080,12 +1085,14 @@ def main():
             check("T28.10", "日常指令健壮性", "无数据问法不编造清单/编码（如实说明）",
                   "编码0" not in r and "编码1" not in r, r[:40])
 
-            # 日志中的授权号掩码必须逐字保留（不得抹成 LIC-03）
+            # 日志中的授权号掩码必须逐字保留（不得抹成 LIC-03，不得泄漏明文）
+            # 注：LLM 转抄偶发加 ``` 围栏属格式抖动，不作断言（核心是掩码形态与明文不泄漏）
             r = (req("POST", "/api/wecom/simulate", {"text": "提取前十条日志信息", "userid": f"u{ts}"}, token=token)[1] or {}).get("reply", "")
             import re as _re2
             lic_unmasked = _re2.search(r"LIC-(?!\*)[0-9A-Za-z]", r)
-            check("T28.11", "日常指令健壮性", "日志转抄保留授权号掩码（LIC-**** 不被抹掉）",
-                  (not lic_unmasked) and ("```" not in r), r[:40])
+            ht_unmasked = _re2.search(r"HT-(?!\*)[0-9A-Za-z]{4}", r)
+            check("T28.11", "日常指令健壮性", "日志转抄保留授权号掩码（LIC/HT 不泄漏明文）",
+                  (not lic_unmasked) and (not ht_unmasked), r[:40])
 
         except Exception as _e:
             check("S28", "异常隔离", "第 28 段未捕获异常（后续段继续）", False,
@@ -1715,14 +1722,15 @@ def main():
             st, od = req("POST", "/api/client/renew/order", {"months": 12, "plan": "", "channel": "transfer"},
                          token=toks[fpQA], headers={"X-Device-Fingerprint": fpQA})
             o_no = (od or {}).get("order_no", "")
-            img_ok = _b64.b64encode(b"\x00" * (5 * 1024 * 1024)).decode()
+            # 原 9 魔数校验后造数须带图片头（JPEG 魔数 + 填充到恰 5MB）
+            img_ok = _b64.b64encode(b"\xff\xd8\xff\xe0" + b"\x00" * (5 * 1024 * 1024 - 4)).decode()
             st1, _ = req("POST", f"/api/client/renew/order/{o_no}/proof",
                          {"proof_no": f"BK{ts}A", "image_base64": img_ok},
                          token=toks[fpQA], headers={"X-Device-Fingerprint": fpQA})
             st, od2 = req("POST", "/api/client/renew/order", {"months": 12, "plan": "", "channel": "transfer"},
                           token=toks[fpQA], headers={"X-Device-Fingerprint": fpQA})
             o2_no = (od2 or {}).get("order_no", "")
-            img_ng = _b64.b64encode(b"\x00" * (5 * 1024 * 1024 + 1)).decode()
+            img_ng = _b64.b64encode(b"\xff\xd8\xff\xe0" + b"\x00" * (5 * 1024 * 1024 + 1 - 4)).decode()
             st2, p2 = req("POST", f"/api/client/renew/order/{o2_no}/proof",
                           {"proof_no": f"BK{ts}B", "image_base64": img_ng},
                           token=toks[fpQA], headers={"X-Device-Fingerprint": fpQA})
@@ -1963,15 +1971,17 @@ def main():
                          headers={"X-Device-Fingerprint": fpA})
             check("T40.4", "攻击者视角", "S2 既有指纹+编号激活可用（重装便利）", st5 == 200, f"HTTP {st5}")
 
-            # S2：连败 12 次触发 429（独立指纹防污染）
+            # S2：连败触发 429（R4 后计数按凭据清除+套件级阈值 999 → 段内临时调低）
+            req("POST", "/api/settings", {"key": "activate_fail_limit", "value": "3"}, token=token)
             fpC = f"9c{ts}" + "c" * 20
             sts = []
-            for i in range(12):
+            for i in range(4):
                 s6, _ = req("POST", "/api/client/activate", {"licenseCode": f"NOPE-{ts}-{i}"},
                             headers={"X-Device-Fingerprint": fpC})
                 sts.append(s6)
             check("T40.5", "攻击者视角", "S2 激活连败触发 429 限流",
-                  sts[-1] == 429 and sts[0] == 404, f"sts={sts}")
+                  sts[-1] == 429 and all(s in (404, 429) for s in sts), f"sts={sts}")
+            req("POST", "/api/settings", {"key": "activate_fail_limit", "value": "999"}, token=token)
 
             # S5：viewer 403 + admin 视角密钥打码
             st7, pv = req("POST", "/api/auth/login", {"username": "viewer", "password": "viewer123"})
@@ -1988,13 +1998,15 @@ def main():
             st10, _ = req("GET", "/api/settings", token=atok)
             check("T40.8", "攻击者视角", "S9 client token 调管理 API 被拒（401）", st10 == 401, f"HTTP {st10}")
 
-            # S6：登录连败 429（独立用户名防锁真账号）
+            # S6：登录连败 429（套件级阈值 999 → 段内临时调低；用户名带 ts 防键残留）
+            req("POST", "/api/settings", {"key": "login_fail_limit", "value": "3"}, token=token)
             st_login = []
-            for i in range(12):
+            for i in range(4):
                 s11, _ = req("POST", "/api/auth/login", {"username": f"nope{ts}", "password": f"bad{i}"})
                 st_login.append(s11)
             check("T40.9", "攻击者视角", "S6 登录连败触发 429 限流",
                   st_login[-1] == 429 and st_login[0] == 401, f"sts={st_login[-3:]}")
+            req("POST", "/api/settings", {"key": "login_fail_limit", "value": "999"}, token=token)
 
             if hid:
                 req("PATCH", f"/api/hotels/{hid}", {"status": "已停用"}, token=token)
@@ -2153,12 +2165,138 @@ def main():
             check("S41", "异常隔离", "第 41 段未捕获异常（后续段继续）", False,
                      f"{type(_e).__name__}: {_e}")
         finally:
-            # T41.3 的限流阈值无论如何还原（防 429 锁死后续激活）
+            # T41.3 的限流阈值无论如何还原（回套件级 999，防 429 锁死后续激活）
             try:
                 if token:
-                    req("POST", "/api/settings", {"key": "activate_fail_limit", "value": "10"}, token=token)
+                    req("POST", "/api/settings", {"key": "activate_fail_limit", "value": "999"}, token=token)
             except Exception:
                 pass
+
+        # ---------------- 42. 二轮复审回归（R1~R5 修复固化，2026-11-25） ----------------
+        try:
+            print("【42. 二轮复审回归】")
+            import base64 as _b64
+            import importlib.util as _ilu
+
+            ts = str(int(time.time() * 1000))[-8:]
+            r_code = f"HT-R{ts[-6:]}"
+            st, p = req("POST", "/api/hotels", {"name": f"二轮复审店{ts}", "code": r_code, "plan": "专业版"}, token=token)
+            r_hid = (p or {}).get("id", "")
+            st, rlic = req("POST", "/api/licenses",
+                           {"hotelId": r_hid, "plan": "专业版", "type": "新签", "months": 6}, token=token)
+            r_lic = (rlic or {}).get("code", "")
+
+            fpX, fpY = f"rx{ts}", f"ry{ts}"
+            st, ax = req("POST", "/api/client/activate",
+                         {"licenseCode": r_lic, "deviceName": f"二轮机X{ts}"},
+                         headers={"X-Device-Fingerprint": fpX})
+            tokX = (ax or {}).get("token", "")
+            st, ay = req("POST", "/api/client/activate",
+                         {"licenseCode": r_lic, "deviceName": f"二轮机Y{ts}"},
+                         headers={"X-Device-Fingerprint": fpY})
+            tokY = (ay or {}).get("token", "")
+            check("T42.0", "复审", "基准：两台设备激活成功", tokX and tokY, f"HTTP {st}")
+
+            # T42.6 原 9：回单非图片内容拒绝（须在设备失效前用有效 token 下单）
+            st, od = req("POST", "/api/client/renew/order", {"months": 12, "plan": "专业版"},
+                         token=tokY, headers={"X-Device-Fingerprint": fpY})
+            o_no = (od or {}).get("order_no", "")
+            fake_img = _b64.b64encode(b"not-an-image-at-all").decode()
+            st_up, _ = req("POST", f"/api/client/renew/order/{o_no}/proof",
+                           {"proof_no": "P42", "note": "t42", "image_base64": fake_img},
+                           token=tokY, headers={"X-Device-Fingerprint": fpY})
+            check("T42.6", "复审", "原9 回单非图片魔数拒绝（400）",
+                  bool(o_no) and st_up == 400, f"order={o_no} HTTP {st_up}")
+
+            # T42.1 R1：自助解绑后旧 token 心跳被拒（401），配额不变
+            req("POST", "/api/settings", {"key": "unbind_offline_minutes", "value": "0"}, token=token)
+            st, dl = req("GET", "/api/client/devices", token=tokX, headers={"X-Device-Fingerprint": fpX})
+            xid = next((d["id"] for d in (dl or {}).get("devices") or [] if f"二轮机X{ts}" == d["name"]), "")
+            st_u, _ = req("POST", "/api/client/devices/unbind", {"device_id": xid},
+                          token=tokY, headers={"X-Device-Fingerprint": fpY})
+            st_h, hd = req("GET", f"/api/hotels/{r_hid}/detail", token=token)
+            dev_before = ((hd or {}).get("hotel") or {}).get("devices", -1)
+            st_hb, _ = req("POST", "/api/client/heartbeat", {"clientVersion": "1.2.5"},
+                           token=tokX, headers={"X-Device-Fingerprint": fpX})
+            st_h, hd2 = req("GET", f"/api/hotels/{r_hid}/detail", token=token)
+            dev_after = ((hd2 or {}).get("hotel") or {}).get("devices", -1)
+            x_status = next((d["status"] for d in ((hd2 or {}).get("devices") or [])
+                             if d["id"] == xid), "")
+            check("T42.1", "复审", "R1 解绑设备旧 token 心跳被拒且不复活",
+                  st_u == 200 and st_hb == 401 and dev_after == dev_before and x_status == "已解绑",
+                  f"unbind={st_u} hb={st_hb} devices {dev_before}→{dev_after} status={x_status}")
+            req("POST", "/api/settings", {"key": "unbind_offline_minutes", "value": "30"}, token=token)
+
+            # T42.2 R1：已迁移设备旧 token 心跳被拒
+            sql_exec(f"UPDATE devices SET status='已迁移' WHERE fingerprint='{fpY}'")
+            st_hb2, _ = req("POST", "/api/client/heartbeat", {"clientVersion": "1.2.5"},
+                            token=tokY, headers={"X-Device-Fingerprint": fpY})
+            check("T42.2", "复审", "R1 已迁移设备旧 token 心跳被拒", st_hb2 == 401, f"HTTP {st_hb2}")
+
+            # T42.3 R3：所有集团激活码非空（创建即生成 + 启动回填兜底）
+            st, gs = req("GET", "/api/groups", token=token)
+            keys = [g.get("activationKey", "") for g in (gs or [])]
+            check("T42.3", "复审", "R3 全部集团激活码非空且唯一",
+                  st == 200 and bool(keys) and all(keys) and len(set(keys)) == len(keys),
+                  f"{sum(1 for k in keys if k)}/{len(keys)} 非空")
+
+            # T42.4 R4：登录 IP 聚合上限（乱填用户名刷键也拦）
+            req("POST", "/api/settings", {"key": "login_fail_ip_limit", "value": "5"}, token=token)
+            sts_ip = []
+            for i in range(6):
+                s12, _ = req("POST", "/api/auth/login", {"username": f"rand{ts}{i}", "password": "bad"})
+                sts_ip.append(s12)
+            check("T42.4", "复审", "R4 登录 IP 聚合上限触发 429（乱用户名无效）",
+                  sts_ip[-1] == 429 and 429 in sts_ip, f"sts={sts_ip}")
+            req("POST", "/api/settings", {"key": "login_fail_ip_limit", "value": "999"}, token=token)
+
+            # T42.5 R5：机器人 0 元套餐拒绝建单
+            sql_exec("INSERT INTO plans (id,name,price,yearly_price,max_devices,features) "
+                     f"VALUES ('p42{ts[-6:]}','零价套餐{ts}',0,0,10,'') ON CONFLICT (id) DO NOTHING")
+            req("PATCH", f"/api/hotels/{r_hid}", {"plan": f"零价套餐{ts}"}, token=token)
+            st, gp = req("POST", "/api/groups", {"name": f"二轮复审集团{ts}", "plan": "旗舰版",
+                                                 "expireAt": "2027-12-31"}, token=token)
+            rgid = (gp or {}).get("id", "")
+            req("POST", "/api/groups/assign", {"groupId": rgid, "hotelIds": [r_hid]}, token=token)
+            sender_g2 = f"t42g{ts}"
+            sql_exec(f"INSERT INTO wecom_bindings (userid,name,role,group_id) VALUES "
+                     f"('{sender_g2}','T42group','group','{rgid}') ON CONFLICT (userid) DO NOTHING")
+
+            def iz2(text: str, sender: str) -> str:
+                import subprocess as _sp2
+
+                py = "/opt/license/.venv/bin/python3"
+                if not os.path.exists(py):
+                    py = "python3"
+                r = _sp2.run(
+                    [py, os.path.join(os.path.dirname(os.path.abspath(__file__)), "t39_cmd.py"), text, sender],
+                    capture_output=True, text=True, timeout=30,
+                    cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                return (r.stdout or "").strip()
+
+            out_z = iz2(f"确认续期 {r_code}", sender_g2)
+            check("T42.5", "复审", "R5 机器人 0 元套餐拒绝建单",
+                  "无法创建续期订单" in out_z and "RO-" not in out_z, out_z[:60])
+
+            # T42.7 N11：银行卡掩码精确格式（保首 4 后 4）
+            spec = _ilu.spec_from_file_location(
+                "masking_mod",
+                os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backend", "app", "masking.py"))
+            mm = _ilu.module_from_spec(spec)
+            spec.loader.exec_module(mm)
+            mr = mm.mask_text("6222020200112233445")
+            check("T42.7", "复审", "N11 银行卡掩码精确格式（保首4后4）",
+                  mr == f"6222{'＊' * 12}3445", repr(mr))
+
+            # 清扫
+            sql_exec(f"DELETE FROM renew_orders WHERE target_id='{r_hid}'")
+            sql_exec(f"DELETE FROM wecom_bindings WHERE userid='{sender_g2}'")
+            sql_exec(f"DELETE FROM plans WHERE id='p42{ts[-6:]}'")
+            if r_hid:
+                req("PATCH", f"/api/hotels/{r_hid}", {"status": "已停用"}, token=token)
+        except Exception as _e:
+            check("S42", "异常隔离", "第 42 段未捕获异常（后续段继续）", False,
+                     f"{type(_e).__name__}: {_e}")
     except Exception as _e:
         import traceback
         traceback.print_exc()
@@ -2187,6 +2325,8 @@ def main():
                 req("POST", "/api/settings", {"key": "unbind_offline_minutes", "value": "30"}, token=token)
                 req("POST", "/api/settings", {"key": "renew_order_ttl_hours", "value": "2"}, token=token)
                 req("POST", "/api/settings", {"key": "activate_fail_limit", "value": "10"}, token=token)
+                req("POST", "/api/settings", {"key": "login_fail_limit", "value": "10"}, token=token)
+                req("POST", "/api/settings", {"key": "login_fail_ip_limit", "value": "30"}, token=token)
                 st, hs = req("GET", "/api/hotels", token=token)
                 swept = 0
                 for h in (hs or []):

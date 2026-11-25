@@ -1,6 +1,8 @@
 """种子数据 —— 首次启动时写入；40 家酒店 + 设备 + 设置 + 操作日志"""
 import json
+import os
 import random
+import secrets
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from .models import User, Hotel, License, Alert, Plan, Device, Setting, AuditLog, Group
@@ -55,6 +57,7 @@ def ensure_groups(db: Session) -> None:
                 id=f"g{seq:03d}",
                 name=gname,
                 code=f"GP-{seq:04d}",
+                activation_key=f"GPK-{secrets.token_hex(8)}",  # R3：创建即生成，不留空窗
                 contact="集团总部",
                 phone="0571-88880000",
                 plan="旗舰版",
@@ -79,6 +82,11 @@ def seed(db: Session) -> None:
         return  # 已初始化
 
     ensure_users(db)
+
+    # R2：演示数据只在显式开启时生成（SEED_DEMO_DATA=1）——
+    # 生产默认关闭，防演示门店的顺序授权码/可预测指纹进生产
+    if os.environ.get("SEED_DEMO_DATA", "").strip().lower() not in ("1", "true", "yes"):
+        return
 
     rnd = random.Random(42)
     base_day = datetime(2026, 11, 1)
@@ -116,7 +124,7 @@ def seed(db: Session) -> None:
                 id=f"d{i+1:03d}-{j+1}", hotel_id=hid,
                 name=f"{rnd.choice(['前台', '客房', '工程', '安保', '餐饮'])}-PC-{j+1}",
                 os=rnd.choice(OS_LIST),
-                fingerprint=f"fp-{hid}-{j+1:02d}",
+                fingerprint=f"f{secrets.token_hex(12)}",  # R2：随机指纹，不可预测
                 last_active=(base_day - timedelta(minutes=rnd.randint(5, 1440))).strftime("%Y-%m-%d %H:%M"),
                 status=rnd.choice(["在线", "在线", "在线", "离线"]),
             ))
@@ -125,7 +133,7 @@ def seed(db: Session) -> None:
         for k in range(rnd.randint(1, 2)):
             issued = expire - timedelta(days=365)
             db.add(License(
-                id=f"l{i+1:03d}-{k+1}", code=f"LIC-2026-{i*2+k+1:04d}", hotel_name=name,
+                id=f"l{i+1:03d}-{k+1}", code=f"LIC-2026-{secrets.token_hex(4).upper()}", hotel_name=name,
                 plan=plan, type=rnd.choice(["新签", "续期", "升级"]),
                 issued_at=issued.strftime("%Y-%m-%d"), expire_at=expire.strftime("%Y-%m-%d"),
                 status="已过期" if expire < base_day else "生效中",
@@ -179,8 +187,10 @@ def seed(db: Session) -> None:
         ("运营管理员", "新增客户", "苏州姑苏锦华", "套餐：专业版"),
     ]
     for idx, (op, action, target, detail) in enumerate(log_defs):
+        from .masking import mask_text
+
         db.add(AuditLog(
-            operator=op, action=action, target=target, detail=detail,
+            operator=op, action=action, target=mask_text(target), detail=mask_text(detail),
             created_at=base_day - timedelta(hours=idx * 11),
         ))
 

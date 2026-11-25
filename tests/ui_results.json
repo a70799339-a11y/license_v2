@@ -1,6 +1,6 @@
 {
   "target": "http://localhost",
-  "time": "2026/11/17 10:17:54",
+  "time": "2026/11/25 10:17:39",
   "total": 45,
   "passed": 45,
   "failed": 0,
@@ -172,7 +172,7 @@
       "module": "AI 智能风控",
       "name": "等级筛选生效",
       "pass": true,
-      "actual": "紧急 98 行"
+      "actual": "紧急 113 行"
     },
     {
       "id": "U8.1",
@@ -221,7 +221,7 @@
       "module": "安全设计",
       "name": "自建吊销测试授权就绪",
       "pass": true,
-      "actual": "code=LIC-2026-1145"
+      "actual": "code=LIC-2026-8AD2B443"
     },
     {
       "id": "U9.3",
@@ -263,7 +263,7 @@
       "module": "汇报机器人",
       "name": "捕获操作有反馈",
       "pass": true,
-      "actual": "已捕获最近会话：wofUQmZQAAxb…（来自 wofUQmZQAAxbpGZmCZ8jO29OIHOdx4sw，20"
+      "actual": "已捕获最近会话：wrfUQmZQAAkI…（来自 wofUQmZQAAxbpGZmCZ8jO29OIHOdx4sw，20"
     },
     {
       "id": "U9.5d",

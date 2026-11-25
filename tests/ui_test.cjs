@@ -295,7 +295,9 @@ function check(cid, module, name, cond, actual = '') {
   check('U9.5a', '每日推送', '推送卡片存在', (await pushCard.count()) > 0);
 
   // 汇报机器人在线状态（长连接）
+  // U5.1 同款：断言前显式等待异步状态渲染（ws-status 拉取慢时 800ms 不够）
   const onlineTag = page.locator('.el-tag', { hasText: '机器人在线' }).first();
+  await onlineTag.waitFor({ state: 'attached', timeout: 15000 }).catch(() => {});
   check('U9.5b', '汇报机器人', '机器人在线标识', (await onlineTag.count()) > 0);
   await page.screenshot({ path: path.join(SHOTS, '095-push-card.png') });
 

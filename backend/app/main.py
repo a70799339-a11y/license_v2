@@ -45,13 +45,21 @@ async def lifespan(app: FastAPI):
             "ALTER TABLE groups ADD COLUMN IF NOT EXISTS activation_key VARCHAR(32) DEFAULT ''",
         ):
             db.execute(__import__("sqlalchemy").text(ddl))
-        # N1 回填：存量集团生成高熵激活码（幂等，仅补空）
+        seed(db)
+        # N1/R3 回填：存量集团补高熵激活码（幂等，仅补空）——放在 seed 之后，
+        # 覆盖 ensure_groups 新建的集团；随后建唯一索引防碰撞
         import secrets as _secrets
 
         for g in db.query(Group).filter((Group.activation_key == "") | (Group.activation_key.is_(None))).all():
             g.activation_key = f"GPK-{_secrets.token_hex(8)}"
         db.commit()
-        seed(db)
+        try:
+            db.execute(__import__("sqlalchemy").text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_groups_activation_key ON groups (activation_key)"
+            ))
+            db.commit()
+        except Exception:
+            db.rollback()  # 索引已存在/极端碰撞时跳过，不阻断启动
     finally:
         db.close()
     # 企微智能机器人长连接（配置齐备时自动启动，读 backend/.env 或环境变量）
@@ -127,6 +135,7 @@ def new_license_code(db: Session, year: int) -> str:
 # S6：登录防爆破——同 账号+IP 15 分钟内失败 10 次 → 429（内存计数，单进程部署足够）
 _LOGIN_FAIL_WINDOW = 900
 _LOGIN_FAIL_LIMIT = 10
+_LOGIN_FAIL_IP_LIMIT = 30  # R4：单 IP 总失败上限（防随机用户名刷键挤掉目标账号计数）
 _LOGIN_FAIL_MAX_KEYS = 10000  # N12：键数上限，防乱填用户名撑爆内存
 _login_failures: dict = {}
 _login_lock = threading.Lock()
@@ -137,22 +146,36 @@ def _login_rate_key(request: Request, username: str) -> str:
     return f"{ip}|{username}"
 
 
-def _login_too_often(key: str) -> bool:
+def _login_limits(db) -> tuple:
+    """登录限流阈值（settings login_fail_limit / login_fail_ip_limit 可调，测试/防护调优用）"""
+    from .wecom import get_setting
+
+    try:
+        per_key = max(1, int(get_setting(db, "login_fail_limit", str(_LOGIN_FAIL_LIMIT))))
+        per_ip = max(1, int(get_setting(db, "login_fail_ip_limit", str(_LOGIN_FAIL_IP_LIMIT))))
+        return per_key, per_ip
+    except Exception:
+        return _LOGIN_FAIL_LIMIT, _LOGIN_FAIL_IP_LIMIT
+
+
+def _login_too_often(key: str, db) -> bool:
     now = time.time()
     with _login_lock:
-        # N12：过期键清理 + 键数封顶
-        if len(_login_failures) > _LOGIN_FAIL_MAX_KEYS:
-            for k in list(_login_failures):
-                arr = [t for t in _login_failures[k] if now - t < _LOGIN_FAIL_WINDOW]
-                if arr:
-                    _login_failures[k] = arr
-                else:
-                    _login_failures.pop(k, None)
-            while len(_login_failures) > _LOGIN_FAIL_MAX_KEYS:
-                _login_failures.pop(next(iter(_login_failures)), None)
-        arr = [t for t in _login_failures.get(key, []) if now - t < _LOGIN_FAIL_WINDOW]
-        _login_failures[key] = arr
-        return len(arr) >= _LOGIN_FAIL_LIMIT
+        # N12/R4：先清过期键（不淘汰窗口内活跃键），再封顶
+        for k in list(_login_failures):
+            kept = [t for t in _login_failures[k] if now - t < _LOGIN_FAIL_WINDOW]
+            if kept:
+                _login_failures[k] = kept
+            else:
+                _login_failures.pop(k, None)
+        while len(_login_failures) > _LOGIN_FAIL_MAX_KEYS:
+            _login_failures.pop(next(iter(_login_failures)), None)
+        arr = _login_failures.get(key, [])
+        # R4：IP 聚合上限——就算键被淘汰/乱填用户名，同 IP 总失败到顶即拦
+        ip = key.split("|", 1)[0]
+        ip_total = sum(len(v) for k, v in _login_failures.items() if k.split("|", 1)[0] == ip)
+        per_key, per_ip = _login_limits(db)
+        return len(arr) >= per_key or ip_total >= per_ip
 
 
 def _login_record_failure(key: str) -> None:
@@ -163,7 +186,7 @@ def _login_record_failure(key: str) -> None:
 @app.post("/api/auth/login", response_model=TokenResponse)
 def login(req: LoginRequest, request: Request, db: Session = Depends(get_db)):
     key = _login_rate_key(request, (req.username or "").strip())
-    if _login_too_often(key):
+    if _login_too_often(key, db):
         raise HTTPException(status_code=429, detail="登录尝试过于频繁，请 15 分钟后再试")
     user = db.query(User).filter(User.username == req.username).first()
     if user is None or not verify_password(req.password, user.password_hash):

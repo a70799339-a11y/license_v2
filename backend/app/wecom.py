@@ -576,7 +576,8 @@ def _query_data(db: Session, text: str, binding) -> tuple:
                 code_hint = ""
                 for nm, cd in name_code.items():
                     if nm and nm in (a.target or ""):
-                        code_hint = f"（{cd}）"
+                        # T28.11 探针实锤：这里拼实时表编码会把明文授权号带进回复——按约定掩码
+                        code_hint = f"（{mask_text(cd)}）" if cd else ""
                         break
                 t = _fmt_bj(a.created_at.strftime("%Y-%m-%d %H:%M:%S") if a.created_at else "")
                 lines.append(f"- {t}｜{a.action}｜{a.target}{code_hint}｜{a.operator}｜{a.detail}")
@@ -975,6 +976,9 @@ def process_command(db: Session, text: str, sender: str = "unknown", on_slow=Non
         from .models import RenewOrder
 
         amount = _plan_price(db, hotel.plan or "专业版", 12)
+        # R5：复用 N7 检查——套餐未配价格/0 元不得建单
+        if amount <= 0:
+            return "❌ 该店套餐未配置价格，无法创建续期订单，请联系服务商"
         order = RenewOrder(
             order_no=f"RO-{datetime.utcnow().strftime('%Y%m%d')}-{_uuid.uuid4().hex[:6]}",
             target_type="hotel",

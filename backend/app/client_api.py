@@ -64,11 +64,22 @@ def get_client_context(
         raise HTTPException(status_code=401, detail="无效客户端凭证")
     if payload.get("typ") != "client":
         raise HTTPException(status_code=401, detail="凭证类型错误")
-    return ClientContext(
+    ctx = ClientContext(
         hotel_id=payload["sub"],
         fingerprint=payload.get("fp", ""),
         scope=payload.get("scope", "hotel"),
     )
+    # R1 补面（修复面完整性）：解绑/迁移/禁用设备的旧 token 不得再调任何客户端接口，
+    # 统一走重新激活（配额检查在 activate）。集团端无设备行，跳过。
+    if ctx.scope == "hotel":
+        dev = (
+            db.query(Device.status)
+            .filter(Device.hotel_id == ctx.hotel_id, Device.fingerprint == ctx.fingerprint)
+            .first()
+        )
+        if dev is not None and dev.status not in ("在线", "离线"):
+            raise HTTPException(status_code=401, detail=f"设备状态为「{dev.status}」，请重新激活")
+    return ctx
 
 
 def get_fingerprint_header(
@@ -217,29 +228,34 @@ def _activate_fail_limit(db) -> int:
 def _activate_too_often(key: str, limit: int) -> bool:
     now = time.time()
     with _activate_lock:
-        # N12：过期键清理 + 键数封顶
-        if len(_activate_failures) > _ACTIVATE_FAIL_MAX_KEYS:
-            for k in list(_activate_failures):
-                arr = [t for t in _activate_failures[k] if now - t < _ACTIVATE_FAIL_WINDOW]
-                if arr:
-                    _activate_failures[k] = arr
-                else:
-                    _activate_failures.pop(k, None)
-            while len(_activate_failures) > _ACTIVATE_FAIL_MAX_KEYS:
-                _activate_failures.pop(next(iter(_activate_failures)), None)
-        arr = [t for t in _activate_failures.get(key, []) if now - t < _ACTIVATE_FAIL_WINDOW]
-        _activate_failures[key] = arr
-        return len(arr) >= limit
+        # N12/R4：先清过期（不淘汰窗口内活跃键），再封顶
+        for k in list(_activate_failures):
+            kept = [(t, c) for t, c in _activate_failures[k] if now - t < _ACTIVATE_FAIL_WINDOW]
+            if kept:
+                _activate_failures[k] = kept
+            else:
+                _activate_failures.pop(k, None)
+        while len(_activate_failures) > _ACTIVATE_FAIL_MAX_KEYS:
+            _activate_failures.pop(next(iter(_activate_failures)), None)
+        return len(_activate_failures.get(key, [])) >= limit
 
 
-def _activate_record_failure(key: str) -> None:
+def _activate_record_failure(key: str, cred: str = "") -> None:
     with _activate_lock:
-        _activate_failures.setdefault(key, []).append(time.time())
+        _activate_failures.setdefault(key, []).append((time.time(), cred or ""))
 
 
-def _activate_clear(key: str) -> None:
+def _activate_clear(key: str, cred: str = "") -> None:
+    """R4：成功只清本凭据的失败记录，不清空整 IP——防持合法码者每试错 9 次重置计数"""
     with _activate_lock:
-        _activate_failures.pop(key, None)
+        arr = _activate_failures.get(key)
+        if not arr:
+            return
+        kept = [(t, c) for t, c in arr if c != (cred or "")]
+        if kept:
+            _activate_failures[key] = kept
+        else:
+            _activate_failures.pop(key, None)
 
 
 @router.post("/activate")
@@ -276,7 +292,7 @@ def activate(
             },
         )
         version = latest_version_info(db)
-        _activate_clear(rate_key)  # 激活成功清除失败计数
+        _activate_clear(rate_key, code_in)  # R4：成功只清本凭据的失败记录
         return {
             "token": create_client_token(group.id, fingerprint, scope="group"),
             "scope": "group",
@@ -296,7 +312,7 @@ def activate(
 
     # N1：集团展示编号（GP-xxxx）不可作激活凭据
     if code_in.startswith("GP-"):
-        _activate_record_failure(rate_key)
+        _activate_record_failure(rate_key, code_in)
         raise HTTPException(
             status_code=403,
             detail="集团编号不能作为激活凭据，请使用集团激活码（GPK-）激活",
@@ -318,14 +334,14 @@ def activate(
                 .first()
             )
             if known is None:
-                _activate_record_failure(rate_key)
+                _activate_record_failure(rate_key, code_in)
                 raise HTTPException(
                     status_code=403,
                     detail="新设备请使用授权码（LIC- 开头）激活，客户编号仅限原设备重装使用",
                 )
             lic = find_active_license(db, hotel)
     if hotel is None:
-        _activate_record_failure(rate_key)
+        _activate_record_failure(rate_key, code_in)
         raise_alert(
             db, level="中", rule="无效激活尝试", hotel_name=req.licenseCode or "未知",
             detail=f"无效授权码/客户编号激活尝试（指纹 {fingerprint[:12]}…）",
@@ -478,7 +494,7 @@ def activate(
 
     signed = sign_license(db, license_payload_for(hotel, lic))
     version = latest_version_info(db)
-    _activate_clear(rate_key)  # 激活成功清除失败计数
+    _activate_clear(rate_key, code_in)  # R4：成功只清本凭据的失败记录
     return {
         "token": create_client_token(hotel.id, fingerprint),
         "scope": "hotel",
@@ -581,8 +597,10 @@ def heartbeat(
         .first()
     )
     if device is not None:
-        if device.status == "已禁用":
-            raise HTTPException(status_code=401, detail="该设备已被禁用")
+        # R1：解绑/迁移/禁用的设备不得借心跳复活（旧 token 90 天有效）——
+        # 一律 401 让客户端走重新激活，配额检查在 activate 的 N3 门禁里
+        if device.status not in ("在线", "离线"):
+            raise HTTPException(status_code=401, detail=f"设备状态为「{device.status}」，请重新激活")
         # P1-2 僵尸复活：离线 ≥90 天设备突然心跳（疑似授权转卖）
         old_active = _parse_ts(device.last_active)
         if (
@@ -1436,6 +1454,16 @@ def submit_renew_proof(
             raw = base64.b64decode(req.image_base64.split(",")[-1])
             if len(raw) > 5 * 1024 * 1024:
                 raise HTTPException(status_code=400, detail="回单图片不能超过 5MB")
+            # 原 9：魔数校验，只收真实图片（防任意文件落盘）
+            is_img = (
+                raw[:3] == b"\xff\xd8\xff"                     # JPEG
+                or raw[:8] == b"\x89PNG\r\n\x1a\n"             # PNG
+                or raw[:4] == b"RIFF" and raw[8:12] == b"WEBP"  # WebP
+                or raw[:6] in (b"GIF87a", b"GIF89a")           # GIF
+                or raw[:4] == b"BM"                            # BMP
+            )
+            if not is_img:
+                raise HTTPException(status_code=400, detail="回单仅支持 JPG/PNG/WebP/GIF/BMP 图片")
             save_dir = Path(__file__).resolve().parent.parent / "uploads" / "renew_proof"
             save_dir.mkdir(parents=True, exist_ok=True)
             fpath = save_dir / f"{o.order_no}.bin"

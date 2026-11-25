@@ -25,7 +25,15 @@ RUN_USER=${SUDO_USER:-$(id -un)}
 # N10：口令/密钥随机生成，不入库不入仓；已有 env.file 则沿用（防重跑改口令）
 ENV_FILE="$APP_DIR/env.file"
 if [ -f "$ENV_FILE" ]; then
-  DB_PASS=$(sed -n 's|.*'"$DB_USER"':\([^@]*\)@.*|\1|p' "$ENV_FILE" | head -1)
+  # R5：env.file 为 root:600——普通用户重跑时须走 sudo 读取，否则会误生成新口令
+  if [ -r "$ENV_FILE" ]; then
+    DB_PASS=$(sed -n 's|.*'"$DB_USER"':\([^@]*\)@.*|\1|p' "$ENV_FILE" | head -1)
+  else
+    DB_PASS=$($SUDO sed -n 's|.*'"$DB_USER"':\([^@]*\)@.*|\1|p' "$ENV_FILE" | head -1)
+  fi
+  if [ -z "$DB_PASS" ]; then
+    echo "     ⚠️ 无法从 $ENV_FILE 读取数据库口令，将生成新口令（需手动同步数据库）"
+  fi
 fi
 : "${DB_PASS:=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
 

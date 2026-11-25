@@ -2512,6 +2512,83 @@ def main():
                     req("POST", "/api/auth/rate-limit/clear", {"confirm": True}, token=token)
             except Exception:
                 pass
+
+        # ---------------- 45. 六轮复审回归（H1/M1/M2/L2/L3/I3/I5 固化，2026-11-26） ----------------
+        try:
+            print("【45. 六轮复审回归】")
+            import http.client as _hc
+            from urllib.parse import urlparse as _up
+
+            ts = str(int(time.time() * 1000))[-8:]
+
+            # T45.1 H1：路径遍历探针——哨兵文件不得被 SPA 兜底读出（realpath 包含校验）
+            sentinel = f"H1SENTINEL{ts}"
+            with open(f"/tmp/h1_sentinel_{ts}.txt", "w") as f:
+                f.write(sentinel)
+            u = _up(BASE)
+            conn = _hc.HTTPConnection(u.hostname, u.port or 80, timeout=15)
+            conn.request("GET", f"/..%2f..%2f..%2f..%2ftmp%2fh1_sentinel_{ts}.txt")
+            resp = conn.getresponse()
+            body = resp.read().decode(errors="ignore")
+            conn.close()
+            check("T45.1", "复审", "H1 路径遍历被拒（哨兵文件不泄露，回落 index）",
+                  resp.status == 200 and sentinel not in body,
+                  f"HTTP {resp.status} leaked={sentinel in body}")
+            os.remove(f"/tmp/h1_sentinel_{ts}.txt")
+
+            # 基础设施：测试店 + 授权 + 激活（T45.2/M1 与 T45.3/L2 共用）
+            st, p = req("POST", "/api/hotels", {"name": f"六轮复审店{ts}", "code": f"HT-YC{ts[-4:]}", "plan": "专业版"},
+                        token=token)
+            h6 = (p or {}).get("id", "")
+            st, lic = req("POST", "/api/licenses",
+                          {"hotelId": h6, "plan": "专业版", "type": "新签", "months": 6}, token=token)
+            c6 = (lic or {}).get("code", "")
+            fp6 = f"y{ts}"
+            st, ay = req("POST", "/api/client/activate",
+                         {"licenseCode": c6, "deviceName": f"六轮机{ts}"},
+                         headers={"X-Device-Fingerprint": fp6})
+            tok6 = (ay or {}).get("token", "")
+
+            # T45.3 L2：超长 base64 先按长度拒（不再先解码占内存）
+            st, od = req("POST", "/api/client/renew/order", {"months": 12, "plan": "专业版"},
+                         token=tok6, headers={"X-Device-Fingerprint": fp6})
+            o6 = (od or {}).get("order_no", "")
+            st_big, _ = req("POST", f"/api/client/renew/order/{o6}/proof",
+                            {"proof_no": "P45", "note": "t45", "image_base64": "A" * (7 * 1024 * 1024 + 16)},
+                            token=tok6, headers={"X-Device-Fingerprint": fp6})
+            check("T45.3", "复审", "L2 超长 base64 按长度预判拒绝（400）",
+                  bool(o6) and st_big == 400, f"order={o6} HTTP {st_big}")
+
+            # T45.2 M1：中断恢复心跳告警可触发（last_active 回拨 100h，且用无秒存量格式）
+            from datetime import datetime as _dt, timedelta as _td
+
+            legacy = (_dt.utcnow() - _td(hours=100)).strftime("%Y-%m-%d %H:%M")  # 分级格式=种子/存量
+            sql_exec(f"UPDATE hotels SET last_active='{legacy}' WHERE id='{h6}'")
+            st_hb, _ = req("POST", "/api/client/heartbeat", {"clientVersion": "1.2.5"},
+                           token=tok6, headers={"X-Device-Fingerprint": fp6})
+            st_al, als = req("GET", "/api/alerts", token=token)
+            hit = [a for a in (als or []) if a.get("rule") == "心跳中断" and a.get("hotelName") == f"六轮复审店{ts}"]
+            check("T45.2", "复审", "M1 中断恢复心跳告警触发（含无秒存量格式不 500）",
+                  st_hb == 200 and bool(hit),
+                  f"hb={st_hb} alerts={len(hit)}")
+
+            # T45.4 L3：内部键（_ 前缀）拒绝写入
+            st_int, _ = req("POST", "/api/settings", {"key": "_ed25519_public", "value": "x"}, token=token)
+            check("T45.4", "复审", "L3 settings 拒写 _ 前缀内部键（400）", st_int == 400, f"HTTP {st_int}")
+
+            # T45.5 I3：登录用户名 strip 后进限流键与查询（带空格与正主同口径）
+            st_ws, pw = req("POST", "/api/auth/login", {"username": f" admin", "password": "admin123"})
+            st_bad, _ = req("POST", "/api/auth/login", {"username": f" ghost{ts} ", "password": "bad"})
+            check("T45.5", "复审", "I3 登录 strip 口径统一（带空格命中同一账号）",
+                  st_ws == 200 and st_bad == 401, f"admin={st_ws} ghost={st_bad}")
+
+            # 清扫
+            sql_exec(f"DELETE FROM alerts WHERE hotel_name='六轮复审店{ts}'")
+            if h6:
+                req("PATCH", f"/api/hotels/{h6}", {"status": "已停用"}, token=token)
+        except Exception as _e:
+            check("S45", "异常隔离", "第 45 段未捕获异常（后续段继续）", False,
+                     f"{type(_e).__name__}: {_e}")
     except Exception as _e:
         import traceback
         traceback.print_exc()

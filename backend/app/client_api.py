@@ -647,14 +647,19 @@ def heartbeat(
             )
         device.last_active = now_str
         device.status = "在线"
+    # M1：先留底旧活跃时间再更新——否则 gap 用更新后的值算恒为 0，
+    # 「中断 N 小时后恢复心跳」告警永远不会触发（死代码）
+    prev_active = hotel.last_active
     hotel.last_active = now_str
 
     lic = find_active_license(db, hotel)
     status = license_status(hotel, lic)
 
     # 实时告警：心跳中断后恢复 / 吊销与过期授权仍在使用
-    gap = (datetime.utcnow() - datetime.strptime(hotel.last_active, "%Y-%m-%d %H:%M:%S")).total_seconds() / 3600 if hotel.last_active else 0
-    if hotel.last_active and gap > offline_grace_hours(db):
+    # M1：gap 基于更新前的 prev_active（_parse_ts 兼容秒级/分级存量格式）
+    prev_ts = _parse_ts(prev_active)
+    gap = (datetime.utcnow() - prev_ts).total_seconds() / 3600 if prev_ts else 0
+    if prev_ts and gap > offline_grace_hours(db):
         raise_alert(
             db, level="中", rule="心跳中断", hotel_name=hotel.name,
             detail=f"中断 {gap:.0f} 小时后恢复心跳（宽限 {offline_grace_hours(db)}h）",
@@ -1484,6 +1489,10 @@ def submit_renew_proof(
             import base64
             from pathlib import Path
 
+            # L2：先按 base64 字符串长度预判（5MB 原文 ≈ 7MB 字符），再解码——
+            # 防超大请求体先占满内存才被拒
+            if len(req.image_base64) > 7 * 1024 * 1024:
+                raise HTTPException(status_code=400, detail="回单图片不能超过 5MB")
             raw = base64.b64decode(req.image_base64.split(",")[-1])
             if len(raw) > 5 * 1024 * 1024:
                 raise HTTPException(status_code=400, detail="回单图片不能超过 5MB")

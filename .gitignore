@@ -1,11 +1,14 @@
 # 依赖与构建产物
 node_modules/
-dist/
+# 仅根目录 dist（管理端构建产物）；client/dist 是客户端 UI 源码，必须入库
+/dist/
 client/src-tauri/target/
 client/node_modules/
 backend/static/
-backend/keys/          # 签名私钥，绝不入库
-backend/.env           # 企微机器人等本地凭据，绝不入库
+# 签名私钥，绝不入库
+backend/keys/
+# 企微机器人等本地凭据，绝不入库
+backend/.env
 # 企微机器人本地配置，绝不入库
 backend/wecom-bot.conf
 __pycache__/

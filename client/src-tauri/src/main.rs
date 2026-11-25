@@ -161,6 +161,28 @@ fn api_url(server: &str, path: &str) -> String {
     format!("{}{}", server.trim_end_matches('/'), path)
 }
 
+/// M2：服务端地址校验——必须为 http(s):// 完整格式（大小写不限），
+/// 拒绝空白字符与内嵌账号密码（user@host 可疑伪装），返回 (规范化地址, 是否 https)
+fn validate_server_url(url: &str) -> Result<(String, bool), String> {
+    let u = url.trim().trim_end_matches('/').to_string();
+    if u.is_empty() || u.chars().any(|c| c.is_whitespace()) {
+        return Err("服务端地址格式无效".into());
+    }
+    let lower = u.to_lowercase();
+    let (is_https, rest) = if lower.starts_with("https://") {
+        (true, &u[8..])
+    } else if lower.starts_with("http://") {
+        (false, &u[7..])
+    } else {
+        return Err("服务端地址必须以 http:// 或 https:// 开头".into());
+    };
+    let host = rest.split('/').next().unwrap_or("");
+    if host.is_empty() || host.contains('@') {
+        return Err("服务端地址格式无效（主机名缺失或含可疑凭据）".into());
+    }
+    Ok((u, is_https))
+}
+
 fn http_post(url: &str, fingerprint: &str, token: &str, body: &Value) -> Result<Value, String> {
     let mut req = ureq::post(url)
         .set("Content-Type", "application/json")
@@ -734,11 +756,32 @@ fn submit_renew_proof(
 }
 
 #[tauri::command]
-fn set_server(state: State<AppState>, server_url: String) -> Result<(), String> {
+fn set_server(
+    state: State<AppState>,
+    server_url: String,
+    confirm: Option<bool>,
+) -> Result<Value, String> {
+    // M2 三层收敛：① http(s) 格式校验 ② 非 HTTPS 须显式二次确认
+    // ③ 换服清凭证（token/license_code 不得流向新地址，须重新激活）
+    let (url, is_https) = validate_server_url(&server_url)?;
+    if !is_https && !confirm.unwrap_or(false) {
+        return Err("NEEDS_CONFIRM: 非 HTTPS 明文传输存在凭证窃听风险，需二次确认".into());
+    }
     let fp = state.fingerprint.clone();
     let mut s = state.inner.lock().unwrap();
-    s.server_url = server_url.trim_end_matches('/').to_string();
-    s.save(&fp, &state_dir()).map_err(|e| e.to_string())
+    let mut cleared = false;
+    if s.server_url != url && (!s.token.is_empty() || !s.license_code.is_empty()) {
+        *s = ClientState {
+            server_url: url,
+            ..Default::default()
+        };
+        remove_license_status_file(); // 第三方校验文件同步消失
+        cleared = true;
+    } else {
+        s.server_url = url;
+    }
+    s.save(&fp, &state_dir()).map_err(|e| e.to_string())?;
+    Ok(json!({ "cleared": cleared }))
 }
 
 #[tauri::command]
@@ -1048,5 +1091,32 @@ mod tests {
         assert_eq!(derive_status_state(&st), "离线锁定");
         let st2 = base_state(); // 刚同步 → 正常
         assert_eq!(derive_status_state(&st2), "正常");
+    }
+
+    // M2：服务端地址校验
+    #[test]
+    fn validate_server_url_ok() {
+        assert_eq!(
+            validate_server_url("https://lic.example.com/").unwrap(),
+            ("https://lic.example.com".to_string(), true)
+        );
+        assert_eq!(
+            validate_server_url("http://10.0.0.5:8000").unwrap(),
+            ("http://10.0.0.5:8000".to_string(), false)
+        );
+        assert_eq!(
+            validate_server_url("HTTPS://LIC.EXAMPLE.COM").unwrap(),
+            ("HTTPS://LIC.EXAMPLE.COM".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn validate_server_url_rejects_bad() {
+        assert!(validate_server_url("lic.example.com").is_err()); // 无 scheme
+        assert!(validate_server_url("ftp://x.com").is_err()); // 非 http(s)
+        assert!(validate_server_url("https://user:pw@evil.com").is_err()); // 内嵌凭据伪装
+        assert!(validate_server_url("https://a b.com").is_err()); // 空白
+        assert!(validate_server_url("").is_err());
+        assert!(validate_server_url("http://").is_err()); // 主机缺失
     }
 }

@@ -295,10 +295,12 @@ def clear_rate_limit(req: RateLimitClearIn, db: Session = Depends(get_db), user:
 
 @app.post("/api/auth/login", response_model=TokenResponse)
 def login(req: LoginRequest, request: Request, db: Session = Depends(get_db)):
-    key = _login_rate_key(request, (req.username or "").strip())
+    # I3：限流键与用户查询统一用 strip 后的用户名，防「 admin 」命中计数却查不到用户
+    username = (req.username or "").strip()
+    key = _login_rate_key(request, username)
     if _login_too_often(key, db):
         raise HTTPException(status_code=429, detail="登录尝试过于频繁，请 15 分钟后再试")
-    user = db.query(User).filter(User.username == req.username).first()
+    user = db.query(User).filter(User.username == username).first()
     if user is None or not verify_password(req.password, user.password_hash):
         _login_record_failure(key)
         raise HTTPException(status_code=401, detail="账号或密码错误")
@@ -1124,6 +1126,10 @@ def wecom_binding_create(
 
 @app.post("/api/settings")
 def update_setting(req: SettingUpdate, db: Session = Depends(get_db), user: User = Depends(require_roles("admin"))):
+    # L3：`_` 前缀是内部键（GET 侧隐藏，如 _ed25519_public），写入侧同样拒绝——
+    # 防覆盖签名公钥等内部键破坏验签链路
+    if (req.key or "").startswith("_"):
+        raise HTTPException(status_code=400, detail="内部配置键不允许通过接口写入")
     s = db.query(Setting).filter(Setting.key == req.key).first()
     if s is None:
         db.add(Setting(key=req.key, value=req.value))
@@ -1632,8 +1638,11 @@ if os.path.isdir(static_dir):
     def spa_fallback(full_path: str):
         if full_path.startswith("api/"):
             raise HTTPException(status_code=404, detail="Not Found")
-        candidate = os.path.join(static_dir, full_path)
-        if full_path and os.path.isfile(candidate):
+        # H1：realpath 包含校验——URL 解码出的 ../ 逃逸一律回落 index.html，
+        # 防未认证任意文件读取（直连后端实测曾可读 /etc/* 与部署密钥）
+        base = os.path.realpath(static_dir)
+        candidate = os.path.realpath(os.path.join(static_dir, full_path))
+        if full_path and candidate.startswith(base + os.sep) and os.path.isfile(candidate):
             return FileResponse(candidate)
         return FileResponse(index_file)
 

@@ -48,8 +48,11 @@ class FileKeyProvider(KeyProvider):
             format=serialization.PrivateFormat.Raw,
             encryption_algorithm=serialization.NoEncryption(),
         ).hex()
-        KEY_FILE.write_text(priv_hex, encoding="utf-8")
-        self._restrict()
+        # I5：O_CREAT|O_TRUNC 直接以 0600 落盘，消除「先写后 chmod」窗口内的可读期
+        fd = os.open(KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(priv_hex)
+        self._restrict()  # 兜底（Windows 为尽力而为；对已存在文件补权限）
         return priv_hex
 
     @staticmethod

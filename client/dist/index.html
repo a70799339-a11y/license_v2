@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>酒店AI管理客户端</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <!-- 侧边导航 -->
+    <aside class="sidebar">
+      <div class="logo">
+        <div class="logo-mark">L</div>
+        <div>
+          <div class="logo-title">酒店AI管理</div>
+          <div class="logo-sub" id="logo-version">客户端 v1.2.2</div>
+        </div>
+      </div>
+      <nav class="menu">
+        <button class="menu-item active" data-view="overview">授权概览</button>
+        <button class="menu-item" data-view="group">集团概览</button>
+        <button class="menu-item" data-view="devices">设备信息</button>
+        <button class="menu-item" data-view="sync">同步状态</button>
+      </nav>
+      <div class="sidebar-foot">
+        <div class="fp-label">设备指纹</div>
+        <div class="fp-value" id="fp-short">--</div>
+      </div>
+    </aside>
+
+    <!-- 主内容 -->
+    <main class="main">
+      <!-- 顶部状态条 -->
+      <header class="topbar">
+        <div>
+          <div class="crumb" id="crumb">授权概览</div>
+          <div class="hello" id="hotel-line">未激活</div>
+        </div>
+        <div class="top-actions">
+          <div class="offline-banner hidden" id="offline-banner">
+            <span id="offline-text">离线运行中</span>
+            <button class="btn-mini" id="btn-reconnect">重新连接</button>
+          </div>
+          <div class="update-banner hidden" id="update-banner">
+            <span id="update-text">发现新版本</span>
+            <button class="btn-mini" id="goto-sync">查看</button>
+          </div>
+          <button class="btn-ghost" id="btn-sync">立即同步</button>
+        </div>
+      </header>
+
+      <!-- 视图：激活 -->
+      <section class="view" id="view-activate">
+        <div class="card activate-card">
+          <h2>激活客户端</h2>
+          <p class="muted">输入服务商提供的授权码（或客户编号），激活后自动与服务端同步。</p>
+          <label>服务端地址
+            <input id="in-server" value="http://localhost" placeholder="http://your-server" />
+          </label>
+          <label>授权码 / 客户编号
+            <input id="in-code" placeholder="如 LIC-2026-0001 或 HT-0001" />
+          </label>
+          <label>设备名称
+            <input id="in-name" placeholder="如 前台-收银电脑" />
+          </label>
+          <button class="btn-primary" id="btn-activate">激活</button>
+          <div class="msg hidden" id="activate-msg"></div>
+          <div class="muted small" id="activate-tip">激活时将采集本机设备指纹并绑定授权，同一设备只能绑定一家酒店。</div>
+        </div>
+      </section>
+
+      <!-- 视图：授权概览（单店） -->
+      <section class="view hidden" id="view-overview">
+        <div class="msg hidden" id="renew-banner" style="margin-bottom:12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <span id="renew-banner-text">授权即将到期</span>
+          <button class="btn-primary btn-mini" id="btn-renew">立即续期</button>
+        </div>
+        <div class="kpi-row">
+          <div class="kpi"><div class="kpi-label">当前套餐</div><div class="kpi-value" id="ov-plan">--</div></div>
+          <div class="kpi"><div class="kpi-label">授权状态</div><div class="kpi-value" id="ov-status">--</div></div>
+          <div class="kpi"><div class="kpi-label">到期日期</div><div class="kpi-value" id="ov-expire">--</div></div>
+          <div class="kpi"><div class="kpi-label">剩余天数</div><div class="kpi-value" id="ov-days">--</div></div>
+        </div>
+        <div class="card">
+          <h3>授权信息</h3>
+          <div class="kv-grid">
+            <div><span class="muted">酒店名称</span><b id="ov-hotel">--</b></div>
+            <div><span class="muted">授权码</span><b class="mono" id="ov-code">--</b></div>
+            <div><span class="muted">自动续期</span><b id="ov-renew">--</b></div>
+            <div><span class="muted">最近同步</span><b id="ov-sync">--</b></div>
+          </div>
+          <div class="msg hidden" id="ov-msg"></div>
+        </div>
+      </section>
+
+      <!-- 视图：集团概览（总端） -->
+      <section class="view hidden" id="view-group">
+        <div class="kpi-row">
+          <div class="kpi"><div class="kpi-label">旗下门店</div><div class="kpi-value" id="gp-count">--</div></div>
+          <div class="kpi"><div class="kpi-label">设备总数</div><div class="kpi-value" id="gp-devices">--</div></div>
+          <div class="kpi"><div class="kpi-label">即将到期 / 过期</div><div class="kpi-value" id="gp-expiring">--</div></div>
+          <div class="kpi"><div class="kpi-label">待处理告警</div><div class="kpi-value" id="gp-alerts">--</div></div>
+        </div>
+        <div class="card">
+          <div class="card-head-row">
+            <h3>门店一览</h3>
+            <div class="btn-row">
+              <button class="btn-primary" id="btn-group-renew-selected">续期选中门店</button>
+              <button class="btn-ghost" id="btn-group-renew-all">全部续期一年</button>
+            </div>
+          </div>
+          <table class="table">
+            <thead><tr><th></th><th>门店</th><th>编号</th><th>城市</th><th>套餐</th><th>状态</th><th>设备</th><th>到期</th></tr></thead>
+            <tbody id="gp-member-rows"><tr><td colspan="8" class="muted">加载中…</td></tr></tbody>
+          </table>
+        </div>
+        <div class="card">
+          <h3>跨店告警</h3>
+          <table class="table">
+            <thead><tr><th>等级</th><th>规则</th><th>门店</th><th>详情</th><th>状态</th></tr></thead>
+            <tbody id="gp-alert-rows"><tr><td colspan="5" class="muted">暂无告警</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 视图：设备信息 -->
+      <section class="view hidden" id="view-devices">
+        <div class="card">
+          <h3>本机设备指纹</h3>
+          <div class="mono fp-full" id="fp-full">--</div>
+          <p class="muted small">指纹由硬件标识派生，用于 License 绑定与防拷贝校验，请勿泄露。</p>
+        </div>
+        <div class="card">
+          <h3>已绑定设备</h3>
+          <p class="muted small" id="device-quota-tip">支持自助解绑（离线 ≥30 分钟的旧设备）与同名迁移；今日剩余自助操作次数：--</p>
+          <table class="table">
+            <thead><tr><th>设备名称</th><th>系统</th><th>指纹</th><th>最近活跃</th><th>状态</th><th>操作</th></tr></thead>
+            <tbody id="device-rows"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 视图：同步状态 -->
+      <section class="view hidden" id="view-sync">
+        <div class="card">
+          <h3>与服务端同步</h3>
+          <div class="kv-grid">
+            <div><span class="muted">最近同步</span><b id="sy-last">--</b></div>
+            <div><span class="muted">授权状态</span><b id="sy-status">--</b></div>
+            <div><span class="muted">本机版本</span><b id="sy-local">1.2.2</b></div>
+            <div><span class="muted">服务端最新版</span><b id="sy-latest">--</b></div>
+            <div><span class="muted">离线宽限（服务端配置）</span><b id="sy-grace">--</b></div>
+            <div><span class="muted">离线剩余可用</span><b id="sy-remain">--</b></div>
+          </div>
+          <div class="msg hidden" id="sy-warn"></div>
+          <div class="btn-row">
+            <button class="btn-primary" id="btn-heartbeat">立即心跳</button>
+            <button class="btn-ghost" id="btn-check-update">检查更新</button>
+          </div>
+          <div class="update-box hidden" id="update-box">
+            <b>可更新版本：<span id="ub-version"></span></b>
+            <p class="muted small" id="ub-notes"></p>
+            <p class="small">下载地址：<span class="mono" id="ub-url"></span></p>
+          </div>
+        </div>
+        <div class="card">
+          <h3>消息通知（企微群机器人）</h3>
+          <p class="muted small">配置本<span id="hook-entity">实体</span>的企微群机器人 webhook 后，风控告警与到期提醒将自动推送到该群。仅支持企业微信官方 webhook 地址。</p>
+          <label style="margin-top:10px">群机器人 webhook
+            <input id="in-hook" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..." />
+          </label>
+          <div style="margin-top:14px;padding-top:12px;border-top:1px solid rgba(255,255,255,.08)">
+            <label class="chk-row" style="display:flex;align-items:center;gap:8px;cursor:pointer">
+              <input type="checkbox" id="in-push-enabled" style="width:auto" />
+              <span>每日定时推送<b id="push-scope-desc">（营业简报）</b></span>
+            </label>
+            <label style="margin-top:8px;display:block">推送时间
+              <input id="in-push-time" type="time" value="09:00" style="width:130px" />
+            </label>
+            <p class="muted small" style="margin:6px 0 0"><span id="push-last-txt">尚未推送过</span></p>
+          </div>
+          <div class="btn-row" style="margin-top:12px">
+            <button class="btn-primary" id="btn-save-hook">保存配置</button>
+            <button class="btn-ghost" id="btn-test-hook">发送测试消息</button>
+            <button class="btn-ghost" id="btn-push-now">立即推送今日简报</button>
+          </div>
+          <div class="msg hidden" id="hook-msg" style="margin-top:12px"></div>
+        </div>
+        <div class="card">
+          <h3>服务端设置</h3>
+          <label>服务端地址
+            <input id="in-server2" placeholder="http://your-server" />
+          </label>
+          <div class="btn-row">
+            <button class="btn-ghost" id="btn-save-server">保存地址</button>
+            <button class="btn-danger" id="btn-logout">退出激活</button>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- 离线超时锁定遮罩 -->
+  <div class="lock-overlay hidden" id="lock-overlay">
+    <div class="lock-card">
+      <div class="lock-icon">!</div>
+      <h2>功能已禁用</h2>
+      <p id="lock-text">客户端离线超过宽限时长，业务功能已锁定。</p>
+      <p class="muted small">连接网络后点「重新连接」即自动恢复，无需联系服务商。</p>
+      <button class="btn-primary" id="btn-lock-reconnect">重新连接</button>
+    </div>
+  </div>
+
+  <!-- 续期弹层（P0-2 自助续期） -->
+  <div class="lock-overlay hidden" id="renew-overlay">
+    <div class="lock-card" style="width:420px;max-width:92vw">
+      <h2 style="margin-top:0">自助续期</h2>
+      <label style="display:block;margin:8px 0">续期时长
+        <select id="renew-months" style="width:100%;margin-top:4px">
+          <option value="12">12 个月</option>
+          <option value="24">24 个月</option>
+        </select>
+      </label>
+      <label style="display:block;margin:8px 0">目标套餐
+        <select id="renew-plan" style="width:100%;margin-top:4px">
+          <option value="">同档续期（当前套餐）</option>
+          <option value="基础版">基础版</option>
+          <option value="专业版">专业版</option>
+          <option value="旗舰版">旗舰版</option>
+        </select>
+      </label>
+      <p class="muted small">支付方式：对公转账（创建订单后填写汇款回单号）；微信支付待开通。</p>
+      <div id="renew-order-box" class="hidden" style="margin-top:10px;padding:10px;border:1px solid rgba(255,255,255,.12);border-radius:8px">
+        <div class="small">订单号：<b class="mono" id="ro-no">--</b>　金额：<b id="ro-amount">--</b></div>
+        <label style="display:block;margin:8px 0">汇款回单号/流水号
+          <input id="ro-proof-no" placeholder="必填" />
+        </label>
+        <label style="display:block;margin:8px 0">备注
+          <input id="ro-proof-note" placeholder="选填" />
+        </label>
+        <div class="small muted" id="ro-status">订单已创建，请转账后填写回单号提交。</div>
+      </div>
+      <div class="btn-row" style="margin-top:14px">
+        <button class="btn-primary" id="btn-renew-create">创建订单</button>
+        <button class="btn-primary hidden" id="btn-renew-proof">提交凭证</button>
+        <button class="btn-ghost" id="btn-renew-close">关闭</button>
+      </div>
+      <div class="msg hidden" id="renew-msg" style="margin-top:10px"></div>
+    </div>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>

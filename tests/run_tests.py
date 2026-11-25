@@ -2297,6 +2297,118 @@ def main():
         except Exception as _e:
             check("S42", "异常隔离", "第 42 段未捕获异常（后续段继续）", False,
                      f"{type(_e).__name__}: {_e}")
+
+        # ---------------- 43. 三轮复审回归（F1/L1/L2 修复固化，2026-11-25） ----------------
+        try:
+            print("【43. 三轮复审回归】")
+            import subprocess as _sp3
+
+            # T43.1 F1：全新库生产启动 → 套餐/设置必备数据齐全（白盒，临时库 license_seed_test）
+            ts = str(int(time.time() * 1000))[-8:]
+            py = "/opt/license/.venv/bin/python3"
+            if not os.path.exists(py):
+                py = "python3"
+            r3 = _sp3.run(
+                [py, os.path.join(os.path.dirname(os.path.abspath(__file__)), "t43_seed.py")],
+                capture_output=True, text=True, timeout=120,
+                cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            rj = {}
+            for ln in (r3.stdout or "").splitlines():
+                if ln.startswith("RESULT_JSON:"):
+                    try:
+                        rj = json.loads(ln[len("RESULT_JSON:"):])
+                    except Exception:
+                        pass
+            check("T43.1", "复审", "F1 生产种子：套餐/设置必备齐全且演示数据关闭",
+                  bool(rj.get("ok")),
+                  json.dumps(rj.get("checks", {}), ensure_ascii=False) if rj else (r3.stderr or "")[-160:])
+            check("T43.1b", "复审", "F1 已部署库缺套餐/设置重启自动补齐",
+                  bool((rj.get("checks") or {}).get("backfill")), f"s3_plans={rj.get('s3_plans')}")
+
+            # T43.2 F1：线上 /api/plans 至少 3 个且价格 > 0（续期计价依赖）
+            st, plans = req("GET", "/api/plans", token=token)
+            priced = [p for p in (plans or []) if (p.get("price") or 0) > 0]
+            check("T43.2", "复审", "F1 套餐接口非空且价格 > 0（续期可计价）",
+                  st == 200 and len(plans or []) >= 3 and len(priced) >= 3,
+                  f"{len(plans or [])} 个套餐 / {len(priced)} 个有价")
+
+            # 清零限流残留（既验手动解除入口，也保证本段计数从零开始）
+            st, cl0 = req("POST", "/api/auth/rate-limit/clear", {}, token=token)
+            check("T43.4a", "复审", "L1 手动解除限流接口可用（admin）",
+                  st == 200 and bool((cl0 or {}).get("ok")), f"HTTP {st}")
+
+            # T43.3 L1：授信账号不受 IP 聚合上限误伤；未授信账号仍拦
+            st, _ = req("POST", "/api/auth/login", {"username": "admin", "password": "admin123"})  # 建立授信
+            req("POST", "/api/settings", {"key": "login_fail_ip_limit", "value": "4"}, token=token)
+            spray = []
+            for i in range(5):
+                s13, _ = req("POST", "/api/auth/login", {"username": f"l1spray{ts}{i}", "password": "bad"})
+                spray.append(s13)
+            st_trust, _ = req("POST", "/api/auth/login", {"username": "admin", "password": "admin123"})
+            st_un, _ = req("POST", "/api/auth/login", {"username": f"l1new{ts}", "password": "bad"})
+            check("T43.3", "复审", "L1 IP 聚合上限触发且授信账号豁免（防共用出口误锁）",
+                  spray[-1] == 429 and st_trust == 200 and st_un == 429,
+                  f"spray={spray} admin={st_trust} untrusted={st_un}")
+
+            # T43.4 L1：手动解除后未授信账号恢复（不再 429）
+            st_c, _ = req("POST", "/api/auth/rate-limit/clear", {}, token=token)
+            st_un2, _ = req("POST", "/api/auth/login", {"username": f"l1new{ts}", "password": "bad"})
+            check("T43.4", "复审", "L1 手动解除限流后登录恢复 401（不再 429）",
+                  st_c == 200 and st_un2 == 401, f"clear={st_c} login={st_un2}")
+            req("POST", "/api/settings", {"key": "login_fail_ip_limit", "value": "999"}, token=token)
+
+            # T43.5 R4×L2：成功只清本凭据失败记录（惰性清理下计数语义不变）
+            st, _ = req("POST", "/api/auth/rate-limit/clear", {"scope": "activate"}, token=token)
+            req("POST", "/api/settings", {"key": "activate_fail_limit", "value": "3"}, token=token)
+            fpA = f"a43{ts}"
+            fakes = []
+            for _ in range(2):
+                s14, _ = req("POST", "/api/client/activate",
+                             {"licenseCode": f"FAKEA{ts}", "deviceName": f"三轮机{ts}"},
+                             headers={"X-Device-Fingerprint": fpA})
+                fakes.append(s14)
+            st, p = req("POST", "/api/hotels", {"name": f"三轮复审店{ts}", "code": f"HT-YA{ts[-4:]}", "plan": "专业版"},
+                        token=token)
+            hid3 = (p or {}).get("id", "")
+            st, lic = req("POST", "/api/licenses",
+                          {"hotelId": hid3, "plan": "专业版", "type": "新签", "months": 6}, token=token)
+            real_code = (lic or {}).get("code", "")
+            fpB = f"b43{ts}"
+            st_ok, okp = req("POST", "/api/client/activate",
+                             {"licenseCode": real_code, "deviceName": f"三轮机B{ts}"},
+                             headers={"X-Device-Fingerprint": fpB})
+            s15, _ = req("POST", "/api/client/activate",
+                         {"licenseCode": f"FAKEA{ts}", "deviceName": f"三轮机{ts}"},
+                         headers={"X-Device-Fingerprint": fpA})
+            s16, _ = req("POST", "/api/client/activate",
+                         {"licenseCode": f"FAKEA{ts}", "deviceName": f"三轮机{ts}"},
+                         headers={"X-Device-Fingerprint": fpA})
+            check("T43.5", "复审", "R4 成功只清本凭据计数（他凭据失败保留→仍 429）",
+                  fakes == [404, 404] and st_ok == 200 and s15 == 404 and s16 == 429,
+                  f"fakes={fakes} ok={st_ok} after={s15},{s16}")
+            st_c2, _ = req("POST", "/api/auth/rate-limit/clear", {"scope": "activate"}, token=token)
+            s17, _ = req("POST", "/api/client/activate",
+                         {"licenseCode": f"FAKEA{ts}", "deviceName": f"三轮机{ts}"},
+                         headers={"X-Device-Fingerprint": fpA})
+            check("T43.6", "复审", "L1 激活限流手动解除后恢复 404（不再 429）",
+                  st_c2 == 200 and s17 == 404, f"clear={st_c2} act={s17}")
+            req("POST", "/api/settings", {"key": "activate_fail_limit", "value": "999"}, token=token)
+
+            # 清扫
+            if hid3:
+                req("PATCH", f"/api/hotels/{hid3}", {"status": "已停用"}, token=token)
+        except Exception as _e:
+            check("S43", "异常隔离", "第 43 段未捕获异常（后续段继续）", False,
+                     f"{type(_e).__name__}: {_e}")
+        finally:
+            try:
+                if token:
+                    req("POST", "/api/settings", {"key": "activate_fail_limit", "value": "999"}, token=token)
+                    req("POST", "/api/settings", {"key": "login_fail_limit", "value": "999"}, token=token)
+                    req("POST", "/api/settings", {"key": "login_fail_ip_limit", "value": "999"}, token=token)
+                    req("POST", "/api/auth/rate-limit/clear", {}, token=token)
+            except Exception:
+                pass
     except Exception as _e:
         import traceback
         traceback.print_exc()

@@ -20,3 +20,29 @@
 - Gitee Issues API 提交失败（token 缺 Issues 写权限，POST 404 "project or enterprise"）——本表为正式跟踪位；如需 Gitee 同步，给令牌加 issues 权限后可补建。
 - S2 残留风险：存量顺序号授权码（LIC-2026-XXXX）仍可被限速枚举，建议运营逐步换发高熵码。
 - S7 需要域名/证书到位后实施。
+
+---
+
+# 第二轮复审跟踪（N1~N13，2026-11-25 上午，license_v2_code_review.md）
+
+> 详见当日日志。P0：N1 集团激活码高熵化 / N2 限流键纯 IP / N3 设备状态门禁 / N4 指纹打码 / N5 企微续期双轨。
+> N6 viewer 授权码打码、N7 套餐校验、N8 LN2 随机 nonce、N9 CSP、N10 env.file 权限、N11 银行卡掩码、N12 限流字典封顶。
+> 回归固化 T41（13 条）。N13 挂账（localStorage token → Cookie+CSRF）。
+
+# 三轮复审跟踪（R1~R5，2026-11-25 上午，license_v2_code_review_v2.md）
+
+> R1 旧 token 心跳复活 → get_client_context 集中门禁；R2 演示数据 SEED_DEMO_DATA 门禁；R3 集团激活码创建即生成；
+> R4 限流绕过点（按凭据清计数 + IP 聚合上限）；R5 0 元拒单/部署脚本 sudo 读 env。
+> 回归固化 T42（8 条）。
+
+# 四轮复审跟踪（F1/L1/L2，2026-11-25，license_v2_code_review_v3.md）
+
+| ID | 严重度 | 问题 | 状态 | 修复要点 | 验收断言 |
+|---|---|---|---|---|---|
+| F1 | 中（P0 功能回归） | SEED_DEMO_DATA 关闭时套餐/设置也被跳过，全新生产环境续期付款整体不可用 | ✅ | 基础数据与演示数据分离：ensure_plans/ensure_settings 幂等补齐，两分支都调用（含已部署库补数） | T43.1/T43.1b/T43.2 |
+| L1 | 低 | 单 IP 登录失败上限可锁死共用出口 IP 的全部员工 | ✅ | 授信键豁免（IP+账号登录成功过则免 IP 聚合上限，单键 10 次仍拦）+ POST /api/auth/rate-limit/clear 手动解除入口（admin） | T43.3/T43.4/T43.6 |
+| L2 | 低 | 限流每请求全量遍历计数字典（最多 1 万键）+ 登录 IP 汇总再扫一遍 | ✅ | 惰性修剪（只清本键/本 IP 桶）+ 全量清扫节流 60s 一次 + IP 聚合独立索引 | T43.5（计数语义不变） |
+
+## 四轮复核确认（v3 报告对前轮的复核）
+- R1~R5、原 9（上传魔数校验）均确认修复；顺手项（机器人授权码打码、种子审计日志脱敏）被报告点名表扬。
+- 遗留（未修，原因见前）：原 6 存量默认口令轮换（挂账：首次登录强制改密）、原 7 TLS（等域名/证书）、N8 DPAPI、N9 withGlobalTauri、N13 Cookie 化。

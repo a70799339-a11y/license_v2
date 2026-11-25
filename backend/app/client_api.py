@@ -206,8 +206,10 @@ def offline_grace_hours(db: Session) -> int:
 _ACTIVATE_FAIL_WINDOW = 900
 _ACTIVATE_FAIL_LIMIT = 10
 _ACTIVATE_FAIL_MAX_KEYS = 10000  # N12：键数上限，防客户端乱填指纹撑爆内存
+_ACTIVATE_SWEEP_INTERVAL = 60  # L2：全量过期清理节流，请求路径只做本键惰性修剪
 _activate_failures: dict = {}
 _activate_lock = threading.Lock()
+_activate_last_sweep = 0.0
 
 
 def _activate_rate_key(request: Request) -> str:
@@ -225,19 +227,45 @@ def _activate_fail_limit(db) -> int:
         return _ACTIVATE_FAIL_LIMIT
 
 
+def _activate_sweep_locked(now: float) -> None:
+    """L2：全量清理过期键（节流调用；请求路径不做全字典遍历）"""
+    global _activate_last_sweep
+    if now - _activate_last_sweep < _ACTIVATE_SWEEP_INTERVAL:
+        return
+    _activate_last_sweep = now
+    for k in list(_activate_failures):
+        kept = [(t, c) for t, c in _activate_failures[k] if now - t < _ACTIVATE_FAIL_WINDOW]
+        if kept:
+            _activate_failures[k] = kept
+        else:
+            _activate_failures.pop(k, None)
+    while len(_activate_failures) > _ACTIVATE_FAIL_MAX_KEYS:
+        _activate_failures.pop(next(iter(_activate_failures)), None)
+
+
 def _activate_too_often(key: str, limit: int) -> bool:
     now = time.time()
     with _activate_lock:
-        # N12/R4：先清过期（不淘汰窗口内活跃键），再封顶
+        _activate_sweep_locked(now)
+        # L2：惰性修剪只清本键（key=IP，桶就是本 IP），不遍历全字典
+        kept = [(t, c) for t, c in _activate_failures.get(key, []) if now - t < _ACTIVATE_FAIL_WINDOW]
+        if kept:
+            _activate_failures[key] = kept
+        else:
+            _activate_failures.pop(key, None)
+        return len(kept) >= limit
+
+
+def clear_activate_failures(ip: Optional[str] = None) -> int:
+    """L1：手动解除激活限流（供 /api/auth/rate-limit/clear 调用）。
+    ip=None 全清；否则只清该 IP。返回清除的失败记录条数。"""
+    cleared = 0
+    with _activate_lock:
         for k in list(_activate_failures):
-            kept = [(t, c) for t, c in _activate_failures[k] if now - t < _ACTIVATE_FAIL_WINDOW]
-            if kept:
-                _activate_failures[k] = kept
-            else:
-                _activate_failures.pop(k, None)
-        while len(_activate_failures) > _ACTIVATE_FAIL_MAX_KEYS:
-            _activate_failures.pop(next(iter(_activate_failures)), None)
-        return len(_activate_failures.get(key, [])) >= limit
+            if ip and k != ip:
+                continue
+            cleared += len(_activate_failures.pop(k, ()))
+    return cleared
 
 
 def _activate_record_failure(key: str, cred: str = "") -> None:

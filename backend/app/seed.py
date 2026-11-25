@@ -75,13 +75,51 @@ def ensure_groups(db: Session) -> None:
     db.commit()
 
 
+def ensure_plans(db: Session) -> None:
+    """幂等补齐套餐（F1：必需基础数据，与 SEED_DEMO_DATA 无关）：
+    全新生产环境没有套餐 → 续期订单 _plan_price 取 0 全部被拒。
+    按 id 只补缺失，不覆盖已有行（保护运营手调过的价格）。"""
+    defs = [
+        ("p1", "基础版", 1999, 19999, 30, ["基础经营看板", "设备管理", "到期提醒", "标准客服支持"], "#3B82F6"),
+        ("p2", "专业版", 4999, 49999, 60, ["全部基础版功能", "AI 智能风控", "多门店集团管理", "批量操作与导入导出", "优先客服支持"], "#8B5CF6"),
+        ("p3", "旗舰版", 9999, 99999, 150, ["全部专业版功能", "定制风控规则", "专属客户成功经理", "API 开放接口", "私有化部署可选"], "#F59E0B"),
+    ]
+    for pid, name, price, yprice, maxd, feats, color in defs:
+        if db.query(Plan).filter(Plan.id == pid).first() is None:
+            cnt = db.query(Hotel).filter(Hotel.plan == name).count()
+            db.add(Plan(
+                id=pid, name=name, price=price, yearly_price=yprice, max_devices=maxd,
+                features=json.dumps(feats, ensure_ascii=False), hotels=cnt, color=color,
+            ))
+    db.commit()
+
+
+def ensure_settings(db: Session) -> None:
+    """幂等补齐系统设置（F1：必需基础数据，与 SEED_DEMO_DATA 无关）：
+    按 key 只补缺失，不覆盖运营已改的值。"""
+    for key, value in (
+        ("auto_renew", "on"),
+        ("renew_days_before", "7"),
+        ("heartbeat_timeout_hours", "72"),
+    ):
+        if db.query(Setting).filter(Setting.key == key).first() is None:
+            db.add(Setting(key=key, value=value))
+    db.commit()
+
+
 def seed(db: Session) -> None:
     if db.query(User).first() is not None:
         ensure_users(db)
         ensure_groups(db)
+        ensure_plans(db)  # F1：已部署环境重启后补上缺失的基础数据
+        ensure_settings(db)
         return  # 已初始化
 
     ensure_users(db)
+    # F1：套餐/设置是必需基础数据，在演示数据门禁之前创建——
+    # 否则全新生产环境（SEED_DEMO_DATA 关）续期付款流程整体不可用
+    ensure_plans(db)
+    ensure_settings(db)
 
     # R2：演示数据只在显式开启时生成（SEED_DEMO_DATA=1）——
     # 生产默认关闭，防演示门店的顺序授权码/可预测指纹进生产
@@ -160,23 +198,7 @@ def seed(db: Session) -> None:
             status=status,
         ))
 
-    # 套餐
-    plans = [
-        ("p1", "基础版", 1999, 19999, 30, ["基础经营看板", "设备管理", "到期提醒", "标准客服支持"], "#3B82F6"),
-        ("p2", "专业版", 4999, 49999, 60, ["全部基础版功能", "AI 智能风控", "多门店集团管理", "批量操作与导入导出", "优先客服支持"], "#8B5CF6"),
-        ("p3", "旗舰版", 9999, 99999, 150, ["全部专业版功能", "定制风控规则", "专属客户成功经理", "API 开放接口", "私有化部署可选"], "#F59E0B"),
-    ]
-    for pid, name, price, yprice, maxd, feats, color in plans:
-        cnt = db.query(Hotel).filter(Hotel.plan == name).count()
-        db.add(Plan(
-            id=pid, name=name, price=price, yearly_price=yprice, max_devices=maxd,
-            features=json.dumps(feats, ensure_ascii=False), hotels=cnt, color=color,
-        ))
-
-    # 设置
-    db.add(Setting(key="auto_renew", value="on"))
-    db.add(Setting(key="renew_days_before", value="7"))
-    db.add(Setting(key="heartbeat_timeout_hours", value="72"))
+    # 套餐/设置已由 ensure_plans/ensure_settings 在演示数据门禁前创建（F1），此处不再重复写
 
     # 操作日志
     log_defs = [

@@ -137,8 +137,12 @@ _LOGIN_FAIL_WINDOW = 900
 _LOGIN_FAIL_LIMIT = 10
 _LOGIN_FAIL_IP_LIMIT = 30  # R4：单 IP 总失败上限（防随机用户名刷键挤掉目标账号计数）
 _LOGIN_FAIL_MAX_KEYS = 10000  # N12：键数上限，防乱填用户名撑爆内存
-_login_failures: dict = {}
+_SWEEP_INTERVAL = 60  # L2：全量过期清理节流到每 60s 一次，请求路径只做惰性修剪
+_login_failures: dict = {}       # key "ip|username" -> [失败时间戳]
+_login_ip_failures: dict = {}    # ip -> [(失败时间戳, key)]（L2：IP 聚合计数独立索引，免全字典汇总）
+_login_trusted: dict = {}        # L1：授信键 "ip|username" -> 最近成功时间（登录成功过，免 IP 聚合误伤）
 _login_lock = threading.Lock()
+_login_last_sweep = 0.0
 
 
 def _login_rate_key(request: Request, username: str) -> str:
@@ -158,29 +162,115 @@ def _login_limits(db) -> tuple:
         return _LOGIN_FAIL_LIMIT, _LOGIN_FAIL_IP_LIMIT
 
 
+def _login_sweep_locked(now: float) -> None:
+    """L2：全量清理过期键（节流调用；请求路径不做全字典遍历）"""
+    global _login_last_sweep
+    if now - _login_last_sweep < _SWEEP_INTERVAL:
+        return
+    _login_last_sweep = now
+    for k in list(_login_failures):
+        kept = [t for t in _login_failures[k] if now - t < _LOGIN_FAIL_WINDOW]
+        if kept:
+            _login_failures[k] = kept
+        else:
+            _login_failures.pop(k, None)
+    for ip in list(_login_ip_failures):
+        kept = [(t, k) for t, k in _login_ip_failures[ip] if now - t < _LOGIN_FAIL_WINDOW]
+        if kept:
+            _login_ip_failures[ip] = kept
+        else:
+            _login_ip_failures.pop(ip, None)
+    while len(_login_failures) > _LOGIN_FAIL_MAX_KEYS:
+        _login_failures.pop(next(iter(_login_failures)), None)
+    while len(_login_trusted) > _LOGIN_FAIL_MAX_KEYS:
+        _login_trusted.pop(next(iter(_login_trusted)), None)
+
+
 def _login_too_often(key: str, db) -> bool:
     now = time.time()
+    ip = key.split("|", 1)[0]
     with _login_lock:
-        # N12/R4：先清过期键（不淘汰窗口内活跃键），再封顶
-        for k in list(_login_failures):
-            kept = [t for t in _login_failures[k] if now - t < _LOGIN_FAIL_WINDOW]
-            if kept:
-                _login_failures[k] = kept
-            else:
-                _login_failures.pop(k, None)
-        while len(_login_failures) > _LOGIN_FAIL_MAX_KEYS:
-            _login_failures.pop(next(iter(_login_failures)), None)
-        arr = _login_failures.get(key, [])
-        # R4：IP 聚合上限——就算键被淘汰/乱填用户名，同 IP 总失败到顶即拦
-        ip = key.split("|", 1)[0]
-        ip_total = sum(len(v) for k, v in _login_failures.items() if k.split("|", 1)[0] == ip)
+        _login_sweep_locked(now)
+        # L2：惰性修剪只清本键/本 IP 的桶，不遍历全字典
+        arr = [t for t in _login_failures.get(key, []) if now - t < _LOGIN_FAIL_WINDOW]
+        if arr:
+            _login_failures[key] = arr
+        else:
+            _login_failures.pop(key, None)
         per_key, per_ip = _login_limits(db)
-        return len(arr) >= per_key or ip_total >= per_ip
+        if len(arr) >= per_key:
+            return True
+        # L1：授信键（该 IP+账号登录成功过）不受 IP 聚合上限影响——
+        # 防共用出口 IP 被乱填用户名刷满 30 次后，全公司连正确密码都进不来；
+        # 单键 10 次上限仍然生效，不放松对指定账号的爆破防护
+        if key in _login_trusted:
+            return False
+        ip_arr = [(t, k) for t, k in _login_ip_failures.get(ip, []) if now - t < _LOGIN_FAIL_WINDOW]
+        if ip_arr:
+            _login_ip_failures[ip] = ip_arr
+        else:
+            _login_ip_failures.pop(ip, None)
+        return len(ip_arr) >= per_ip
 
 
 def _login_record_failure(key: str) -> None:
+    now = time.time()
     with _login_lock:
-        _login_failures.setdefault(key, []).append(time.time())
+        _login_failures.setdefault(key, []).append(now)
+        ip = key.split("|", 1)[0]
+        _login_ip_failures.setdefault(ip, []).append((now, key))
+
+
+def _login_clear_key_locked(key: str) -> None:
+    """清单个键的失败记录（成功登录/手动解除共用）——调用方持锁"""
+    _login_failures.pop(key, None)
+    ip = key.split("|", 1)[0]
+    lst = _login_ip_failures.get(ip)
+    if lst:
+        kept = [(t, k) for t, k in lst if k != key]
+        if kept:
+            _login_ip_failures[ip] = kept
+        else:
+            _login_ip_failures.pop(ip, None)
+
+
+class RateLimitClearIn(BaseModel):
+    ip: str = ""
+    username: str = ""
+    scope: str = "all"  # login | activate | all
+
+
+@app.post("/api/auth/rate-limit/clear")
+def clear_rate_limit(req: RateLimitClearIn, user: User = Depends(require_roles("admin"))):
+    """L1：手动解除限流（共用出口 IP 被误锁的恢复通道；也可清激活限流）。
+    不带 ip/username = 全清；带筛选则只清匹配项。仅 admin 可用。"""
+    from .client_api import clear_activate_failures
+
+    cleared = {"login": 0, "activate": 0}
+    if req.scope in ("login", "all"):
+        with _login_lock:
+            for k in list(_login_failures):
+                ip, _, uname = k.partition("|")
+                if req.ip and ip != req.ip:
+                    continue
+                if req.username and uname != req.username:
+                    continue
+                cleared["login"] += len(_login_failures.pop(k, ()))
+            for ip in list(_login_ip_failures):
+                if req.ip and ip != req.ip:
+                    continue
+                if req.username:
+                    kept = [(t, k) for t, k in _login_ip_failures[ip]
+                            if k.partition("|")[2] != req.username]
+                    if kept:
+                        _login_ip_failures[ip] = kept
+                    else:
+                        _login_ip_failures.pop(ip, None)
+                else:
+                    _login_ip_failures.pop(ip, None)
+    if req.scope in ("activate", "all"):
+        cleared["activate"] = clear_activate_failures(req.ip or None)
+    return {"ok": True, "cleared": cleared}
 
 
 @app.post("/api/auth/login", response_model=TokenResponse)
@@ -193,7 +283,8 @@ def login(req: LoginRequest, request: Request, db: Session = Depends(get_db)):
         _login_record_failure(key)
         raise HTTPException(status_code=401, detail="账号或密码错误")
     with _login_lock:
-        _login_failures.pop(key, None)
+        _login_clear_key_locked(key)
+        _login_trusted[key] = time.time()  # L1：授信该 IP+账号，后续免 IP 聚合误伤
     return TokenResponse(token=create_token(user.username, user.role), username=user.username, name=user.name, role=user.role)
 
 

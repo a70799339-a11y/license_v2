@@ -242,3 +242,5 @@ MSYS→Windows exe 的参数转义会吃掉/提前展开 `$?`，凡是「命令�
 
 - [2026-11-25] SQLAlchemy 2.x 的 str(URL) 会把密码渲染成 ***：测试/脚本里拼接数据库 URL 后重解析会拿假密码连库（报 password authentication failed）。必须用 render_as_string(hide_password=False) 取全量 URL。—— t43_seed.py F1 白盒踩坑
 - [2026-11-25] 安全修复的改动边界必须区分「被保护的」与「被误伤的」：SEED_DEMO_DATA 门禁把必需基础数据（套餐/设置）也关掉导致全新生产环境续期全瘫（F1）；登录 IP 聚合上限把共用出口 IP 的正常员工一起锁死（L1）。修复落地前走三受害面自检：全新环境、共用 IP 正常用户、防御自身性能（L2 每请求全字典遍历）。
+
+- [2026-11-25] 接口加新副作用（审计/落库）时必须核对函数签名带齐依赖（db: Session = Depends(get_db)）——漏掉只在运行时 NameError，py_compile 抓不到（clear_rate_limit 加 write_log 踩坑）。且 FastAPI 接口 500 不代表无副作用：内存清理在审计写入之前完成，失败请求也已生效，排查时不能假设失败=回滚。

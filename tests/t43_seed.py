@@ -112,6 +112,21 @@ def main() -> int:
         finally:
             db.close()
 
+        # ---- 4. 运营改价后重启不被重置（F1 补数只补缺失不覆盖）----
+        db = SessionLocal()
+        try:
+            p1 = db.query(Plan).filter(Plan.id == "p1").first()
+            p1.price = 12345
+            db.commit()
+        finally:
+            db.close()
+        db = SessionLocal()
+        try:
+            seed(db)
+            price_kept = db.query(Plan).filter(Plan.id == "p1").first().price
+        finally:
+            db.close()
+
         need_settings = {"auto_renew", "renew_days_before", "heartbeat_timeout_hours"}
         checks = {
             "plans_fresh": s1["plans"] == 3 and all(p > 0 for p in s1["plan_prices"]),
@@ -120,11 +135,13 @@ def main() -> int:
             "users_fresh": s1["users"] >= 3,
             "idempotent": s2["plans"] == 3 and s2["settings"] == s1["settings"],
             "backfill": s3["plans"] == 3 and need_settings.issubset(set(s3["settings"])),
+            "price_keep": float(price_kept) == 12345.0,
         }
         ok = all(checks.values())
         print("RESULT_JSON:" + json.dumps({
             "ok": ok, "checks": checks,
             "s1": s1, "s2_plans": s2["plans"], "s3_plans": s3["plans"],
+            "price_kept": float(price_kept),
         }, ensure_ascii=False))
         return 0 if ok else 1
     finally:

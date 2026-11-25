@@ -191,7 +191,7 @@ class PlanOut(BaseModel):
     color: str
 
     @classmethod
-    def from_orm_model(cls, p):
+    def from_orm_model(cls, p, hotels=None):
         import json
         try:
             feats = json.loads(p.features) if p.features else []
@@ -199,5 +199,7 @@ class PlanOut(BaseModel):
             feats = []
         return cls(
             id=p.id, name=p.name, price=p.price, yearlyPrice=p.yearly_price,
-            maxDevices=p.max_devices, features=feats, hotels=p.hotels, color=p.color,
+            maxDevices=p.max_devices, features=feats,
+            # G1：hotels 传入实时统计值；不传时回落快照字段（仅兼容旧调用）
+            hotels=hotels if hotels is not None else p.hotels, color=p.color,
         )

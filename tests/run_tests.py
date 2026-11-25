@@ -2332,8 +2332,8 @@ def main():
                   st == 200 and len(plans or []) >= 3 and len(priced) >= 3,
                   f"{len(plans or [])} 个套餐 / {len(priced)} 个有价")
 
-            # 清零限流残留（既验手动解除入口，也保证本段计数从零开始）
-            st, cl0 = req("POST", "/api/auth/rate-limit/clear", {}, token=token)
+            # 清零限流残留（既验手动解除入口，也保证本段计数从零开始；G2 后全清需 confirm）
+            st, cl0 = req("POST", "/api/auth/rate-limit/clear", {"confirm": True}, token=token)
             check("T43.4a", "复审", "L1 手动解除限流接口可用（admin）",
                   st == 200 and bool((cl0 or {}).get("ok")), f"HTTP {st}")
 
@@ -2351,14 +2351,14 @@ def main():
                   f"spray={spray} admin={st_trust} untrusted={st_un}")
 
             # T43.4 L1：手动解除后未授信账号恢复（不再 429）
-            st_c, _ = req("POST", "/api/auth/rate-limit/clear", {}, token=token)
+            st_c, _ = req("POST", "/api/auth/rate-limit/clear", {"confirm": True}, token=token)
             st_un2, _ = req("POST", "/api/auth/login", {"username": f"l1new{ts}", "password": "bad"})
             check("T43.4", "复审", "L1 手动解除限流后登录恢复 401（不再 429）",
                   st_c == 200 and st_un2 == 401, f"clear={st_c} login={st_un2}")
             req("POST", "/api/settings", {"key": "login_fail_ip_limit", "value": "999"}, token=token)
 
             # T43.5 R4×L2：成功只清本凭据失败记录（惰性清理下计数语义不变）
-            st, _ = req("POST", "/api/auth/rate-limit/clear", {"scope": "activate"}, token=token)
+            st, _ = req("POST", "/api/auth/rate-limit/clear", {"scope": "activate", "confirm": True}, token=token)
             req("POST", "/api/settings", {"key": "activate_fail_limit", "value": "3"}, token=token)
             fpA = f"a43{ts}"
             fakes = []
@@ -2386,7 +2386,7 @@ def main():
             check("T43.5", "复审", "R4 成功只清本凭据计数（他凭据失败保留→仍 429）",
                   fakes == [404, 404] and st_ok == 200 and s15 == 404 and s16 == 429,
                   f"fakes={fakes} ok={st_ok} after={s15},{s16}")
-            st_c2, _ = req("POST", "/api/auth/rate-limit/clear", {"scope": "activate"}, token=token)
+            st_c2, _ = req("POST", "/api/auth/rate-limit/clear", {"scope": "activate", "confirm": True}, token=token)
             s17, _ = req("POST", "/api/client/activate",
                          {"licenseCode": f"FAKEA{ts}", "deviceName": f"三轮机{ts}"},
                          headers={"X-Device-Fingerprint": fpA})
@@ -2406,7 +2406,110 @@ def main():
                     req("POST", "/api/settings", {"key": "activate_fail_limit", "value": "999"}, token=token)
                     req("POST", "/api/settings", {"key": "login_fail_limit", "value": "999"}, token=token)
                     req("POST", "/api/settings", {"key": "login_fail_ip_limit", "value": "999"}, token=token)
-                    req("POST", "/api/auth/rate-limit/clear", {}, token=token)
+                    req("POST", "/api/auth/rate-limit/clear", {"confirm": True}, token=token)
+            except Exception:
+                pass
+
+        # ---------------- 44. 四轮复审回归（G1~G4 修复固化，2026-11-25） ----------------
+        try:
+            print("【44. 四轮复审回归】")
+            import subprocess as _sp4
+
+            ts = str(int(time.time() * 1000))[-8:]
+            py = "/opt/license/.venv/bin/python3"
+            if not os.path.exists(py):
+                py = "python3"
+
+            # T44.1 G1：套餐门店数 = 实时 Hotel.plan 统计（不再用写入时快照）
+            st, plans = req("GET", "/api/plans", token=token)
+            st, hs = req("GET", "/api/hotels", token=token)
+            live = {}
+            for h in (hs or []):
+                live[h.get("plan", "")] = live.get(h.get("plan", ""), 0) + 1
+            mismatch = [p["name"] for p in (plans or []) if p.get("hotels") != live.get(p.get("name"), 0)]
+            check("T44.1", "复审", "G1 套餐门店数与实时统计一致",
+                  st == 200 and bool(plans) and not mismatch, f"mismatch={mismatch}")
+
+            # T44.2 G2：解除限流审计 + 权限/确认门
+            st_v, pv = req("POST", "/api/auth/login", {"username": "viewer", "password": "viewer123"})
+            vtok = (pv or {}).get("token", "")
+            st_403, _ = req("POST", "/api/auth/rate-limit/clear", {"confirm": True}, token=vtok)
+            st_400, _ = req("POST", "/api/auth/rate-limit/clear", {}, token=token)
+            st_ok, _ = req("POST", "/api/auth/rate-limit/clear", {"confirm": True}, token=token)
+            st_lg, logs = req("GET", "/api/logs", token=token)
+            has_audit = any(l.get("action") == "解除限流" for l in (logs or []))
+            check("T44.2", "复审", "G2 解除限流写审计 + viewer 403 + 全清需 confirm",
+                  st_403 == 403 and st_400 == 400 and st_ok == 200 and has_audit,
+                  f"403={st_403} 400={st_400} 200={st_ok} audit={has_audit}")
+
+            # T44.3 L1：授信账号单键上限仍生效（连错 3 次后 429）
+            req("POST", "/api/settings", {"key": "login_fail_limit", "value": "3"}, token=token)
+            st_ad, _ = req("POST", "/api/auth/login", {"username": "admin", "password": "admin123"})  # 确保授信
+            st_wrong = []
+            for _ in range(4):
+                s18, _ = req("POST", "/api/auth/login", {"username": "admin", "password": f"wrong{ts}"})
+                st_wrong.append(s18)
+            check("T44.3", "复审", "L1 授信账号单键爆破上限仍拦（连错→429）",
+                  st_wrong == [401, 401, 401, 429], f"sts={st_wrong}")
+            req("POST", "/api/auth/rate-limit/clear", {"username": "admin"}, token=token)
+            st_ad2, _ = req("POST", "/api/auth/login", {"username": "admin", "password": "admin123"})
+            check("T44.3b", "复审", "L1 按用户名解除后 admin 恢复登录",
+                  st_ad2 == 200, f"HTTP {st_ad2}")
+
+            # T44.4 G2：按用户名只清单个键（他键保留）
+            u1, u2 = f"t44u1{ts}", f"t44u2{ts}"
+            req("POST", "/api/settings", {"key": "login_fail_limit", "value": "2"}, token=token)
+            for u in (u1, u2):
+                req("POST", "/api/auth/login", {"username": u, "password": "bad"})
+                req("POST", "/api/auth/login", {"username": u, "password": "bad"})
+            st_cl, _ = req("POST", "/api/auth/rate-limit/clear", {"username": u1}, token=token)
+            s_u1, _ = req("POST", "/api/auth/login", {"username": u1, "password": "bad"})
+            s_u2, _ = req("POST", "/api/auth/login", {"username": u2, "password": "bad"})
+            check("T44.4", "复审", "G2 按用户名解除：目标恢复 401、他键仍 429",
+                  st_cl == 200 and s_u1 == 401 and s_u2 == 429,
+                  f"clear={st_cl} u1={s_u1} u2={s_u2}")
+            req("POST", "/api/settings", {"key": "login_fail_limit", "value": "999"}, token=token)
+            req("POST", "/api/auth/rate-limit/clear", {"confirm": True}, token=token)
+
+            # T44.5 G4：满额拒新键、不淘汰活跃计数（白盒，临时压低 MAX_KEYS）
+            r4 = _sp4.run(
+                [py, os.path.join(os.path.dirname(os.path.abspath(__file__)), "t44_ratelimit.py")],
+                capture_output=True, text=True, timeout=60,
+                cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            rj4 = {}
+            for ln in (r4.stdout or "").splitlines():
+                if ln.startswith("RESULT_JSON:"):
+                    try:
+                        rj4 = json.loads(ln[len("RESULT_JSON:"):])
+                    except Exception:
+                        pass
+            check("T44.5", "复审", "G4 限流满额拒新键且不淘汰活跃计数（白盒）",
+                  bool(rj4.get("ok")),
+                  json.dumps(rj4.get("checks", {}), ensure_ascii=False) if rj4 else (r4.stderr or "")[-160:])
+
+            # T44.6 F1（v3 建议补测）：重启不重置运营改价——t43_seed 场景 4
+            r3b = _sp4.run(
+                [py, os.path.join(os.path.dirname(os.path.abspath(__file__)), "t43_seed.py")],
+                capture_output=True, text=True, timeout=120,
+                cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            rj6 = {}
+            for ln in (r3b.stdout or "").splitlines():
+                if ln.startswith("RESULT_JSON:"):
+                    try:
+                        rj6 = json.loads(ln[len("RESULT_JSON:"):])
+                    except Exception:
+                        pass
+            check("T44.6", "复审", "F1 套餐改价后重启不被种子重置",
+                  bool((rj6.get("checks") or {}).get("price_keep")),
+                  f"price_kept={rj6.get('price_kept')}")
+        except Exception as _e:
+            check("S44", "异常隔离", "第 44 段未捕获异常（后续段继续）", False,
+                     f"{type(_e).__name__}: {_e}")
+        finally:
+            try:
+                if token:
+                    req("POST", "/api/settings", {"key": "login_fail_limit", "value": "999"}, token=token)
+                    req("POST", "/api/auth/rate-limit/clear", {"confirm": True}, token=token)
             except Exception:
                 pass
     except Exception as _e:

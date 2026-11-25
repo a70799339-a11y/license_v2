@@ -137,6 +137,7 @@ _LOGIN_FAIL_WINDOW = 900
 _LOGIN_FAIL_LIMIT = 10
 _LOGIN_FAIL_IP_LIMIT = 30  # R4：单 IP 总失败上限（防随机用户名刷键挤掉目标账号计数）
 _LOGIN_FAIL_MAX_KEYS = 10000  # N12：键数上限，防乱填用户名撑爆内存
+_LOGIN_TRUSTED_TTL = 30 * 86400  # G3：授信标记 30 天有效，过期视为不可信
 _SWEEP_INTERVAL = 60  # L2：全量过期清理节流到每 60s 一次，请求路径只做惰性修剪
 _login_failures: dict = {}       # key "ip|username" -> [失败时间戳]
 _login_ip_failures: dict = {}    # ip -> [(失败时间戳, key)]（L2：IP 聚合计数独立索引，免全字典汇总）
@@ -180,8 +181,7 @@ def _login_sweep_locked(now: float) -> None:
             _login_ip_failures[ip] = kept
         else:
             _login_ip_failures.pop(ip, None)
-    while len(_login_failures) > _LOGIN_FAIL_MAX_KEYS:
-        _login_failures.pop(next(iter(_login_failures)), None)
+    # G4：不再 FIFO 淘汰窗口内活跃计数——满额由 _login_too_often 拒新键兜底
     while len(_login_trusted) > _LOGIN_FAIL_MAX_KEYS:
         _login_trusted.pop(next(iter(_login_trusted)), None)
 
@@ -200,11 +200,18 @@ def _login_too_often(key: str, db) -> bool:
         per_key, per_ip = _login_limits(db)
         if len(arr) >= per_key:
             return True
+        # G4：计数键满额时拒新键（fail-closed），不再 FIFO 淘汰窗口内活跃计数——
+        # 防攻击者刷大量随机键把别人的计数挤掉绕过限流
+        if key not in _login_failures and len(_login_failures) >= _LOGIN_FAIL_MAX_KEYS:
+            return True
         # L1：授信键（该 IP+账号登录成功过）不受 IP 聚合上限影响——
         # 防共用出口 IP 被乱填用户名刷满 30 次后，全公司连正确密码都进不来；
         # 单键 10 次上限仍然生效，不放松对指定账号的爆破防护
+        # G3：授信 30 天过期，防长期运行后豁免面无限变大
         if key in _login_trusted:
-            return False
+            if now - _login_trusted[key] < _LOGIN_TRUSTED_TTL:
+                return False
+            _login_trusted.pop(key, None)
         ip_arr = [(t, k) for t, k in _login_ip_failures.get(ip, []) if now - t < _LOGIN_FAIL_WINDOW]
         if ip_arr:
             _login_ip_failures[ip] = ip_arr
@@ -216,6 +223,9 @@ def _login_too_often(key: str, db) -> bool:
 def _login_record_failure(key: str) -> None:
     now = time.time()
     with _login_lock:
+        # G4：满额不收新键（与 too_often 拒新对应），不淘汰活跃计数
+        if key not in _login_failures and len(_login_failures) >= _LOGIN_FAIL_MAX_KEYS:
+            return
         _login_failures.setdefault(key, []).append(now)
         ip = key.split("|", 1)[0]
         _login_ip_failures.setdefault(ip, []).append((now, key))
@@ -238,14 +248,18 @@ class RateLimitClearIn(BaseModel):
     ip: str = ""
     username: str = ""
     scope: str = "all"  # login | activate | all
+    confirm: bool = False  # G2：无筛选全清必须显式确认，防误触/被盗用一把梭
 
 
 @app.post("/api/auth/rate-limit/clear")
-def clear_rate_limit(req: RateLimitClearIn, user: User = Depends(require_roles("admin"))):
+def clear_rate_limit(req: RateLimitClearIn, db: Session = Depends(get_db), user: User = Depends(require_roles("admin"))):
     """L1：手动解除限流（共用出口 IP 被误锁的恢复通道；也可清激活限流）。
-    不带 ip/username = 全清；带筛选则只清匹配项。仅 admin 可用。"""
+    不带 ip/username = 全清（需 confirm=true）；带筛选则只清匹配项。仅 admin 可用。
+    G2：每次调用写审计日志（操作人/范围/清除条数），后台可追溯。"""
     from .client_api import clear_activate_failures
 
+    if not req.ip and not req.username and not req.confirm:
+        raise HTTPException(status_code=400, detail="全部清空需显式传入 confirm=true 确认")
     cleared = {"login": 0, "activate": 0}
     if req.scope in ("login", "all"):
         with _login_lock:
@@ -270,6 +284,12 @@ def clear_rate_limit(req: RateLimitClearIn, user: User = Depends(require_roles("
                     _login_ip_failures.pop(ip, None)
     if req.scope in ("activate", "all"):
         cleared["activate"] = clear_activate_failures(req.ip or None)
+    write_log(
+        db, user, "解除限流",
+        f"{req.scope} ip={req.ip or '全部'} user={req.username or '全部'}",
+        f"清除失败记录 login={cleared['login']} 条 activate={cleared['activate']} 条",
+    )
+    db.commit()
     return {"ok": True, "cleared": cleared}
 
 
@@ -627,7 +647,14 @@ def alert_groups(db: Session = Depends(get_db), _: User = Depends(get_current_us
 # ---------- 套餐 ----------
 @app.get("/api/plans", response_model=list[PlanOut])
 def list_plans(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
-    return [PlanOut.from_orm_model(p) for p in db.query(Plan).order_by(Plan.id).all()]
+    # G1：门店数按 Hotel.plan 实时统计（Plan.hotels 是写入时快照，已废弃不作准）
+    from sqlalchemy import func
+
+    live = dict(db.query(Hotel.plan, func.count()).group_by(Hotel.plan).all())
+    return [
+        PlanOut.from_orm_model(p, hotels=live.get(p.name, 0))
+        for p in db.query(Plan).order_by(Plan.id).all()
+    ]
 
 
 # ---------- 设置 ----------

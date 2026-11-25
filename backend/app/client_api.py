@@ -239,8 +239,7 @@ def _activate_sweep_locked(now: float) -> None:
             _activate_failures[k] = kept
         else:
             _activate_failures.pop(k, None)
-    while len(_activate_failures) > _ACTIVATE_FAIL_MAX_KEYS:
-        _activate_failures.pop(next(iter(_activate_failures)), None)
+    # G4：不再 FIFO 淘汰窗口内活跃计数——满额由 _activate_too_often 拒新键兜底
 
 
 def _activate_too_often(key: str, limit: int) -> bool:
@@ -253,6 +252,9 @@ def _activate_too_often(key: str, limit: int) -> bool:
             _activate_failures[key] = kept
         else:
             _activate_failures.pop(key, None)
+        # G4：满额拒新键（fail-closed），不淘汰活跃计数
+        if key not in _activate_failures and len(_activate_failures) >= _ACTIVATE_FAIL_MAX_KEYS:
+            return True
         return len(kept) >= limit
 
 
@@ -270,6 +272,9 @@ def clear_activate_failures(ip: Optional[str] = None) -> int:
 
 def _activate_record_failure(key: str, cred: str = "") -> None:
     with _activate_lock:
+        # G4：满额不收新键（与 too_often 拒新对应），不淘汰活跃计数
+        if key not in _activate_failures and len(_activate_failures) >= _ACTIVATE_FAIL_MAX_KEYS:
+            return
         _activate_failures.setdefault(key, []).append((time.time(), cred or ""))
 
 

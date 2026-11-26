@@ -13,7 +13,7 @@ use license_core::{
 use serde_json::{json, Value};
 use tauri::State;
 
-const CLIENT_VERSION: &str = "1.2.5";
+const CLIENT_VERSION: &str = "1.2.6";
 
 /// S1：出厂固化 Ed25519 验签公钥——信任锚，禁止使用服务端响应携带的公钥验签
 /// （响应公钥仅供比对告警；密钥轮换需随客户端版本更新本常量）
@@ -181,6 +181,19 @@ fn validate_server_url(url: &str) -> Result<(String, bool), String> {
         return Err("服务端地址格式无效（主机名缺失或含可疑凭据）".into());
     }
     Ok((u, is_https))
+}
+
+/// M2 传输门禁（激活/换服共用，禁止复制粘贴各自校验）：
+/// ① http(s) 完整格式校验（拒 user@host 伪装）② 非 HTTPS 明文必须显式 confirm
+fn ensure_transport_allowed(
+    server_url: &str,
+    confirm: Option<bool>,
+) -> Result<(String, bool), String> {
+    let (url, is_https) = validate_server_url(server_url)?;
+    if !is_https && !confirm.unwrap_or(false) {
+        return Err("NEEDS_CONFIRM: 非 HTTPS 明文传输存在凭证窃听风险，需二次确认".into());
+    }
+    Ok((url, is_https))
 }
 
 fn http_post(url: &str, fingerprint: &str, token: &str, body: &Value) -> Result<Value, String> {
@@ -494,10 +507,14 @@ fn activate(
     server_url: String,
     license_code: String,
     device_name: String,
+    confirm: Option<bool>,
 ) -> Result<Value, String> {
+    // M2：激活是服务端地址的主入口，与 set_server 同门禁（格式校验 + 非 HTTPS 二次确认）——
+    // 修复面完整性：换服有门禁而激活没有 = 诱导填激活表单即绕过
+    let (url, _is_https) = ensure_transport_allowed(&server_url, confirm)?;
     let fp = state.fingerprint.clone();
     let mut st = state.inner.lock().unwrap();
-    activate_core(&fp, &server_url, &license_code, &device_name, &mut st)
+    activate_core(&fp, &url, &license_code, &device_name, &mut st)
 }
 
 #[tauri::command]
@@ -763,10 +780,7 @@ fn set_server(
 ) -> Result<Value, String> {
     // M2 三层收敛：① http(s) 格式校验 ② 非 HTTPS 须显式二次确认
     // ③ 换服清凭证（token/license_code 不得流向新地址，须重新激活）
-    let (url, is_https) = validate_server_url(&server_url)?;
-    if !is_https && !confirm.unwrap_or(false) {
-        return Err("NEEDS_CONFIRM: 非 HTTPS 明文传输存在凭证窃听风险，需二次确认".into());
-    }
+    let (url, _is_https) = ensure_transport_allowed(&server_url, confirm)?;
     let fp = state.fingerprint.clone();
     let mut s = state.inner.lock().unwrap();
     let mut cleared = false;
@@ -1118,5 +1132,23 @@ mod tests {
         assert!(validate_server_url("https://a b.com").is_err()); // 空白
         assert!(validate_server_url("").is_err());
         assert!(validate_server_url("http://").is_err()); // 主机缺失
+    }
+
+    // M2：激活/换服共用传输门禁（激活路径曾绕过校验——修复面完整性教训）
+    #[test]
+    fn ensure_transport_allowed_gate() {
+        // https 无需 confirm
+        assert!(ensure_transport_allowed("https://lic.example.com", None).is_ok());
+        // http 无 confirm → NEEDS_CONFIRM
+        let e = ensure_transport_allowed("http://10.0.0.5:8000", None).unwrap_err();
+        assert!(e.contains("NEEDS_CONFIRM"));
+        assert!(ensure_transport_allowed("http://10.0.0.5:8000", Some(false)).is_err());
+        // http 有 confirm → 放行
+        assert_eq!(
+            ensure_transport_allowed("http://10.0.0.5:8000", Some(true)).unwrap(),
+            ("http://10.0.0.5:8000".to_string(), false)
+        );
+        // 伪装地址即便 confirm 也拒（格式门禁在前）
+        assert!(ensure_transport_allowed("https://user@evil.com", Some(true)).is_err());
     }
 }

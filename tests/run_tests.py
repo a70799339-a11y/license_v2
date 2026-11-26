@@ -2531,8 +2531,10 @@ def main():
             resp = conn.getresponse()
             body = resp.read().decode(errors="ignore")
             conn.close()
+            # 通过口径：哨兵不泄露即安全。200=应用层回落 index（直连 8000）；
+            # 4xx=边缘/应用层拒（nginx 口径下 ..%2f 被边缘 400 挡，属预期）
             check("T45.1", "复审", "H1 路径遍历被拒（哨兵文件不泄露，回落 index）",
-                  resp.status == 200 and sentinel not in body,
+                  sentinel not in body and resp.status in (200, 400, 403, 404),
                   f"HTTP {resp.status} leaked={sentinel in body}")
             os.remove(f"/tmp/h1_sentinel_{ts}.txt")
 

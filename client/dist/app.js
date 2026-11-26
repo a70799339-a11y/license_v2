@@ -148,6 +148,13 @@ $("btn-activate").addEventListener("click", async () => {
     showMsg($("activate-msg"), "请填写服务端地址与授权码", "err");
     return;
   }
+  // M2：激活是服务端地址主入口——非 HTTPS 明文传输须二次确认（Rust 侧同门禁强制）
+  const actIsHttps = server.toLowerCase().startsWith("https://");
+  let actConfirm = false;
+  if (!actIsHttps) {
+    if (!window.confirm("⚠️ 非 HTTPS 明文传输，激活凭证与心跳数据可能被窃听。\n确定继续使用 HTTP？")) return;
+    actConfirm = true;
+  }
   $("btn-activate").disabled = true;
   showMsg($("activate-msg"), "正在激活并验签…", "warn");
   try {
@@ -155,6 +162,7 @@ $("btn-activate").addEventListener("click", async () => {
       serverUrl: server,
       licenseCode: code,
       deviceName: name || "客户端",
+      confirm: actConfirm,
     });
     // P0-1 同名迁移提示（重装系统场景）
     if (res.migration_hint && res.migrate_target) {

@@ -91,3 +91,10 @@
 - T3 验收中追加修复：**激活路径绕过 M2 门禁**（activate 直存 server_url 不校验/不 confirm）——六轮 M2 修复面漏掉的写入口，与「加新不审旧/修点不修面」同型；已抽 ensure_transport_allowed 公共门禁 + UI 警示 + Rust 单测固化
 - M2 行收口：打包 v1.2.6 已完成（原挂账「打包独立节奏」关闭）
 - P1 T4~T7 / P2 T8~T10：待启动
+
+## P1 进度（第 1 期）
+
+| 任务 | 内容 | 状态 | 验收 |
+|---|---|---|---|
+| T4（P1-1） | L1 编号 count()+1 竞态：设置表计数控位+SELECT FOR UPDATE（alloc_code_seq，populate_existing），三处创建接口（Hotel/License/Group）改造；ensure_code_seqs 启动幂等初始化（只升不降）；ensure_groups 同型 len() 隐患一并修 | ✅ 2026-11-26 | T46 三条：20 线程并发建授权/集团无 500、编号唯一且连续、单线程续接；基线 234/234 |
+| T5（P1-2） | hotel_id 强关联迁移 | 进行中 | — |

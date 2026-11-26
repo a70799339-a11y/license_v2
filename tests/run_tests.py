@@ -2591,6 +2591,102 @@ def main():
         except Exception as _e:
             check("S45", "异常隔离", "第 45 段未捕获异常（后续段继续）", False,
                      f"{type(_e).__name__}: {_e}")
+
+        # ---------------- 46. 编号分配竞态（T4 计数控位，2026-11-26） ----------------
+        try:
+            print("【46. 编号分配竞态】")
+            import threading as _th
+
+            ts = str(int(time.time() * 1000))[-8:]
+            st, h = req("POST", "/api/hotels",
+                        {"name": f"竞态编号店{ts}", "code": f"HT-XC{ts[-4:]}", "plan": "专业版"},
+                        token=token)
+            h_id = (h or {}).get("id", "")
+
+            def _nums(ids):
+                out = []
+                for _i in ids:
+                    t = "".join(ch for ch in _i if ch.isdigit())
+                    if t:
+                        out.append(int(t))
+                return sorted(out)
+
+            res_lock = _th.Lock()
+
+            # T46.1：20 线程并发建授权——无 500、id 唯一、序号连续
+            res_l = {}
+            bar_l = _th.Barrier(20)
+
+            def _mk_lic(i):
+                bar_l.wait()
+                s_i, p_i = req("POST", "/api/licenses",
+                               {"hotelId": h_id, "plan": "专业版", "type": "新签", "months": 1},
+                               token=token)
+                with res_lock:
+                    res_l[i] = (s_i, (p_i or {}).get("id", ""))
+
+            ths = [_th.Thread(target=_mk_lic, args=(i,)) for i in range(20)]
+            for t in ths:
+                t.start()
+            for t in ths:
+                t.join(timeout=90)
+            sts_l = [v[0] for v in res_l.values()]
+            ids_l = [v[1] for v in res_l.values() if v[1]]
+            nums_l = _nums(ids_l)
+            contig_l = len(nums_l) == 20 and nums_l == list(range(nums_l[0], nums_l[0] + 20))
+            check("T46.1", "竞态", "20 线程并发建授权：无 500、编号唯一且连续",
+                  len(res_l) == 20 and all(s == 200 for s in sts_l)
+                  and len(set(ids_l)) == 20 and contig_l,
+                  f"done={len(res_l)} ok={sum(1 for s in sts_l if s == 200)} "
+                  f"uniq={len(set(ids_l))} contig={contig_l} sts={sorted(set(sts_l))}")
+
+            # T46.2：20 线程并发建集团——无 500、id/集团码唯一且连续
+            res_g = {}
+            bar_g = _th.Barrier(20)
+
+            def _mk_grp(i):
+                bar_g.wait()
+                s_i, p_i = req("POST", "/api/groups",
+                               {"name": f"竞态集团{ts}-{i}", "plan": "专业版", "expireAt": "2027-12-31"},
+                               token=token)
+                with res_lock:
+                    res_g[i] = (s_i, (p_i or {}).get("id", ""), (p_i or {}).get("code", ""))
+
+            ths = [_th.Thread(target=_mk_grp, args=(i,)) for i in range(20)]
+            for t in ths:
+                t.start()
+            for t in ths:
+                t.join(timeout=90)
+            sts_g = [v[0] for v in res_g.values()]
+            ids_g = [v[1] for v in res_g.values() if v[1]]
+            codes_g = [v[2] for v in res_g.values() if v[2]]
+            nums_g = _nums(ids_g)
+            contig_g = len(nums_g) == 20 and nums_g == list(range(nums_g[0], nums_g[0] + 20))
+            check("T46.2", "竞态", "20 线程并发建集团：无 500、编号与集团码唯一且连续",
+                  len(res_g) == 20 and all(s == 200 for s in sts_g)
+                  and len(set(ids_g)) == 20 and len(set(codes_g)) == 20 and contig_g,
+                  f"done={len(res_g)} ok={sum(1 for s in sts_g if s == 200)} "
+                  f"uniq={len(set(ids_g))}/{len(set(codes_g))} contig={contig_g} sts={sorted(set(sts_g))}")
+
+            # T46.3：并发后单线程行为不变——续接号段连续
+            s1, p1 = req("POST", "/api/licenses",
+                         {"hotelId": h_id, "plan": "专业版", "type": "新签", "months": 1}, token=token)
+            s2, p2 = req("POST", "/api/licenses",
+                         {"hotelId": h_id, "plan": "专业版", "type": "新签", "months": 1}, token=token)
+            n1 = int("".join(c for c in (p1 or {}).get("id", "") if c.isdigit()) or 0)
+            n2 = int("".join(c for c in (p2 or {}).get("id", "") if c.isdigit()) or 0)
+            expect1 = (nums_l[-1] + 1) if nums_l else 0
+            check("T46.3", "竞态", "并发后单线程续接编号连续（行为不变）",
+                  s1 == 200 and s2 == 200 and n1 == expect1 and n2 == expect1 + 1,
+                  f"n1={n1} n2={n2} expect1={expect1}")
+
+            # 清扫：竞态集团直接删（无集团删除接口）；测试店走清扫关键词「竞态」
+            sql_exec(f"DELETE FROM groups WHERE name LIKE '竞态集团{ts}-%'")
+            if h_id:
+                req("PATCH", f"/api/hotels/{h_id}", {"status": "已停用"}, token=token)
+        except Exception as _e:
+            check("S46", "异常隔离", "第 46 段未捕获异常（后续段继续）", False,
+                     f"{type(_e).__name__}: {_e}")
     except Exception as _e:
         import traceback
         traceback.print_exc()

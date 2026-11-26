@@ -362,17 +362,33 @@ class HotelCreateOut(BaseModel):
     id: str
 
 
+def alloc_code_seq(db: Session, key: str) -> int:
+    """T4：编号计数控位分配——设置表行锁递增（SELECT FOR UPDATE），
+    与业务插入同一事务、同一 commit 原子生效，消除 count()+1 并发同号撞主键。
+    控位行由 seed.ensure_code_seqs 启动时幂等初始化（存量最大编号）。
+    populate_existing 必加：否则 SQLAlchemy 身份映射返回旧值，行锁形同虚设（T38 教训）。"""
+    row = (
+        db.query(Setting)
+        .filter(Setting.key == key)
+        .with_for_update()
+        .populate_existing()
+        .first()
+    )
+    if row is None:
+        # 防御路径：控位缺失（未经 seed）时从 1 起——生产入口都过 seed，正常不走这里
+        row = Setting(key=key, value="0")
+        db.add(row)
+        db.flush()
+    n = int(row.value or "0") + 1
+    row.value = str(n)
+    return n
+
+
 @app.post("/api/hotels", response_model=HotelCreateOut)
 def create_hotel(req: HotelCreate, db: Session = Depends(get_db), user: User = Depends(require_roles("admin", "operator"))):
     if db.query(Hotel).filter(Hotel.code == req.code).first():
         raise HTTPException(status_code=400, detail="客户编号已存在")
-    max_num = 0
-    for (hid,) in db.query(Hotel.id).all():
-        import re
-        m = re.search(r"(\d+)$", hid or "")
-        if m:
-            max_num = max(max_num, int(m.group(1)))
-    hid = f"h{max_num + 1:03d}"
+    hid = f"h{alloc_code_seq(db, 'seq_hotel'):03d}"
     expire = (datetime.utcnow() + timedelta(days=365)).strftime("%Y-%m-%d")
     db.add(Hotel(
         id=hid, name=req.name, code=req.code, group=req.group, city=req.city,
@@ -461,7 +477,7 @@ def create_license(req: LicenseCreate, db: Session = Depends(get_db), user: User
     h = db.query(Hotel).filter(Hotel.id == req.hotelId).first()
     if h is None:
         raise HTTPException(status_code=404, detail="客户不存在")
-    seq = db.query(License).count() + 1
+    seq = alloc_code_seq(db, "seq_license")  # T4：计数控位替代 count()+1
     issued = datetime.utcnow()
     expire = issued + timedelta(days=30 * req.months)
     lic = License(
@@ -763,9 +779,7 @@ def list_groups(db: Session = Depends(get_db), user: User = Depends(get_current_
 def create_group(req: GroupCreate, db: Session = Depends(get_db), user: User = Depends(require_roles("admin", "operator"))):
     if db.query(Group).filter(Group.name == req.name).first():
         raise HTTPException(status_code=400, detail="集团名称已存在")
-    seq = db.query(Group).count() + 1
-    while db.query(Group).filter(Group.code == f"GP-{seq:04d}").first():
-        seq += 1
+    seq = alloc_code_seq(db, "seq_group")  # T4：计数控位替代 count()+1（控位含 GP 码空间，见 ensure_code_seqs）
     g = Group(
         id=f"g{seq:03d}",
         name=req.name,

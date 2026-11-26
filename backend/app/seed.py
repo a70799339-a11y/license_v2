@@ -2,6 +2,7 @@
 import json
 import os
 import random
+import re
 import secrets
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
@@ -46,7 +47,12 @@ def ensure_users(db: Session) -> None:
 def ensure_groups(db: Session) -> None:
     """幂等构建集团（总/子关系）：按酒店 group 名生成集团并回填 group_id"""
     existing = {g.name: g for g in db.query(Group).all()}
-    seq = len(existing)
+    # T4：按存量最大编号取基数（len() 在有删除时会撞已存在的 g 序号）
+    seq = 0
+    for gid in existing.values():
+        m = re.search(r"(\d+)$", gid.id or "")
+        if m:
+            seq = max(seq, int(m.group(1)))
     for (gname,) in db.query(Hotel.group).distinct().all():
         if not gname:
             continue
@@ -107,12 +113,48 @@ def ensure_settings(db: Session) -> None:
     db.commit()
 
 
+def ensure_code_seqs(db: Session) -> None:
+    """T4：编号计数控位初始化（幂等，只升不降）——
+    缺失则按存量最大编号建位；已存在则抬到 max(现值, 存量最大)，
+    防手工插入的更大序号导致新编号撞主键。分配见 main.alloc_code_seq（行锁递增）。"""
+    def _max_suffix(rows) -> int:
+        mx = 0
+        for (v,) in rows:
+            m = re.search(r"(\d+)$", v or "")
+            if m:
+                mx = max(mx, int(m.group(1)))
+        return mx
+
+    specs = {
+        "seq_hotel": _max_suffix(db.query(Hotel.id).all()),
+        "seq_license": _max_suffix(db.query(License.id).all()),
+        # 集团 id(gNNN) 与展示码 GP-NNNN 同号，取两者最大防历史错位
+        "seq_group": max(
+            _max_suffix(db.query(Group.id).all()),
+            _max_suffix(db.query(Group.code).all()),
+        ),
+    }
+    for key, mx in specs.items():
+        row = db.query(Setting).filter(Setting.key == key).first()
+        if row is None:
+            db.add(Setting(key=key, value=str(mx)))
+        else:
+            try:
+                cur = int(row.value or "0")
+            except ValueError:
+                cur = 0
+            if mx > cur:
+                row.value = str(mx)
+    db.commit()
+
+
 def seed(db: Session) -> None:
     if db.query(User).first() is not None:
         ensure_users(db)
         ensure_groups(db)
         ensure_plans(db)  # F1：已部署环境重启后补上缺失的基础数据
         ensure_settings(db)
+        ensure_code_seqs(db)  # T4：计数控位幂等补齐/抬升
         return  # 已初始化
 
     ensure_users(db)
@@ -124,6 +166,7 @@ def seed(db: Session) -> None:
     # R2：演示数据只在显式开启时生成（SEED_DEMO_DATA=1）——
     # 生产默认关闭，防演示门店的顺序授权码/可预测指纹进生产
     if os.environ.get("SEED_DEMO_DATA", "").strip().lower() not in ("1", "true", "yes"):
+        ensure_code_seqs(db)
         return
 
     rnd = random.Random(42)
@@ -218,3 +261,4 @@ def seed(db: Session) -> None:
 
     db.commit()
     ensure_groups(db)  # 构建集团（总/子）关系
+    ensure_code_seqs(db)  # T4：演示数据建完后初始化计数控位（在其后，防与 h001..h040 等种子编号相撞）

@@ -55,10 +55,18 @@ def req_raw(method: str, path: str, raw: bytes, token=None):
 
 
 def sql_exec(sql: str) -> bool:
-    """测试造数辅助：直连本地库改时间戳/配额等无 API 的字段（WSL 内 postgres 免密；失败返回 False）"""
+    """测试造数辅助：直连本地库改时间戳/配额等无 API 的字段（失败返回 False）。
+    CI/隔离库：设 TEST_DATABASE_URL 时只打该库（不回落本机默认库，防误伤 dev 数据）；
+    未设时保持原行为（WSL 内 postgres 免密 / 兜底 root psql）。"""
+    import os
     import subprocess
-    for cmd in (["sudo", "-u", "postgres", "psql", "-d", "license", "-c", sql],
-                ["psql", "-U", "postgres", "-d", "license", "-c", sql]):
+    dsn = os.environ.get("TEST_DATABASE_URL", "")
+    if dsn:
+        cmds = [["psql", dsn, "-c", sql]]
+    else:
+        cmds = [["sudo", "-u", "postgres", "psql", "-d", "license", "-c", sql],
+                ["psql", "-U", "postgres", "-d", "license", "-c", sql]]
+    for cmd in cmds:
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
             if r.returncode == 0:
@@ -296,7 +304,10 @@ def main():
         # ---------------- 10. 客户端同步（激活/心跳/版本更新） ----------------
         try:
             print("【10. 客户端同步】")
-            FP = "ab" * 32  # 模拟设备指纹（64 位 hex）
+            # 每轮唯一指纹（64 位 hex）：固定指纹在 dev 库会被历史轮次绑定占用，
+            # 一设备一店 409 让激活静默失败并连累 T13/T17/T29 的客户端上下文（T7 教训）
+            import hashlib
+            FP = hashlib.md5(f"t10-{ts}".encode()).hexdigest() * 2
 
             st, p = req("GET", "/api/client/version")
             check("T10.1", "客户端同步", "版本接口无需鉴权可获取", st == 200 and bool((p or {}).get("latest")),
@@ -306,9 +317,15 @@ def main():
             check("T10.2", "客户端同步", "Ed25519 公钥可获取", st == 200 and (p or {}).get("algorithm") == "ed25519"
                   and len((p or {}).get("public_key", "")) == 64)
 
-            # S2 后新指纹只能用授权码激活（编号仅限原设备重装）——取一条生效授权码
-            _lics = (req("GET", "/api/licenses", token=token)[1] or [])
-            _acode = next((l.get("code") for l in _lics if l.get("code")), "HT-0001")
+            # S2 后新指纹只能用授权码激活（编号仅限原设备重装）——自建店+授权自足造数：
+            # 演示库授权有「已过期（seed offset -30/-3）/演示设备占满配额」坑，
+            # 扫库选型在全新库上会踩雷（T7 CI 教训）；自建 12 月授权保证心跳 valid
+            st_h, ph10 = req("POST", "/api/hotels",
+                             {"name": f"同步测试店{ts}", "code": f"HT-SY{ts}", "plan": "基础版"}, token=token)
+            _hid10 = (ph10 or {}).get("id")
+            st_l, pl10 = req("POST", "/api/licenses",
+                             {"hotelId": _hid10, "plan": "基础版", "type": "新签", "months": 12}, token=token)
+            _acode = (pl10 or {}).get("code")
             st, p = req("POST", "/api/client/activate",
                         {"licenseCode": _acode, "deviceName": "自动化测试客户端", "clientVersion": "0.1.0"},
                         headers={"X-Device-Fingerprint": FP})
@@ -345,9 +362,9 @@ def main():
             devs = (p or {}).get("devices") or []
             fpm = FP[:6] + "…" + FP[-4:]  # N4 后 profile 指纹为打码形式
             check("T10.9", "客户端同步", "自助数据仅含本酒店（设备/告警）", st == 200
-                  and (p or {}).get("hotel", {}).get("id") == "h001"
+                  and (p or {}).get("hotel", {}).get("id") == _hid10
                   and any(d.get("fingerprint") == fpm for d in devs),
-                  f"devices={len(devs)}，含本机={any(d.get('fingerprint') == fpm for d in devs)}")
+                  f"hotel={(p or {}).get('hotel', {}).get('id')} expect={_hid10} devices={len(devs)}")
 
         except Exception as _e:
             check("S10", "异常隔离", "第 10 段未捕获异常（后续段继续）", False,
@@ -2797,12 +2814,14 @@ def main():
 
             # T48.4 性能：1w+ 日志/告警量下分页接口 <500ms（压测数据自带清扫）
             try:
-                sql_exec(
+                # created_at 是 timestamp 列：必须 now()（to_char 返回 text 会被 PG 拒——
+                # 曾被 dev 库 1w+ 存量掩盖成静默失败）；断言带上插入结果防再掩
+                ok_logs = sql_exec(
                     "INSERT INTO audit_logs (operator, action, target, detail, created_at) "
                     "SELECT 'T48压测', '性能压测', 'T48-'||g, '1w 行压测数据', "
-                    "to_char(now(), 'YYYY-MM-DD HH24:MI:SS') FROM generate_series(1,10000) g"
+                    "now() FROM generate_series(1,10000) g"
                 )
-                sql_exec(
+                ok_alerts = sql_exec(
                     "INSERT INTO alerts (id, level, rule, hotel_name, detail, time, status) "
                     "SELECT 'T48'||g, '中', 'T48压测', '压测店', '性能压测', "
                     "to_char(now(), 'YYYY-MM-DD HH24:MI:SS'), '待处理' FROM generate_series(1,10000) g"
@@ -2815,14 +2834,38 @@ def main():
                 dt_alerts = (time.time() - t0) * 1000
                 check("T48.4", "分页", "1w+ 日志/告警量下分页接口 <500ms",
                       st_p == 200 and st_a2 == 200 and dt_logs < 500 and dt_alerts < 500
+                      and ok_logs and ok_alerts
                       and (pgp or {}).get("total", 0) >= 10000 and (ap2 or {}).get("total", 0) >= 10000,
-                      f"logs={dt_logs:.0f}ms alerts={dt_alerts:.0f}ms "
+                      f"insert={ok_logs}/{ok_alerts} logs={dt_logs:.0f}ms alerts={dt_alerts:.0f}ms "
                       f"total={(pgp or {}).get('total')}/{(ap2 or {}).get('total')}")
             finally:
                 sql_exec("DELETE FROM audit_logs WHERE operator='T48压测'")
                 sql_exec("DELETE FROM alerts WHERE rule='T48压测'")
         except Exception as _e:
             check("S48", "异常隔离", "第 48 段未捕获异常（后续段继续）", False,
+                     f"{type(_e).__name__}: {_e}")
+
+        # ---------------- 49. CI 门禁（T7，2026-11-26） ----------------
+        try:
+            print("【49. CI 门禁】")
+            import subprocess as _sp
+            import sys as _sys
+            root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            r = _sp.run([_sys.executable, os.path.join(root, "ci", "check_utcnow.py")],
+                        capture_output=True, text=True, timeout=30)
+            out_txt = ((r.stdout or "") + (r.stderr or ""))[-160:].strip()
+            check("T49.1", "CI门禁", "utcnow 存量白名单校验通过（基线外新增即失败）",
+                  r.returncode == 0, f"rc={r.returncode} {out_txt}")
+            wf = os.path.join(root, ".workflow", "ci.yml")
+            wf_txt = ""
+            if os.path.exists(wf):
+                with open(wf, "r", encoding="utf-8") as f:
+                    wf_txt = f.read()
+            check("T49.2", "CI门禁", "Gitee Go 流水线存在且挂接 run_ci.sh",
+                  "ci/run_ci.sh" in wf_txt and "hostGroupID" in wf_txt,
+                  "workflow " + ("有" if wf_txt else "缺失"))
+        except Exception as _e:
+            check("S49", "异常隔离", "第 49 段未捕获异常（后续段继续）", False,
                      f"{type(_e).__name__}: {_e}")
     except Exception as _e:
         import traceback

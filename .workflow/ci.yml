@@ -1,0 +1,31 @@
+# T7 CI 流水线（Gitee Go）：push / PR 触发，跑 ci/run_ci.sh
+# （utcnow 门禁 + Rust 单测 + 临时库后端黑盒回归，全程零 SECRET 进仓）
+#
+# 启用步骤（一次性，需要仓库管理员操作）：
+#   1. Gitee 仓库 → DevOps → Gitee Go → 开通流水线
+#   2. 「主机组」注册一台构建主机（Windows 装 Gitee Go Agent 即可，需 python3/postgres/cargo 或 WSL）
+#   3. 把主机组 ID 填到下方 hostGroupID，保存后 push 即自动触发
+version: '1.0'
+name: license-ci
+displayName: 'license-v2 CI'
+triggers:
+  push:
+    branches:
+      precise:
+        - main
+  pr:
+    branches:
+      precise:
+        - main
+stages:
+  - stage:
+      name: ci-stage
+      displayName: '门禁+单测+黑盒回归'
+      failFast: true
+      steps:
+        - step: shell@agent
+          name: run-ci
+          displayName: 'bash ci/run_ci.sh'
+          hostGroupID: license-ci   # TODO: 替换为 Gitee Go 主机组 ID
+          script: |
+            bash ci/run_ci.sh

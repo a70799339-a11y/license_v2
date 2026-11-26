@@ -26,8 +26,24 @@ TEST_DB = "license_seed_test"
 
 
 def psql(sql: str) -> bool:
-    for cmd in (["sudo", "-u", "postgres", "psql", "-c", sql],
-                ["psql", "-U", "postgres", "-c", sql]):
+    """CREATE/DROP DATABASE 必须打到 DATABASE_URL 所在实例的 maintenance 库。
+    CI 临时实例（TEST_DATABASE_URL/DATABASE_URL 显式带 host:port）不能只走本机 socket
+    兜底——否则库建到默认实例、应用连临时实例报「库不存在」（T7 首跑教训）。"""
+    cmds = []
+    base = os.environ.get("TEST_DATABASE_URL") or os.environ.get("DATABASE_URL") or ""
+    if base:
+        try:
+            from sqlalchemy.engine import make_url
+            u = make_url(base)
+            admin = u.set(database="postgres")
+            dsn = (admin.render_as_string(hide_password=False)
+                   if hasattr(admin, "render_as_string") else str(admin))
+            cmds.append(["psql", dsn, "-c", sql])
+        except Exception:
+            pass
+    cmds += [["sudo", "-u", "postgres", "psql", "-c", sql],
+             ["psql", "-U", "postgres", "-c", sql]]
+    for cmd in cmds:
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
             if r.returncode == 0:

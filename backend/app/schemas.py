@@ -46,6 +46,7 @@ class HotelOut(BaseModel):
 
 
 class HotelUpdate(BaseModel):
+    name: Optional[str] = None  # T5：改名入口（关联走 hotel_id，改名不断链）
     status: Optional[str] = None
     autoRenew: Optional[bool] = None
     expireAt: Optional[str] = None

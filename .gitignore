@@ -25,6 +25,8 @@ release/
 # tools/ 下为本地杂项；verify_sample 是第三方交付物须入库
 tools/*
 !tools/verify_sample/
+# T5 库迁移脚本（运维执行，须入库）
+!tools/migrate_license_hotel_id.py
 
 # 系统文件
 .DS_Store

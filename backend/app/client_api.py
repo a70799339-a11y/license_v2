@@ -142,10 +142,17 @@ def license_payload_for(hotel: Hotel, lic: License) -> dict:
 
 
 def find_active_license(db: Session, hotel: Hotel) -> Optional[License]:
-    """优先取未吊销授权；若全部吊销则返回最近一条（供 revoked 状态判定）"""
+    """优先取未吊销授权；若全部吊销则返回最近一条（供 revoked 状态判定）。
+    T5：按 hotel_id 关联（酒店改名不断链）；hotel_id 为空的存量行按名兼容（迁移前过渡）。"""
+    from sqlalchemy import and_, or_
+
+    link = or_(
+        License.hotel_id == hotel.id,
+        and_(or_(License.hotel_id.is_(None), License.hotel_id == ""), License.hotel_name == hotel.name),
+    )
     lic = (
         db.query(License)
-        .filter(License.hotel_name == hotel.name, License.status != "已吊销")
+        .filter(link, License.status != "已吊销")
         .order_by(License.expire_at.desc())
         .first()
     )
@@ -153,7 +160,7 @@ def find_active_license(db: Session, hotel: Hotel) -> Optional[License]:
         return lic
     return (
         db.query(License)
-        .filter(License.hotel_name == hotel.name)
+        .filter(link)
         .order_by(License.expire_at.desc())
         .first()
     )
@@ -355,7 +362,11 @@ def activate(
     lic = db.query(License).filter(License.code == req.licenseCode).first()
     hotel: Optional[Hotel] = None
     if lic is not None:
-        hotel = db.query(Hotel).filter(Hotel.name == lic.hotel_name).first()
+        # T5：优先 hotel_id 反查（改名不断链）；存量空位按名兼容
+        if lic.hotel_id:
+            hotel = db.query(Hotel).filter(Hotel.id == lic.hotel_id).first()
+        if hotel is None:
+            hotel = db.query(Hotel).filter(Hotel.name == lic.hotel_name).first()
     if hotel is None:
         hotel = db.query(Hotel).filter(Hotel.code == req.licenseCode).first()
         if hotel is not None:

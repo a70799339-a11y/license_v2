@@ -2687,6 +2687,65 @@ def main():
         except Exception as _e:
             check("S46", "异常隔离", "第 46 段未捕获异常（后续段继续）", False,
                      f"{type(_e).__name__}: {_e}")
+
+        # ---------------- 47. hotel_id 强关联（T5 迁移，2026-11-26） ----------------
+        try:
+            print("【47. hotel_id 强关联】")
+            ts = str(int(time.time() * 1000))[-8:]
+            st, h = req("POST", "/api/hotels",
+                        {"name": f"改名连锁店{ts}", "code": f"HT-XD{ts[-4:]}", "plan": "专业版"},
+                        token=token)
+            h_id = (h or {}).get("id", "")
+            st, lic = req("POST", "/api/licenses",
+                          {"hotelId": h_id, "plan": "专业版", "type": "新签", "months": 12}, token=token)
+            lic_id = (lic or {}).get("id", "")
+            lic_code = (lic or {}).get("code", "")
+            old_exp = (lic or {}).get("expireAt", "")
+
+            # T47.1：改名后门店详情授权不断链（hotel_id 关联）
+            st_rn, _ = req("PATCH", f"/api/hotels/{h_id}",
+                           {"name": f"改名后连锁店{ts}"}, token=token)
+            st_d, det = req("GET", f"/api/hotels/{h_id}/detail", token=token)
+            lics = (det or {}).get("licenses", [])
+            hit = [l for l in lics if l.get("id") == lic_id]
+            check("T47.1", "关联", "改名后门店详情授权不断链（hotel_id 关联）",
+                  st_rn == 200 and st_d == 200 and bool(hit),
+                  f"rename={st_rn} lics={len(lics)} name={(hit[0].get('hotelName') if hit else '')}")
+
+            # T47.2：改名后激活+心跳正常（激活反查与 find_active_license 均走 hotel_id）
+            fp = f"m{ts}"
+            st_a, ay = req("POST", "/api/client/activate",
+                           {"licenseCode": lic_code, "deviceName": f"改名机{ts}"},
+                           headers={"X-Device-Fingerprint": fp})
+            tok_m = (ay or {}).get("token", "")
+            st_hb, hb = req("POST", "/api/client/heartbeat", {"clientVersion": "1.2.6"},
+                            token=tok_m, headers={"X-Device-Fingerprint": fp})
+            check("T47.2", "关联", "改名后激活+心跳正常（授权按 hotel_id 命中）",
+                  st_a == 200 and st_hb == 200 and (hb or {}).get("expire_at") == old_exp,
+                  f"act={st_a} hb={st_hb} expire={(hb or {}).get('expire_at')} old={old_exp}")
+
+            # T47.3：改名后续期订单确认仍命中授权（到期顺延）
+            st_o, od = req("POST", "/api/client/renew/order", {"months": 12, "plan": "专业版"},
+                           token=tok_m, headers={"X-Device-Fingerprint": fp})
+            o_no = (od or {}).get("order_no", "")
+            st_l, ros = req("GET", "/api/renew-orders", token=token)
+            target = next((o for o in (ros or []) if isinstance(o, dict) and o.get("orderNo") == o_no), None)
+            st_cf, cf = req("POST", f"/api/renew-orders/{(target or {}).get('id')}/confirm", {}, token=token)
+            st_d2, det2 = req("GET", f"/api/hotels/{h_id}/detail", token=token)
+            lic2 = next((l for l in (det2 or {}).get("licenses", []) if l.get("id") == lic_id), {})
+            new_exp = lic2.get("expireAt", "")
+            check("T47.3", "关联", "改名后续期订单确认仍命中授权（到期日顺延）",
+                  st_o == 200 and st_cf == 200 and bool(o_no) and new_exp > old_exp
+                  and len((cf or {}).get("renewed") or []) == 1,
+                  f"order={o_no} confirm={st_cf} {old_exp}->{new_exp}")
+
+            # 清扫
+            sql_exec(f"DELETE FROM renew_orders WHERE target_id='{h_id}'")
+            if h_id:
+                req("PATCH", f"/api/hotels/{h_id}", {"status": "已停用"}, token=token)
+        except Exception as _e:
+            check("S47", "异常隔离", "第 47 段未捕获异常（后续段继续）", False,
+                     f"{type(_e).__name__}: {_e}")
     except Exception as _e:
         import traceback
         traceback.print_exc()

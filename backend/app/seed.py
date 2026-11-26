@@ -214,7 +214,8 @@ def seed(db: Session) -> None:
         for k in range(rnd.randint(1, 2)):
             issued = expire - timedelta(days=365)
             db.add(License(
-                id=f"l{i+1:03d}-{k+1}", code=f"LIC-2026-{secrets.token_hex(4).upper()}", hotel_name=name,
+                id=f"l{i+1:03d}-{k+1}", code=f"LIC-2026-{secrets.token_hex(4).upper()}",
+                hotel_id=hid, hotel_name=name,
                 plan=plan, type=rnd.choice(["新签", "续期", "升级"]),
                 issued_at=issued.strftime("%Y-%m-%d"), expire_at=expire.strftime("%Y-%m-%d"),
                 status="已过期" if expire < base_day else "生效中",

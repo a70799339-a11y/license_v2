@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from .auth import create_token, get_current_user, require_roles, verify_password
 from .database import Base, engine, get_db
-from .models import Alert, AuditLog, Device, Group, Hotel, License, Plan, Setting, User
+from .models import Alert, AuditLog, Device, Group, Hotel, License, Plan, RenewOrder, Setting, User
 from .schemas import (
     AlertOut, AuditLogOut, BatchDisableRequest, BatchRenewRequest, DeviceOut,
     HotelCreate, HotelOut, HotelUpdate, LicenseCreate, LicenseOut,
@@ -428,6 +428,20 @@ def update_hotel(hotel_id: str, upd: HotelUpdate, db: Session = Depends(get_db),
     h = db.query(Hotel).filter(Hotel.id == hotel_id).first()
     if h is None:
         raise HTTPException(status_code=404, detail="客户不存在")
+    if upd.name is not None and upd.name.strip() and upd.name.strip() != h.name:
+        new_name = upd.name.strip()
+        if db.query(Hotel).filter(Hotel.name == new_name, Hotel.id != hotel_id).first():
+            raise HTTPException(status_code=400, detail="酒店名称已存在")
+        old_name = h.name
+        h.name = new_name
+        # T5：hotel_name 是展示冗余——改名同步授权/告警/续期订单的展示名，
+        # 关联查询已走 hotel_id 不受影响
+        db.query(License).filter(License.hotel_id == hotel_id).update({"hotel_name": new_name})
+        db.query(Alert).filter(Alert.hotel_name == old_name).update({"hotel_name": new_name})
+        db.query(RenewOrder).filter(
+            RenewOrder.target_type == "hotel", RenewOrder.target_id == hotel_id
+        ).update({"target_name": new_name})
+        write_log(db, user, "编辑客户", new_name, f"改名：{old_name} → {new_name}")
     if upd.status is not None:
         h.status = upd.status
     if upd.autoRenew is not None:
@@ -446,7 +460,13 @@ def hotel_detail(hotel_id: str, db: Session = Depends(get_db), user: User = Depe
     h = db.query(Hotel).filter(Hotel.id == hotel_id).first()
     if h is None:
         raise HTTPException(status_code=404, detail="客户不存在")
-    lics = [LicenseOut.from_orm_model(l) for l in db.query(License).filter(License.hotel_name == h.name).all()]
+    from sqlalchemy import and_, or_
+
+    link = or_(
+        License.hotel_id == h.id,
+        and_(or_(License.hotel_id.is_(None), License.hotel_id == ""), License.hotel_name == h.name),
+    )
+    lics = [LicenseOut.from_orm_model(l) for l in db.query(License).filter(link).all()]
     if user.role not in ("admin", "operator"):
         from .masking import mask_text
 
@@ -481,7 +501,8 @@ def create_license(req: LicenseCreate, db: Session = Depends(get_db), user: User
     issued = datetime.utcnow()
     expire = issued + timedelta(days=30 * req.months)
     lic = License(
-        id=f"ln{seq:04d}", code=new_license_code(db, issued.year), hotel_name=h.name,
+        id=f"ln{seq:04d}", code=new_license_code(db, issued.year),
+        hotel_id=h.id, hotel_name=h.name,  # T5：ID 关联 + 展示冗余
         plan=req.plan, type=req.type, issued_at=issued.strftime("%Y-%m-%d"),
         expire_at=expire.strftime("%Y-%m-%d"), status="生效中",
         devices=0, max_devices=PLAN_MAXDEV.get(req.plan, 30),

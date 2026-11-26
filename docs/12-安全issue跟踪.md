@@ -98,3 +98,5 @@
 |---|---|---|---|
 | T4（P1-1） | L1 编号 count()+1 竞态：设置表计数控位+SELECT FOR UPDATE（alloc_code_seq，populate_existing），三处创建接口（Hotel/License/Group）改造；ensure_code_seqs 启动幂等初始化（只升不降）；ensure_groups 同型 len() 隐患一并修 | ✅ 2026-11-26 | T46 三条：20 线程并发建授权/集团无 500、编号唯一且连续、单线程续接；基线 234/234 |
 | T5（P1-2） | hotel_id 强关联迁移 | 进行中 | — |
+
+| T5（P1-2） | hotel_id 强关联：models 加 hotel_id（展示冗余 hotel_name 保留）→ tools/migrate_license_hotel_id.py 幂等迁移（ALTER IF NOT EXISTS+按名回填+零丢失对账）→ 4 处查询切换（find_active_license×2/激活反查/门店详情，存量空位按名兼容过渡）→ 新增改名入口（PATCH name，重名校验+授权/告警/订单展示名同步） | ✅ 2026-11-26 | 动库前备份 backup/license_before_hotelid_20261126.sql；迁移对账 1739/1739 零丢失、幂等复跑回填 0；T47 三条（改名后详情不断链/激活+心跳/续期确认顺延）；基线 237/237 |

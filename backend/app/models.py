@@ -74,6 +74,8 @@ class License(Base):
     __tablename__ = "licenses"
     id = Column(String(16), primary_key=True, index=True)
     code = Column(String(32), unique=True, nullable=False, index=True)
+    # T5：ID 外键关联（改名不断链）；hotel_name 保留为展示冗余（改名时同步）
+    hotel_id = Column(String(16), index=True, default="")
     hotel_name = Column(String(128), nullable=False)
     plan = Column(String(16), default="基础版")
     type = Column(String(16), default="新签")

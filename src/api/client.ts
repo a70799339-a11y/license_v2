@@ -277,6 +277,37 @@ export const api = {
     request<{ ok: boolean }>('/settings', { method: 'POST', body: JSON.stringify({ key, value }) }),
   listLogs: () => request<AuditLog[]>('/logs'),
 
+  // T6 分页（照抄 /hotels/page 信封：{items,total,page,pageSize}）
+  listLogsPage: (params: { page?: number; pageSize?: number; keyword?: string }) => {
+    const q = new URLSearchParams()
+    if (params.page) q.set('page', String(params.page))
+    if (params.pageSize) q.set('page_size', String(params.pageSize))
+    if (params.keyword) q.set('keyword', params.keyword)
+    return request<{ items: AuditLog[]; total: number; page: number; pageSize: number }>(`/logs/page?${q}`)
+  },
+  listAlertsPage: (params: { page?: number; pageSize?: number; level?: string; status?: string }) => {
+    const q = new URLSearchParams()
+    if (params.page) q.set('page', String(params.page))
+    if (params.pageSize) q.set('page_size', String(params.pageSize))
+    if (params.level) q.set('level', params.level)
+    if (params.status) q.set('status', params.status)
+    return request<{
+      items: Alert[]
+      total: number
+      page: number
+      pageSize: number
+      stats: { pending: number; handling: number; done: number; urgent: number }
+    }>(`/alerts/page?${q}`)
+  },
+  listLlmLogsPage: (params: { page?: number; pageSize?: number; sourceType?: string; scene?: string }) => {
+    const q = new URLSearchParams()
+    if (params.page) q.set('page', String(params.page))
+    if (params.pageSize) q.set('page_size', String(params.pageSize))
+    if (params.sourceType) q.set('sourceType', params.sourceType)
+    if (params.scene) q.set('scene', params.scene)
+    return request<{ items: LlmCallLog[]; total: number; page: number; pageSize: number }>(`/llm-logs/page?${q}`)
+  },
+
   // 大模型调用审计（每次 LLM 调用全量留痕，脱敏落库）
   listLlmLogs: (params?: { sourceType?: string; scene?: string; limit?: number }) => {
     const q = new URLSearchParams()

@@ -1221,6 +1221,146 @@ def list_llm_logs(
     ]
 
 
+# ---------- T6 分页端点（L6：日志/告警无分页 → 照抄 /api/hotels/page 模式） ----------
+# page/page_size 查询参数；默认 50、上限 200；{items,total,page,pageSize} 信封；
+# 原列表端点保留不动（既有测试/前端零回归），前端列表切 /page + 页码
+
+
+@app.get("/api/logs/page")
+def list_logs_page(
+    page: int = 1,
+    page_size: int = 50,
+    keyword: str = "",
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    q = db.query(AuditLog)
+    if keyword:
+        like = f"%{keyword}%"
+        q = q.filter(
+            (AuditLog.operator.like(like)) | (AuditLog.action.like(like)) | (AuditLog.target.like(like))
+        )
+    total = q.count()
+    size = min(max(page_size, 1), 200)
+    items = (
+        q.order_by(AuditLog.created_at.desc())
+        .offset(max(page - 1, 0) * size)
+        .limit(size)
+        .all()
+    )
+    return {
+        "items": [AuditLogOut.from_orm_model(a).model_dump() for a in items],
+        "total": total,
+        "page": page,
+        "pageSize": size,
+    }
+
+
+@app.get("/api/alerts/page")
+def list_alerts_page(
+    page: int = 1,
+    page_size: int = 50,
+    level: str = "",
+    status: str = "",
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    """告警分页 + 筛选；stats 为全量统计（与旧前端 all.value 统计卡片口径一致）"""
+    from sqlalchemy import func
+
+    from .alerting import scan_stale_heartbeats
+
+    scan_stale_heartbeats(db)  # 与 /api/alerts 同：读取时惰性扫描
+    try:
+        from .wecom import flush_daily, push_enabled
+
+        if push_enabled(db):
+            flush_daily(db)
+    except Exception:
+        pass
+    q = db.query(Alert)
+    if level:
+        q = q.filter(Alert.level == level)
+    if status:
+        q = q.filter(Alert.status == status)
+    total = q.count()
+    size = min(max(page_size, 1), 200)
+    items = (
+        q.order_by(Alert.time.desc())
+        .offset(max(page - 1, 0) * size)
+        .limit(size)
+        .all()
+    )
+    stats = {"pending": 0, "handling": 0, "done": 0, "urgent": 0}
+    for st_name, cnt in db.query(Alert.status, func.count()).group_by(Alert.status).all():
+        if st_name == "待处理":
+            stats["pending"] = cnt
+        elif st_name == "处理中":
+            stats["handling"] = cnt
+        elif st_name == "已处置":
+            stats["done"] = cnt
+    stats["urgent"] = db.query(Alert).filter(Alert.level == "紧急").count()
+    return {
+        "items": [AlertOut.from_orm_model(a) for a in items],
+        "total": total,
+        "page": page,
+        "pageSize": size,
+        "stats": stats,
+    }
+
+
+@app.get("/api/llm-logs/page")
+def list_llm_logs_page(
+    page: int = 1,
+    page_size: int = 50,
+    sourceType: str = "",
+    scene: str = "",
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    from .models import LLMCallLog
+
+    q = db.query(LLMCallLog)
+    if sourceType:
+        q = q.filter(LLMCallLog.source_type == sourceType)
+    if scene:
+        q = q.filter(LLMCallLog.scene == scene)
+    total = q.count()
+    size = min(max(page_size, 1), 200)
+    rows = (
+        q.order_by(LLMCallLog.created_at.desc())
+        .offset(max(page - 1, 0) * size)
+        .limit(size)
+        .all()
+    )
+    return {
+        "items": [
+            {
+                "id": r.id,
+                "sourceType": r.source_type,
+                "sourceId": r.source_id,
+                "sourceName": r.source_name,
+                "userId": r.user_id,
+                "scene": r.scene,
+                "userInput": r.user_input,
+                "modelInput": r.model_input,
+                "modelOutput": r.model_output,
+                "modelName": r.model_name,
+                "tokensIn": r.tokens_in,
+                "tokensOut": r.tokens_out,
+                "latencyMs": r.latency_ms,
+                "status": r.status,
+                "error": r.error,
+                "createdAt": r.created_at.strftime("%Y-%m-%d %H:%M:%S") if r.created_at else "",
+            }
+            for r in rows
+        ],
+        "total": total,
+        "page": page,
+        "pageSize": size,
+    }
+
+
 class LLMSimulateReq(BaseModel):
     sourceType: str = "admin"       # group / hotel / admin
     sourceId: str = "demo"

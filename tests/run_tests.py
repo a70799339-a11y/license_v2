@@ -782,16 +782,25 @@ def main():
             print("【18. 大模型调用审计】")
 
             secret_input = f"联系人手机 13812345678，酒店设备指纹 {'cd' * 32}，最近哪家风险高？-{ts}"
+            # 冷启动容错：后端重启后首推 Ollama 可能超时/瞬时拒绝（今天已咬两次）——15s 后重试一次；
+            # 真故障连续两次失败仍会暴露
             st, p = req("POST", "/api/llm-logs/simulate",
                         {"sourceType": "group", "sourceId": "GP-0001", "sourceName": "审计测试集团",
                          "userId": "u-test", "scene": "对话查询", "userInput": secret_input},
                         token=token)
+            if not (st == 200 and (p or {}).get("result", {}).get("status") == "success"):
+                time.sleep(15)
+                st, p = req("POST", "/api/llm-logs/simulate",
+                            {"sourceType": "group", "sourceId": "GP-0001", "sourceName": "审计测试集团",
+                             "userId": "u-test", "scene": "对话查询", "userInput": secret_input},
+                            token=token)
             check("T18.1", "大模型审计", "经网关调用自动留痕（输入/输出/模型/耗时）",
                   st == 200 and (p or {}).get("result", {}).get("status") == "success",
                   f"status={(p or {}).get('result', {}).get('status')}")
 
             st, logs = req("GET", "/api/llm-logs?sourceType=group&limit=10", token=token)
-            rec = next((l for l in (logs or []) if "审计测试集团" in (l.get("sourceName") or "")), {})
+            rec = next((l for l in (logs or [])
+                        if "审计测试集团" in (l.get("sourceName") or "") and l.get("status") == "success"), {})
             masked_ok = (
                 "138＊＊＊＊5678" in (rec.get("userInput") or "")
                 and "13812345678" not in (rec.get("userInput") or "")
@@ -2745,6 +2754,75 @@ def main():
                 req("PATCH", f"/api/hotels/{h_id}", {"status": "已停用"}, token=token)
         except Exception as _e:
             check("S47", "异常隔离", "第 47 段未捕获异常（后续段继续）", False,
+                     f"{type(_e).__name__}: {_e}")
+
+        # ---------------- 48. 日志/告警分页（T6，2026-11-26） ----------------
+        try:
+            print("【48. 日志/告警分页】")
+
+            # T48.1 logs/page：信封 + 切片不重 + page_size 上限 200
+            st, pg = req("GET", "/api/logs/page?page=1&page_size=5", token=token)
+            st2, pg2 = req("GET", "/api/logs/page?page=2&page_size=5", token=token)
+            ids1 = set(i.get("id") for i in (pg or {}).get("items", []))
+            ids2 = set(i.get("id") for i in (pg2 or {}).get("items", []))
+            st_c, pgc = req("GET", "/api/logs/page?page=1&page_size=999", token=token)
+            check("T48.1", "分页", "logs/page 信封+切片不重+上限 200",
+                  st == 200 and st2 == 200 and len(ids1) <= 5 and ids1.isdisjoint(ids2)
+                  and isinstance((pg or {}).get("total"), int)
+                  and st_c == 200 and (pgc or {}).get("pageSize") == 200
+                  and len((pgc or {}).get("items", [])) <= 200,
+                  f"p1={len(ids1)} p2={len(ids2)} cap={(pgc or {}).get('pageSize')}")
+
+            # T48.2 alerts/page：筛选 + stats 全量口径与原端点对照
+            st, ap = req("GET", "/api/alerts/page?page=1&page_size=3", token=token)
+            st_all, alist = req("GET", "/api/alerts", token=token)
+            stats = (ap or {}).get("stats", {})
+            urgent_cnt = sum(1 for a in (alist or []) if isinstance(a, dict) and a.get("level") == "紧急")
+            check("T48.2", "分页", "alerts/page 筛选+stats 对照全量（原列表端点不回归）",
+                  st == 200 and st_all == 200 and isinstance(alist, list)
+                  and len((ap or {}).get("items", [])) <= 3
+                  and {"pending", "handling", "done", "urgent"} <= set(stats)
+                  and stats.get("urgent") == urgent_cnt,
+                  f"items={len((ap or {}).get('items', []))} total={(ap or {}).get('total')} "
+                  f"urgent={stats.get('urgent')}/{urgent_cnt}")
+
+            # T48.3 llm-logs/page + 原列表端点形态回归
+            st, lp = req("GET", "/api/llm-logs/page?page=1&page_size=5", token=token)
+            st_l, ll = req("GET", "/api/llm-logs?limit=5", token=token)
+            check("T48.3", "分页", "llm-logs/page 分页 + /logs /llm-logs 列表形态不回归",
+                  st == 200 and len((lp or {}).get("items", [])) <= 5
+                  and (lp or {}).get("pageSize") == 5
+                  and st_l == 200 and isinstance(ll, list),
+                  f"page={len((lp or {}).get('items', []))} list={len(ll or [])}")
+
+            # T48.4 性能：1w+ 日志/告警量下分页接口 <500ms（压测数据自带清扫）
+            try:
+                sql_exec(
+                    "INSERT INTO audit_logs (operator, action, target, detail, created_at) "
+                    "SELECT 'T48压测', '性能压测', 'T48-'||g, '1w 行压测数据', "
+                    "to_char(now(), 'YYYY-MM-DD HH24:MI:SS') FROM generate_series(1,10000) g"
+                )
+                sql_exec(
+                    "INSERT INTO alerts (id, level, rule, hotel_name, detail, time, status) "
+                    "SELECT 'T48'||g, '中', 'T48压测', '压测店', '性能压测', "
+                    "to_char(now(), 'YYYY-MM-DD HH24:MI:SS'), '待处理' FROM generate_series(1,10000) g"
+                )
+                t0 = time.time()
+                st_p, pgp = req("GET", "/api/logs/page?page=3&page_size=50", token=token)
+                dt_logs = (time.time() - t0) * 1000
+                t0 = time.time()
+                st_a2, ap2 = req("GET", "/api/alerts/page?page=2&page_size=50", token=token)
+                dt_alerts = (time.time() - t0) * 1000
+                check("T48.4", "分页", "1w+ 日志/告警量下分页接口 <500ms",
+                      st_p == 200 and st_a2 == 200 and dt_logs < 500 and dt_alerts < 500
+                      and (pgp or {}).get("total", 0) >= 10000 and (ap2 or {}).get("total", 0) >= 10000,
+                      f"logs={dt_logs:.0f}ms alerts={dt_alerts:.0f}ms "
+                      f"total={(pgp or {}).get('total')}/{(ap2 or {}).get('total')}")
+            finally:
+                sql_exec("DELETE FROM audit_logs WHERE operator='T48压测'")
+                sql_exec("DELETE FROM alerts WHERE rule='T48压测'")
+        except Exception as _e:
+            check("S48", "异常隔离", "第 48 段未捕获异常（后续段继续）", False,
                      f"{type(_e).__name__}: {_e}")
     except Exception as _e:
         import traceback

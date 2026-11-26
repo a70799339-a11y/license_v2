@@ -100,3 +100,5 @@
 | T5（P1-2） | hotel_id 强关联迁移 | 进行中 | — |
 
 | T5（P1-2） | hotel_id 强关联：models 加 hotel_id（展示冗余 hotel_name 保留）→ tools/migrate_license_hotel_id.py 幂等迁移（ALTER IF NOT EXISTS+按名回填+零丢失对账）→ 4 处查询切换（find_active_license×2/激活反查/门店详情，存量空位按名兼容过渡）→ 新增改名入口（PATCH name，重名校验+授权/告警/订单展示名同步） | ✅ 2026-11-26 | 动库前备份 backup/license_before_hotelid_20261126.sql；迁移对账 1739/1739 零丢失、幂等复跑回填 0；T47 三条（改名后详情不断链/激活+心跳/续期确认顺延）；基线 237/237 |
+
+| T6（P1-3） | L6 日志/告警分页：/api/logs/page /api/alerts/page /api/llm-logs/page（照抄 /api/hotels/page 双端点模式，page_size 默认 50 上限 200；alerts/page 带筛选+全量 stats）；前端 RiskView/SecurityView 服务端分页+页码，审计日志按钮接线操作日志分页表；顺带修 scan_stale_heartbeats N+1（批量去重替代逐酒店 exists，1w 告警量 1417ms→33ms） | ✅ 2026-11-26 | T48 四条：信封切片上限/stats 对照/列表形态回归/1w+ 压测 logs 10ms alerts 33ms（<500ms）；原列表端点不动零回归；T18 加冷启动重试（LLM 首推超时/拒绝环境抖动，当日两次） |

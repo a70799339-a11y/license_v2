@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api, type Alert, type AlertGroup } from '../api/client'
 import { downloadCsv } from '../api/client'
@@ -7,36 +7,52 @@ import { useAuthStore } from '../stores/auth'
 import { fmtBJ } from '../utils/time'
 
 const auth = useAuthStore()
-const all = ref<Alert[]>([])
+// T6：服务端分页（stats 随分页响应回传，统计卡片仍为全量口径）
+const items = ref<Alert[]>([])
+const total = ref(0)
+const page = ref(1)
+const pageSize = ref(50)
 const loading = ref(true)
 const levelFilter = ref('')
 const statusFilter = ref('')
 const viewMode = ref<'detail' | 'group'>('group')
 const groups = ref<AlertGroup[]>([])
+const stats = ref({ pending: 0, handling: 0, done: 0, urgent: 0 })
+
+async function loadPage() {
+  const r = await api.listAlertsPage({
+    page: page.value,
+    pageSize: pageSize.value,
+    level: levelFilter.value || undefined,
+    status: statusFilter.value || undefined,
+  })
+  items.value = r.items
+  total.value = r.total
+  stats.value = r.stats
+}
 
 onMounted(async () => {
   try {
-    all.value = await api.listAlerts()
+    await loadPage()
     groups.value = await api.alertGroups()
   } finally {
     loading.value = false
   }
 })
 
-const filtered = computed(() =>
-  all.value.filter(a => {
-    if (levelFilter.value && a.level !== levelFilter.value) return false
-    if (statusFilter.value && a.status !== statusFilter.value) return false
-    return true
-  })
-)
-
-const stats = computed(() => ({
-  pending: all.value.filter(a => a.status === '待处理').length,
-  handling: all.value.filter(a => a.status === '处理中').length,
-  done: all.value.filter(a => a.status === '已处置').length,
-  urgent: all.value.filter(a => a.level === '紧急').length,
-}))
+function onFilterChange() {
+  page.value = 1
+  loadPage()
+}
+function onPageChange(p: number) {
+  page.value = p
+  loadPage()
+}
+function onSizeChange(s: number) {
+  pageSize.value = s
+  page.value = 1
+  loadPage()
+}
 
 function levelType(l: Alert['level']) {
   return l === '紧急' ? 'danger' : l === '高' ? 'warning' : 'info'
@@ -61,7 +77,7 @@ async function confirmHandle() {
   try {
     await api.handleAlert(handleAlert.value.id, handleNote.value)
     handleDialog.value = false
-    all.value = await api.listAlerts()
+    await loadPage()
     groups.value = await api.alertGroups()
     ElMessage.success('已处置，结果已推送企微')
   } catch (e) {
@@ -164,19 +180,19 @@ function groupLevel(l: string) {
     </div>
 
     <div v-if="viewMode === 'detail'" class="card filter-bar mb-20">
-      <el-radio-group v-model="levelFilter">
+      <el-radio-group v-model="levelFilter" @change="onFilterChange">
         <el-radio-button value="">全部等级</el-radio-button>
         <el-radio-button value="紧急">紧急</el-radio-button>
         <el-radio-button value="高">高</el-radio-button>
         <el-radio-button value="中">中</el-radio-button>
       </el-radio-group>
-      <el-select v-model="statusFilter" placeholder="处置状态" style="width: 130px" clearable>
+      <el-select v-model="statusFilter" placeholder="处置状态" style="width: 130px" clearable @change="onFilterChange">
         <el-option v-for="s in ['待处理', '处理中', '已处置']" :key="s" :label="s" :value="s" />
       </el-select>
     </div>
 
     <div v-if="viewMode === 'detail'" class="card">
-      <el-table :data="filtered">
+      <el-table :data="items">
         <el-table-column label="等级" width="80">
           <template #default="{ row }">
             <el-tag :type="levelType(row.level)" size="small">{{ row.level }}</el-tag>
@@ -210,6 +226,17 @@ function groupLevel(l: string) {
           </template>
         </el-table-column>
       </el-table>
+      <div style="display: flex; justify-content: flex-end; margin-top: 12px">
+        <el-pagination
+          :current-page="page"
+          :page-size="pageSize"
+          :total="total"
+          :page-sizes="[20, 50, 100, 200]"
+          layout="total, sizes, prev, pager, next"
+          @current-change="onPageChange"
+          @size-change="onSizeChange"
+        />
+      </div>
     </div>
 
     <el-dialog v-model="handleDialog" title="处置告警" width="480px">

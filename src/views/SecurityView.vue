@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { api, type License, type LlmCallLog } from '../api/client'
+import { api, type AuditLog, type License, type LlmCallLog } from '../api/client'
 import { fmtBJ } from '../utils/time'
 
 const licenses = ref<License[]>([])
@@ -191,15 +191,63 @@ async function runSim() {
   }
 }
 
-// ---------- 大模型调用审计 ----------
+// ---------- 大模型调用审计（T6 服务端分页） ----------
 const llmLogs = ref<LlmCallLog[]>([])
 const llmFilter = ref('')
+const llmPage = ref(1)
+const llmPageSize = ref(50)
+const llmTotal = ref(0)
 const llmDetail = ref<LlmCallLog | null>(null)
 const llmDetailShow = ref(false)
 const llmSimInput = ref('最近哪家酒店风险最高？联系人手机 13812345678')
 
 async function loadLlmLogs() {
-  llmLogs.value = await api.listLlmLogs({ sourceType: llmFilter.value || undefined, limit: 30 })
+  const r = await api.listLlmLogsPage({
+    page: llmPage.value,
+    pageSize: llmPageSize.value,
+    sourceType: llmFilter.value || undefined,
+  })
+  llmLogs.value = r.items
+  llmTotal.value = r.total
+}
+function onLlmFilterChange() {
+  llmPage.value = 1
+  loadLlmLogs()
+}
+function onLlmPageChange(p: number) {
+  llmPage.value = p
+  loadLlmLogs()
+}
+function onLlmSizeChange(s: number) {
+  llmPageSize.value = s
+  llmPage.value = 1
+  loadLlmLogs()
+}
+
+// ---------- 操作日志（T6：审计日志按钮接线，分页列表） ----------
+const logsShow = ref(false)
+const logs = ref<AuditLog[]>([])
+const logsTotal = ref(0)
+const logsPage = ref(1)
+const logsPageSize = ref(50)
+
+async function loadLogs() {
+  const r = await api.listLogsPage({ page: logsPage.value, pageSize: logsPageSize.value })
+  logs.value = r.items
+  logsTotal.value = r.total
+}
+function toggleLogs() {
+  logsShow.value = !logsShow.value
+  if (logsShow.value) loadLogs()
+}
+function onLogsPageChange(p: number) {
+  logsPage.value = p
+  loadLogs()
+}
+function onLogsSizeChange(s: number) {
+  logsPageSize.value = s
+  logsPage.value = 1
+  loadLogs()
 }
 
 async function simulateLlm() {
@@ -333,7 +381,7 @@ async function restoreLicense(row: License) {
       </div>
       <div style="display: flex; gap: 8px">
         <el-button>签发策略</el-button>
-        <el-button>审计日志</el-button>
+        <el-button @click="toggleLogs">审计日志</el-button>
         <el-button type="danger">立即吊销</el-button>
       </div>
     </div>
@@ -461,7 +509,7 @@ async function restoreLicense(row: License) {
       </div>
       <p v-if="llmPing" class="muted" style="font-size: 12px; margin: 4px 0 12px">{{ llmPing.detail }}</p>
       <div style="display: flex; gap: 12px; align-items: center; margin: 12px 0">
-        <el-select v-model="llmFilter" placeholder="全部来源" style="width: 140px" clearable @change="loadLlmLogs">
+        <el-select v-model="llmFilter" placeholder="全部来源" style="width: 140px" clearable @change="onLlmFilterChange">
           <el-option label="集团总端" value="group" />
           <el-option label="门店客户端" value="hotel" />
           <el-option label="管理后台" value="admin" />
@@ -501,6 +549,17 @@ async function restoreLicense(row: License) {
           </template>
         </el-table-column>
       </el-table>
+      <div style="display: flex; justify-content: flex-end; margin-top: 12px">
+        <el-pagination
+          :current-page="llmPage"
+          :page-size="llmPageSize"
+          :total="llmTotal"
+          :page-sizes="[20, 50, 100, 200]"
+          layout="total, sizes, prev, pager, next"
+          @current-change="onLlmPageChange"
+          @size-change="onLlmSizeChange"
+        />
+      </div>
       <el-dialog v-model="llmDetailShow" title="大模型调用详情" width="640px">
         <template v-if="llmDetail">
           <el-descriptions :column="2" border size="small">
@@ -517,6 +576,34 @@ async function restoreLicense(row: License) {
           <div v-if="llmDetail.error" class="llm-field"><b>错误</b><pre style="color: #b91c1c">{{ llmDetail.error }}</pre></div>
         </template>
       </el-dialog>
+    </div>
+
+    <!-- T6：操作日志（审计日志按钮展开，服务端分页） -->
+    <div v-if="logsShow" class="card mb-20">
+      <div class="card-title" style="display: flex; justify-content: space-between; align-items: center">
+        <span>操作日志</span>
+        <el-button size="small" @click="loadLogs">刷新</el-button>
+      </div>
+      <el-table :data="logs" size="small" max-height="360">
+        <el-table-column label="时间" width="150">
+          <template #default="{ row }"><span class="mono">{{ fmtBJ(row.createdAt) }}</span></template>
+        </el-table-column>
+        <el-table-column prop="operator" label="操作人" width="110" />
+        <el-table-column prop="action" label="动作" width="120" />
+        <el-table-column prop="target" label="对象" width="160" show-overflow-tooltip />
+        <el-table-column prop="detail" label="详情" min-width="220" show-overflow-tooltip />
+      </el-table>
+      <div style="display: flex; justify-content: flex-end; margin-top: 12px">
+        <el-pagination
+          :current-page="logsPage"
+          :page-size="logsPageSize"
+          :total="logsTotal"
+          :page-sizes="[20, 50, 100, 200]"
+          layout="total, sizes, prev, pager, next"
+          @current-change="onLogsPageChange"
+          @size-change="onLogsSizeChange"
+        />
+      </div>
     </div>
 
     <div class="card flow-card mb-20">

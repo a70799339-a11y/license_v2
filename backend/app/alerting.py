@@ -57,20 +57,30 @@ def raise_alert(
 
 
 def scan_stale_heartbeats(db: Session, timeout_hours: int = 72) -> int:
-    """扫描长时间无心跳的在册酒店（读取告警时惰性触发，补上「还在停摆」的告警）"""
+    """扫描长时间无心跳的在册酒店（读取告警时惰性触发，补上「还在停摆」的告警）。
+    T6 性能：24h 去重批量一次查回（替代逐酒店 N+1，1w 告警量下该 N+1 是 1.4s 主因）；
+    跳过已停用酒店（停用店不再产生心跳告警，也省掉测试清扫店的无效扫描）。"""
     from .models import Hotel
 
     cutoff = (datetime.utcnow() - timedelta(hours=timeout_hours)).strftime("%Y-%m-%d %H:%M:%S")
+    since = (datetime.utcnow() - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+    dedup = {
+        name
+        for (name,) in db.query(Alert.hotel_name)
+        .filter(Alert.rule == "心跳中断", Alert.time >= since)
+        .distinct()
+    }
     count = 0
-    for h in db.query(Hotel).filter(Hotel.last_active != "").all():
-        if h.last_active < cutoff:
+    for h in db.query(Hotel).filter(Hotel.last_active != "", Hotel.status != "已停用").all():
+        if h.last_active < cutoff and h.name not in dedup:
+            # 去重已批量完成（dedupe_hours=0 跳过单条 exists 查询）
             if raise_alert(
                 db,
                 level="中",
                 rule="心跳中断",
                 hotel_name=h.name,
                 detail=f"最近心跳 {h.last_active}，已超过 {timeout_hours} 小时无同步",
-                dedupe_hours=24,
+                dedupe_hours=0,
             ):
                 count += 1
     if count:
